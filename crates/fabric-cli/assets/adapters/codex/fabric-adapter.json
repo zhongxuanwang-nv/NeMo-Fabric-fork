@@ -13,7 +13,8 @@
       "instructions.system",
       "mcp",
       "skills"
-    ]
+    ],
+    "native_model_providers": ["openai"]
   },
   "telemetry": {
     "providers": {

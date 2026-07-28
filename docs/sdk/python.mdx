@@ -200,6 +200,11 @@ by adapter:
 
 Model selection is deterministic: the `default` role wins; otherwise a single
 named role is selected. More than one role without `default` fails planning.
+Claude and Codex list the provider identifiers that use native authentication
+in `adapter_descriptor.config.native_model_providers`. Other lowercase provider
+names remain valid when the adapter accepts `models.base_url` and the selected
+model supplies both `base_url` and `api_key_env`. Planning and `doctor(...)`
+report missing custom-provider connection fields before adapter startup.
 
 If a normalized field has no complete mapping, `plan(...)` and runtime start
 fail with a configuration compatibility error naming the adapter and field.

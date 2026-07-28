@@ -33,6 +33,10 @@ indexes the public config models. The generated pages omit constructor fields an
 defaults, so read the installed `nemo_fabric` models (they ship `py.typed`) for
 exact field names and defaults.
 
+For Claude and Codex, provider identifiers outside the adapter-native set
+require both `ModelConfig.base_url` and `ModelConfig.api_key_env`. Planning
+validates those fields before adapter startup.
+
 ## Build And Shape
 
 Construct the nested config directly, then adjust capabilities with helper

@@ -16,7 +16,8 @@
       "tools.blocked",
       "mcp",
       "skills"
-    ]
+    ],
+    "native_model_providers": ["anthropic"]
   },
   "telemetry": {
     "providers": {

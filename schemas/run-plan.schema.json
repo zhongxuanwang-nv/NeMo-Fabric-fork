@@ -67,6 +67,14 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "native_model_providers": {
+          "description": "Provider identifiers that can use the adapter's native authentication path.\n\nOther provider identifiers require explicit `base_url` and `api_key_env`\nvalues when the adapter accepts custom model endpoints.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "type": "object"

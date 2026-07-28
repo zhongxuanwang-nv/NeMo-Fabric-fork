@@ -986,6 +986,7 @@ def test_descriptor_has_no_codex_binary_requirement():
         "mcp",
         "skills",
     ]
+    assert descriptor["config"]["native_model_providers"] == ["openai"]
     assert "requirements" not in descriptor
 
 

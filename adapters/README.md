@@ -104,6 +104,11 @@ and additive extension maps because their support does not vary by adapter:
 
 The selected model role is `default`, or the sole configured role when no
 `default` exists. More than one role without `default` fails planning.
+Claude and Codex list the provider identifiers that use native authentication
+in `adapter_descriptor.config.native_model_providers`. Other lowercase provider
+names remain valid when the adapter accepts `models.base_url` and the selected
+model supplies both `base_url` and `api_key_env`. Planning and `doctor(...)`
+report missing custom-provider connection fields before adapter startup.
 `runtime.max_turns` is optional; omitting it preserves adapter-native defaults
 without creating a compatibility requirement.
 

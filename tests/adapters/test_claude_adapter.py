@@ -97,6 +97,7 @@ def test_claude_descriptor_is_narrow_and_versioned():
                 "mcp",
                 "skills",
             ],
+            "native_model_providers": ["anthropic"],
         },
         "telemetry": {
             "providers": {
