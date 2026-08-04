@@ -81,12 +81,19 @@ implementations reach independently belongs in the contract, not in either adapt
 | 8   | **Two declared capabilities do not exist.** `ToolsConfig` has only `blocked`; `FabricConfig` has no `instructions`.                                                                  | Cannot consume either, and has no natural target for a system instruction, so prompt intent travels as uninterpreted `agent` settings.                                     | Its descriptor accepts `instructions.system` and `tools.enabled`.                                                     | Add both to `FabricConfig`, and deliver `instructions.system` only where an adapter declares a mapping.                                                                      |
 | 9   | **Normalization is copied, not shared.**                                                                                                                                             | Provider defaults, key-env resolution, and MCP transport normalization were copied near-verbatim from the Deep Agents adapter.                                             | Maps `models.`* to NAT `llms` with the same provider, key env, base URL, and temperature fields.                      | Move model-alias and MCP-transport normalization into `nemo-fabric-adapters-common` so third parties do not re-derive provider defaults and drift.                           |
 | 10  | **Naming is inconsistent.**                                                                                                                                                          | `nvidia.fabric.langgraph`, `nemo_fabric_adapters.langgraph`.                                                                                                               | `nvidia.nemo.platform.nat`, `nemo_platform_fabric_adapter_nat`.                                                       | Adopt one provider token across repository, distribution, import package, `adapter_id`, and `harness`.                                                                       |
+| 11  | **Runtime capability flags are unverified.** `resolve_runtime_capabilities` only ANDs a descriptor claim with the adapter kind, and no runtime path implements streaming, cancellation, updates, or service lifecycle. | Declares all four `false` by convention; a `true` would be propagated as fact and silently not work. | Declares all four `false` by the same convention. | Either verify the flags against what the runtime actually implements, or state that they are advisory. The parent goal of "truthful capability declarations" currently rests on adapter honesty alone. |
 
 Requirements 1 through 3 gate third-party adapters at all: without discovery an
 adapter cannot be installed, and without declared settings and conditional
 capability acceptance every adapter invents its own validation and failure
-behavior. Requirements 4 through 8 are correctness and uniformity of the shared
-contract. Requirements 9 and 10 reduce duplication and drift.
+behavior. Requirements 4 through 8 and 11 are correctness and uniformity of the
+shared contract. Requirements 9 and 10 reduce duplication and drift.
+
+Not everything failed to transfer. The `capabilities` block worked: both adapters
+independently declared the same four flags `false` with the same reasoning, and
+neither needs any of them to ship. That contrast is useful — the descriptor's runtime
+capability section is sound in intent, while `config.accepts` needed requirement 3
+because it cannot express a capability that depends on settings.
 
 ## LangGraph Behaviors That Shape The Design
 
@@ -254,6 +261,22 @@ particularly visible — `astream` already yields incremental node and message e
 and the adapter already consumes them to attribute usage to the turn and build the
 bounded event summary. The incremental data exists; there is simply no channel to
 forward it live, so it is buffered and reported after completion.
+
+**Progressive output is not a prerequisite.** Nothing about LangGraph requires it for
+a request/response invocation: both validation agents run end to end today, and
+driving the graph with `astream` rather than `ainvoke` is an internal choice made for
+usage attribution, not to satisfy Fabric. The parent document reaches the same
+conclusion for NAT, declaring `streaming: false` and listing it as not implemented by
+the initial adapter lifecycle. Two frameworks that both stream natively independently
+concluded they do not need it to ship, which is worth recording as agreement rather
+than as a gap.
+
+Note that `capabilities` is a self-declared claim. `resolve_runtime_capabilities`
+only ANDs the descriptor's flag with "is this a process or python adapter", and no
+runtime path implements progressive delivery, so a descriptor claiming
+`streaming: true` would be propagated into the plan as fact and simply not work.
+Unlike `tools.blocked`, which fails closed with `UnsupportedToolsPolicy`, nothing
+verifies these four flags (requirement 11).
 
 What is unsupported specifically because of LangGraph:
 
