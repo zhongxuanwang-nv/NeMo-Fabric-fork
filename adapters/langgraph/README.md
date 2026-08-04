@@ -96,7 +96,10 @@ settings = {
 
 ## Configuration reference
 
-All settings live under `harness.settings.langgraph`. Unknown keys are rejected.
+All settings live under `harness.settings.langgraph`. Unknown keys are rejected. The
+same surface is published as a JSON Schema in the `settings_schema` field of
+[`fabric-adapter.json`](fabric-adapter.json), so an installed adapter advertises its
+own settings.
 
 ### `entrypoint`
 
@@ -163,7 +166,9 @@ isolated.
   reported as enforced. Use a `factory` entry point for those.
 - **Policy covers only wrapped tools.** `tools.blocked` applies to tools passed
   through `context.mcp_tools()` or `context.guard_tools(...)`. A graph that wires
-  tools directly owns that boundary.
+  tools directly owns that boundary. For MCP tools a selector may be the bare tool
+  name, which denies it on every server, or `server__tool`, which denies one
+  server's copy; the tool itself is not renamed.
 - **Output must be JSON-safe.** An unserializable projection fails with a
   normalized error instead of a corrupted result.
 - **No streaming or cancellation.** Fabric's Python adapter runtime invokes an

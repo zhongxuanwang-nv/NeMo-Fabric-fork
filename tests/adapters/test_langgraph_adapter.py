@@ -26,6 +26,11 @@ from nemo_fabric_adapters.langgraph import adapter  # noqa: E402
 from nemo_fabric_adapters.langgraph import context as context_module  # noqa: E402
 from nemo_fabric_adapters.langgraph import models as model_support  # noqa: E402
 from nemo_fabric_adapters.langgraph import tools as tool_support  # noqa: E402
+from nemo_fabric_adapters.langgraph.config import BINDING_KINDS  # noqa: E402
+from nemo_fabric_adapters.langgraph.config import EVENT_MODES  # noqa: E402
+from nemo_fabric_adapters.langgraph.config import INPUT_MODES  # noqa: E402
+from nemo_fabric_adapters.langgraph.config import OUTPUT_MODES  # noqa: E402
+from nemo_fabric_adapters.langgraph.config import STATE_MODES  # noqa: E402
 from nemo_fabric_adapters.langgraph.config import AdapterConfigError  # noqa: E402
 from nemo_fabric_adapters.langgraph.config import parse_settings  # noqa: E402
 
@@ -117,13 +122,14 @@ def fake_model(monkeypatch: pytest.MonkeyPatch) -> FakeChatModel:
 
 @pytest.fixture
 def fake_mcp(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Serve one MCP tool without contacting a server."""
+    """Serve one MCP tool per configured server without contacting one."""
 
     class FakeClient:
         def __init__(self, connections: dict[str, Any]) -> None:
             self.connections = connections
 
-        async def get_tools(self) -> list[Any]:
+        async def get_tools(self, *, server_name: str | None = None) -> list[Any]:
+            # Mirrors MultiServerMCPClient: tools carry their bare MCP name.
             return [search_docs]
 
     import langchain_mcp_adapters.client as mcp_client
@@ -148,6 +154,38 @@ def test_descriptor_declares_only_supported_surface() -> None:
     assert descriptor["config"]["accepts"] == ["models", "tools", "tools.blocked", "mcp"]
     # No telemetry provider is validated end to end yet, so none is advertised.
     assert descriptor["telemetry"]["providers"] == {}
+    # Runtime capabilities are declared explicitly rather than left to defaults.
+    assert descriptor["capabilities"] == {
+        "cancellation": False,
+        "service": False,
+        "streaming": False,
+        "updates": False,
+    }
+
+
+def test_descriptor_settings_schema_matches_the_parser() -> None:
+    """The advertised settings schema must agree with what the adapter enforces."""
+
+    descriptor = json.loads(DESCRIPTOR_PATH.read_text(encoding="utf-8"))
+    schema = descriptor["settings_schema"]["properties"]["langgraph"]
+
+    assert schema["required"] == ["entrypoint"]
+    assert schema["additionalProperties"] is False
+    # Advertised keys and enum values must match the closed sets the parser accepts.
+    assert set(schema["properties"]) == {
+        "entrypoint",
+        "input",
+        "output",
+        "events",
+        "state",
+        "agent",
+        "recursion_limit",
+    }
+    assert set(schema["properties"]["entrypoint"]["properties"]["kind"]["enum"]) == BINDING_KINDS
+    assert set(schema["properties"]["input"]["properties"]["mode"]["enum"]) == INPUT_MODES
+    assert set(schema["properties"]["output"]["properties"]["mode"]["enum"]) == OUTPUT_MODES
+    assert set(schema["properties"]["events"]["properties"]["mode"]["enum"]) == EVENT_MODES
+    assert set(schema["properties"]["state"]["enum"]) == STATE_MODES
 
 
 # --- agent 1: unmodified compiled graph ----------------------------------
@@ -405,6 +443,33 @@ def test_blocked_mcp_tool_cannot_execute(
     assert not any("docs:what does the contract say?" in finding for finding in findings)
     # The unblocked application tool still ran.
     assert any("precedent:what does the contract say?" in finding for finding in findings)
+
+
+def test_nat_style_qualified_selector_blocks_one_server(
+    tmp_path: Path, fake_model: FakeChatModel, fake_mcp: None
+) -> None:
+    # NAT names function-group members 'group__member'. The same selector must
+    # resolve here, and must deny only the named server's tool.
+    payload = build_payload(
+        tmp_path,
+        case_review_settings(output={"mode": "state"}, agent={"max_findings": 4}),
+        request_input="check both sources",
+        models={"default": {"provider": "nvidia", "model": "fake-model"}},
+        blocked=["docs__search_docs"],
+        mcp_servers={
+            "docs": {"transport": "streamable_http", "url": "http://localhost:1"},
+            "wiki": {"transport": "streamable_http", "url": "http://localhost:2"},
+        },
+    )
+
+    result = adapter.run(payload)
+
+    assert result["failed"] is False, result["error"]
+    findings = result["response"]["findings"]
+    denials = [finding for finding in findings if "blocked by the configured tools policy" in finding]
+    # Exactly one of the two identically named MCP tools was denied.
+    assert len(denials) == 1, findings
+    assert sum("docs:check both sources" in finding for finding in findings) == 1, findings
 
 
 def test_factory_agent_projects_domain_field(

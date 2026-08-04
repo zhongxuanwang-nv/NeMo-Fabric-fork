@@ -141,6 +141,10 @@ Before opening a PR, check the following:
    reflect the current behavior.
 5. For docs site changes, run `just docs` to regenerate the Python and Rust API
    references and validate the Fern configuration.
+6. For a change that needs design alignment, add or update a proposal in
+   [`docs/designs/`](docs/designs/README.md) and link it from the affected package
+   `README.md`. That directory is deliberately excluded from the published site, so
+   add the entry to its index rather than to the Fern navigation.
 
 For documentation-heavy changes, prefer small targeted commits so the history
 clearly separates entry-point changes, reference changes, examples, and

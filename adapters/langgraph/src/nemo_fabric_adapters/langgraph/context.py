@@ -43,7 +43,7 @@ class LangGraphAdapterContext:
         runnable_config: dict[str, Any],
         checkpointer: Any | None,
         callbacks: list[Any],
-        mcp_tools: list[Any],
+        mcp_tools: list[tuple[str, Any]],
     ) -> None:
         self._payload = payload
         self._settings = settings
@@ -94,9 +94,12 @@ class LangGraphAdapterContext:
     # --- tools ------------------------------------------------------------
 
     def mcp_tools(self) -> list[Any]:
-        """Return LangChain tools from Fabric MCP servers, with tool policy applied."""
+        """Return LangChain tools from Fabric MCP servers, with tool policy applied.
 
-        return self.guard_tools(self._mcp_tools)
+        Policy accepts either a bare tool name or a ``server__tool`` selector.
+        """
+
+        return tool_support.guard_mcp_tools(self._mcp_tools, self._blocked)
 
     def guard_tools(self, tools: list[Any]) -> list[Any]:
         """Apply Fabric ``tools.blocked`` to ``tools``.

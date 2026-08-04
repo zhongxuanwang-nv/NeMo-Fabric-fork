@@ -7,9 +7,86 @@
     "module": "nemo_fabric_adapters.langgraph.adapter",
     "callable": "run"
   },
+  "settings_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "langgraph": {
+        "type": "object",
+        "properties": {
+          "entrypoint": {
+            "type": "object",
+            "properties": {
+              "target": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Reference to the graph or factory as 'module.path:attribute'."
+              },
+              "kind": {
+                "enum": ["compiled", "factory", "runnable_factory"],
+                "default": "compiled"
+              },
+              "search_paths": {
+                "type": "array",
+                "items": { "type": "string" },
+                "default": [],
+                "description": "Directories relative to base_dir, appended to the import path."
+              }
+            },
+            "required": ["target"],
+            "additionalProperties": false
+          },
+          "input": {
+            "type": "object",
+            "properties": {
+              "mode": { "enum": ["passthrough", "messages", "field"], "default": "passthrough" },
+              "field": { "type": "string", "minLength": 1 },
+              "messages_key": { "type": "string", "minLength": 1, "default": "messages" }
+            },
+            "additionalProperties": false
+          },
+          "output": {
+            "type": "object",
+            "properties": {
+              "mode": { "enum": ["last_message", "field", "state"], "default": "last_message" },
+              "field": { "type": "string", "minLength": 1 },
+              "messages_key": { "type": "string", "minLength": 1, "default": "messages" }
+            },
+            "additionalProperties": false
+          },
+          "events": {
+            "type": "object",
+            "properties": {
+              "mode": { "enum": ["none", "summary"], "default": "none" },
+              "limit": { "type": "integer", "minimum": 1, "default": 50 }
+            },
+            "additionalProperties": false
+          },
+          "state": { "enum": ["none", "graph", "adapter"], "default": "none" },
+          "agent": {
+            "type": "object",
+            "default": {},
+            "description": "Domain settings passed to a factory unchanged; Fabric assigns them no meaning.",
+            "additionalProperties": true
+          },
+          "recursion_limit": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["entrypoint"],
+        "additionalProperties": false
+      }
+    },
+    "required": ["langgraph"],
+    "additionalProperties": true
+  },
   "requirements": {},
   "config": {
     "accepts": ["models", "tools", "tools.blocked", "mcp"]
+  },
+  "capabilities": {
+    "cancellation": false,
+    "service": false,
+    "streaming": false,
+    "updates": false
   },
   "telemetry": {
     "providers": {}
