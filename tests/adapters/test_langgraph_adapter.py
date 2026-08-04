@@ -151,7 +151,15 @@ def test_descriptor_declares_only_supported_surface() -> None:
         "module": "nemo_fabric_adapters.langgraph.adapter",
         "callable": "run",
     }
-    assert descriptor["config"]["accepts"] == ["models", "tools", "tools.blocked", "mcp"]
+    # Sub-path granularity follows the NAT reference adapter's precedent.
+    assert descriptor["config"]["accepts"] == [
+        "models",
+        "models.base_url",
+        "models.temperature",
+        "tools",
+        "tools.blocked",
+        "mcp",
+    ]
     # No telemetry provider is validated end to end yet, so none is advertised.
     assert descriptor["telemetry"]["providers"] == {}
     # Runtime capabilities are declared explicitly rather than left to defaults.

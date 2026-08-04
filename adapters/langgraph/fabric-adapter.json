@@ -80,7 +80,14 @@
   },
   "requirements": {},
   "config": {
-    "accepts": ["models", "tools", "tools.blocked", "mcp"]
+    "accepts": [
+      "models",
+      "models.base_url",
+      "models.temperature",
+      "tools",
+      "tools.blocked",
+      "mcp"
+    ]
   },
   "capabilities": {
     "cancellation": false,
