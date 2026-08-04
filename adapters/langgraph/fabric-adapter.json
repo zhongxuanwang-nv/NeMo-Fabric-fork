@@ -1,0 +1,17 @@
+{
+  "contract_version": "fabric.adapter/v1alpha1",
+  "adapter_id": "nvidia.fabric.langgraph",
+  "harness": "langgraph",
+  "adapter_kind": "python",
+  "runner": {
+    "module": "nemo_fabric_adapters.langgraph.adapter",
+    "callable": "run"
+  },
+  "requirements": {},
+  "config": {
+    "accepts": ["models", "tools", "tools.blocked", "mcp"]
+  },
+  "telemetry": {
+    "providers": {}
+  }
+}

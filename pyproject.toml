@@ -56,6 +56,10 @@ adapters-hermes = [
   "nemo-fabric-adapters-hermes == 0.1.0; python_version < '3.14'",
 ]
 
+adapters-langgraph = [
+  "nemo-fabric-adapters-langgraph == 0.1.0",
+]
+
 codex = [
   "nemo-fabric-adapters-codex == 0.1.0",
 ]
@@ -78,6 +82,10 @@ hermes = [
   "hermes-agent>=0.17.0; python_version < '3.14'",
 ]
 
+langgraph = [
+  "nemo-fabric-adapters-langgraph[mcp,models,state] == 0.1.0",
+]
+
 relay = [
   # Allow the current 0.5 line and the upcoming 0.6 release; resolves to 0.5.x
   # today and adopts 0.6 automatically once it is published.
@@ -98,6 +106,9 @@ adapters = [
   # and test environments exercise the SDK-native NeMo Relay integration.
   "nemo-fabric-adapters-deepagents[relay]",
   "nemo-fabric-adapters-hermes; python_version < '3.14'",
+  # Install the LangGraph adapter with the optional extras its Fabric-managed
+  # model, MCP, and state features need, so tests exercise the full surface.
+  "nemo-fabric-adapters-langgraph[mcp,models,state]",
 ]
 
 dev = [
@@ -134,6 +145,7 @@ nemo-fabric-adapters-claude = { path = "adapters/claude", editable = true }
 nemo-fabric-adapters-codex = { path = "adapters/codex", editable = true }
 nemo-fabric-adapters-deepagents = { path = "adapters/deepagents", editable = true }
 nemo-fabric-adapters-hermes = { path = "adapters/hermes", editable = true }
+nemo-fabric-adapters-langgraph = { path = "adapters/langgraph", editable = true }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

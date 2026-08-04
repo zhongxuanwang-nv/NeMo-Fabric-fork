@@ -37,6 +37,20 @@ just build-all
   --input "Reply with exactly: fabric works"
 ```
 
+## Custom LangGraph agents
+
+[`langgraph`](langgraph/README.md) holds two representative custom LangGraph
+agents that validate the generic
+[LangGraph adapter](../adapters/langgraph/README.md). One is an existing compiled
+graph that runs unchanged; the other is a factory graph that opts into
+Fabric-managed models, MCP tools, tool policy, and durable multi-turn state. Both
+use the same adapter ID.
+
+```bash
+pip install -e '.[langgraph,runtime]'
+pytest tests/adapters/test_langgraph_adapter.py
+```
+
 ## Harbor
 
 [`harbor`](harbor/README.md) demonstrates how to evaluate Fabric agents with

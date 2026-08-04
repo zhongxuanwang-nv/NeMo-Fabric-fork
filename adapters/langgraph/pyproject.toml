@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = [
+  "setuptools>=77",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nemo-fabric-adapters-langgraph"
+version = "0.1.0"
+description = "Generic LangGraph adapter for NeMo Fabric"
+authors = [
+  { name = "NVIDIA Corporation" },
+]
+keywords = ["agents", "ai", "langgraph", "nemo-fabric", "runtime", "tools"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "nemo-fabric-adapters-common == 0.1.0",
+  "langchain-core>=0.3,<2.0",
+  "langgraph>=1.2,<2.0",
+]
+
+[project.optional-dependencies]
+# Fabric-managed chat models. Only needed when a graph consumes
+# LangGraphAdapterContext.chat_model(...); a compiled graph that builds its own
+# model does not require this extra.
+models = [
+  "langchain>=1.3,<2.0",
+  "langchain-openai>=0.3",
+]
+# Fabric-managed MCP tools. Only needed when a graph consumes
+# LangGraphAdapterContext.mcp_tools().
+mcp = [
+  "langchain-mcp-adapters>=0.1,<0.3.0",
+]
+# Adapter-owned checkpoint persistence for ``state: adapter``. Requires 3.x: the
+# 2.x line is incompatible with the langgraph 1.2 core (AsyncSqliteSaver fails
+# with 'Connection has no attribute is_alive').
+state = [
+  "langgraph-checkpoint-sqlite>=3.0,<4.0",
+]
+
+[project.urls]
+Repository = "https://github.com/NVIDIA/nemo-fabric/"
+Documentation = "https://nvidia-nemo-fabric.docs.buildwithfern.com/nemo/fabric"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["nemo_fabric_adapters.langgraph*"]
+
+[tool.setuptools.data-files]
+"share/nemo-fabric/adapters/langgraph" = ["fabric-adapter.json"]
+
+[tool.uv.sources]
+nemo-fabric-adapters-common = { path = "../common", editable = true }

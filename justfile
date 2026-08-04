@@ -10,7 +10,7 @@ no_uv := "false"
 # When set, versioning and packaging targets use this exact release version.
 ref_name := ""
 
-python_projects := ". python adapters/common adapters/claude adapters/codex adapters/deepagents adapters/hermes"
+python_projects := ". python adapters/common adapters/claude adapters/codex adapters/deepagents adapters/hermes adapters/langgraph"
 
 bash_helpers := '''
 set -euo pipefail
@@ -337,7 +337,7 @@ test-python:
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ "{{ no_uv }}" != "true" ]]; then
-        uv sync --group test --no-group dev --extra claude --extra codex --extra deepagents --extra harbor --extra hermes --extra relay --extra runtime
+        uv sync --group test --no-group dev --extra claude --extra codex --extra deepagents --extra harbor --extra hermes --extra langgraph --extra relay --extra runtime
     fi
     uv run --no-sync pytest
 
