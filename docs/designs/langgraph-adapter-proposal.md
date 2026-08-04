@@ -234,10 +234,28 @@ Neither exists in Fabric yet (requirement 8). LangGraph's semantics for them:
 
 ## Initially Unsupported
 
-Streaming, cancellation, config updates, service lifecycle, and Fabric skills are
-unsupported for the same reasons the parent document gives for NAT, and the
-descriptor declares all four runtime capabilities `false`. Requirements 1, 5, 6, and
-8 cover the contract gaps. What is unsupported specifically because of LangGraph:
+Cancellation, config updates, service lifecycle, and Fabric skills are unsupported
+for the same reasons the parent document gives for NAT, and the descriptor declares
+all four runtime capabilities `false`. Requirements 1, 5, 6, and 8 cover the contract
+gaps.
+
+**Streaming needs a distinction.** `capabilities.streaming` means "whether
+invocations can emit progressive output" — the result channel back to the Fabric
+caller — and the Python adapter transport cannot do it, since it runs a subprocess to
+completion and parses one stdout document. That is separate from NeMo Relay's ATOF
+event stream, which is genuinely live: its endpoints support `http_post`,
+`websocket`, and `ndjson`. So live observability is available through the telemetry
+channel even while the result channel is not, and declaring `streaming: false` does
+not contradict emitting ATOF.
+
+This adapter does not emit ATOF **yet**, for a different reason: it declares no
+telemetry provider until one is validated end to end. LangGraph makes the gap
+particularly visible — `astream` already yields incremental node and message events,
+and the adapter already consumes them to attribute usage to the turn and build the
+bounded event summary. The incremental data exists; there is simply no channel to
+forward it live, so it is buffered and reported after completion.
+
+What is unsupported specifically because of LangGraph:
 
 | Capability | Reason |
 | --- | --- |

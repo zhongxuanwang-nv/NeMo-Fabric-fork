@@ -171,8 +171,12 @@ isolated.
   server's copy; the tool itself is not renamed.
 - **Output must be JSON-safe.** An unserializable projection fails with a
   normalized error instead of a corrupted result.
-- **No streaming or cancellation.** Fabric's Python adapter runtime invokes an
-  adapter to completion and returns one result.
+- **No progressive output or cancellation.** Fabric's Python adapter runtime invokes
+  an adapter to completion and returns one result, so `capabilities.streaming` is
+  `false`. The graph is still streamed internally with `astream`, but those events are
+  buffered and reported afterwards through `events: summary` rather than forwarded
+  live. NeMo Relay's ATOF is a separate live channel and is unaffected by this flag;
+  this adapter does not emit it until a telemetry provider is validated.
 - **Interrupts cannot be answered.** A graph that calls `interrupt()` returns a
   normalized incomplete result with `interrupted: true` and the interrupt payload,
   rather than a partial success. Under `state: graph` or `state: adapter` the
