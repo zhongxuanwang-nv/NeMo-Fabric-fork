@@ -311,23 +311,38 @@ factory agent additionally run against a live NVIDIA endpoint across two turns.
 
 ## Open Decisions
 
-The ten contract requirements above each need a decision in the parent document.
-Decisions specific to this adapter:
+The eleven contract requirements above each need a decision in the parent document.
+Decisions specific to this adapter, with a recommendation where there is one:
 
-1. Which requirements gate publishing this adapter? Requirement 1 blocks it
-  outright, and resolving it also removes the packaging workaround in `TODO.md`.
-2. Should `runnable_factory` and `current_context()` remain supported for NAT
-  portability, or should Fabric support only the explicit `factory` contract?
-3. Which production or partner agents replace the two example fixtures as long-term
-  compatibility cases?
-4. Which NeMo Relay LangGraph integration version has an approved validation path,
-  so telemetry can be declared?
+1. **Which requirements gate publishing this adapter?** Requirement 1 blocks it
+   outright: a consumer who installs the wheel cannot use it, because Fabric will not
+   find the descriptor. Resolving it also removes the packaging workaround in
+   `TODO.md`. Recommendation: treat 1 as blocking and 2 and 3 as required before a
+   second third-party adapter is written, since without them each adapter invents its
+   own validation and rejection behavior.
+2. **Should `runnable_factory` and `current_context()` remain supported?** Both exist
+   only for NAT portability, and both are extra public surface Fabric must keep
+   working. Recommendation: keep `runnable_factory`, which is one branch in the loader
+   and lets a graph written for `langgraph_wrapper` run unchanged; treat
+   `current_context()` as provisional, since ambient state is easy to misuse and the
+   explicit `factory` argument is always available.
+3. **Which production or partner agents replace the two example fixtures?** The
+   current agents were written for this validation, so they cannot prove the adapter
+   was not designed around them. Needed: at least one real agent that predates any
+   Fabric involvement, ideally exercising a feature neither fixture touches, such as
+   `Store`, `Send` fan-out, or structured output.
+4. **Which NeMo Relay LangGraph integration version has an approved validation
+   path?** Until one is named, the descriptor declares no telemetry provider, so
+   enabling telemetry fails at plan time and no ATOF or OTel flows from a LangGraph
+   agent. The merge point already exists as `context.callbacks`; what is missing is
+   the Relay-side integration equivalent to `nemo_relay.integrations.deepagents` and
+   an end-to-end test pinning the version pair.
 
 ## References
 
 - Third Party Adapters for Fabric (Ajay Thorve) — the parent contract document.
 - [NAT third-party plugin packages](https://docs.nvidia.com/nemo/agent-toolkit/latest/extend/third-party-plugins.html)
 - [Running existing LangGraph agents in NAT](https://docs.nvidia.com/nemo/agent-toolkit/latest/run-workflows/existing-agents/langgraph.html)
-- `[adapters/deepagents/](../../adapters/deepagents/README.md)` — in-repo precedent
-for a LangGraph-based harness.
+- [`adapters/deepagents/`](../../adapters/deepagents/README.md) — in-repo precedent
+  for a LangGraph-based harness.
 
