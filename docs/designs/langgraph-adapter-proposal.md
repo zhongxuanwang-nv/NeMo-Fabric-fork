@@ -9,6 +9,11 @@ Continues **Third Party Adapters for Fabric** (Ajay Thorve), which establishes t
 third-party adapter contract with NAT as the first reference implementation and
 leaves this section as two options to decide between.
 
+The purpose is not LangGraph support on its own. It is to confirm that one contract
+can serve independently developed adapters, and to feed the changes that contract
+still needs back into the parent document. Those are collected in
+[Contract Requirements](#contract-requirements-from-two-implementations).
+
 | | |
 | --- | --- |
 | **Status** | In Progress |
@@ -36,8 +41,9 @@ the contract holds here, it is framework-independent rather than shaped around N
 - Keep the normalized-versus-`harness.settings` boundary identical in meaning to
   the NAT adapter.
 - Reject capabilities the adapter cannot enforce instead of ignoring them.
-- Report where the contract does **not** transfer from NAT, so those gaps are
-  decided rather than discovered later.
+- Specify the contract changes a standardized third-party adapter contract needs,
+  each evidenced by two independent implementations rather than one framework's
+  convenience.
 
 ## Success Criteria
 
@@ -49,8 +55,9 @@ the contract holds here, it is framework-independent rather than shaped around N
 | Runtime reuse retains graph state across `invoke` calls and isolates runtimes | Met |
 | Both agents run end to end through the real Fabric runtime | Met |
 | One adapter serves every custom agent, with no per-agent adapter | Met |
-| Clean installation discovers an external adapter wheel | **Blocked** on descriptor discovery |
-| Normalized system instructions map to a graph | **Blocked** on `instructions` in `FabricConfig` |
+| Clean installation discovers an external adapter wheel | **Blocked** — requirement 1 |
+| Normalized system instructions map to a graph | **Blocked** — requirement 8 |
+| The contract's gaps are specified, not just encountered | Met — 10 requirements below |
 
 ## Option 1: Application-Specific Adapter
 
@@ -83,6 +90,31 @@ argument instead of an ambient accessor.
 custom process or container lifecycle, server-side streaming or cancellation, or a
 non-JSON request/result protocol. A new prompt, state schema, node, subgraph,
 application tool, retriever, routing policy, or output field never justifies it.
+
+## Contract Requirements From Two Implementations
+
+The main output for the parent document. Each row is a gap that both NAT and this
+adapter hit independently, so it belongs in the shared contract rather than in
+either adapter. Detail for the LangGraph column is in the sections below.
+
+| # | Gap | NAT evidence | LangGraph evidence | Contract change |
+| --- | --- | --- | --- | --- |
+| 1 | **Installed adapters are not discoverable.** `AdapterRegistry` scans only `<repo>/adapters/` and `<base_dir>/adapters/`. | Success criterion "discover an external adapter wheel without modifying Fabric core" is unmet. | The wheel installs its descriptor to `share/nemo-fabric/adapters/langgraph/`; nothing reads it. | Define **one** mechanism — an entry-point group or a `share/nemo-fabric/adapters` scan under `sys.prefix` — and have the registry use it. Blocking for any third party. |
+| 2 | **Settings are not declared or centrally validated.** `settings_schema` is absent from `adapter-descriptor.schema.json`, so it survives only as an untyped `extensions` passthrough. | Publishes `settings_schema`, then defers authoritative validation to its own registry. | Publishes `settings_schema` and hand-validates in the adapter, rejecting unknown keys itself. | Promote `settings_schema` to a typed descriptor field and validate `harness.settings` against it at plan time, so settings errors are uniform and pre-execution. |
+| 3 | **Capability acceptance cannot be conditional.** `config.accepts` is a static list, but what an adapter can enforce depends on its settings. | A custom workflow cannot take normalized instructions or auto-attached MCP; ReAct can. Same `accepts` list. | `tools.blocked`, Fabric MCP, and `state: adapter` are enforceable for `factory` but not `compiled`. Same `accepts` list. | Add a plan-time adapter validation hook, or declarative conditional accepts, so rejection is uniform and happens before execution instead of each adapter hand-rolling it at invoke. |
+| 4 | **Where runtime state lives is unspecified.** `adapter_kind: python` spawns a subprocess per invoke; `start` only preflights and `stop` emits an event. | Design retains builder, workflow, sessions, and MCP clients in memory across `invoke` — not possible under this kind. | Keys a durable checkpoint to `runtime_id` instead, which the current kind supports. | State that `runtime_id` is the state key for `adapter_kind: python`, and add a distinct persistent kind if in-memory retention is required rather than overloading `python`. |
+| 5 | **The adapter result envelope has no schema.** Thirteen schemas exist; none covers the adapter's stdout. `RunResult.output` is opaque. | Converts NAT results to "the Fabric adapter response contract" by convention. | Reproduces `response`/`failed`/`messages` by copying existing adapters. | Schema the stdout envelope, and add a general adapter-artifact key: only `relay_artifacts` of kind `atof`/`atif` currently reach the manifest. |
+| 6 | **No status for a run that stopped needing input.** | Human-in-the-loop will need one. | `interrupt()` returns with `__interrupt__`; the adapter invents `interrupted`/`interrupts`. | Add a normalized incomplete/needs-input outcome so adapters do not each invent a different shape for the same situation. |
+| 7 | **Tool selector semantics are not specified.** | `<group>__<member>` is canonical, and members are renamed. | MCP tools carry bare names; the optional prefix joins with a single ambiguous underscore. The adapter resolves both forms without renaming. | Specify `__` as the separator, whether adapters rename or resolve, and the `enabled` then `blocked` precedence once `tools.enabled` exists. |
+| 8 | **Two declared capabilities do not exist.** `ToolsConfig` has only `blocked`; `FabricConfig` has no `instructions`. | Descriptor accepts `instructions.system` and `tools.enabled`. | Cannot consume either; carries prompt intent through uninterpreted `agent` settings. | Add both to `FabricConfig`, and deliver `instructions.system` only where an adapter declares a mapping, since LangGraph has no equivalent of ReAct `additional_instructions`. |
+| 9 | **Normalization is copied, not shared.** | Maps `models.*` to NAT `llms` with provider, key env, base URL, temperature. | Provider defaults, key-env resolution, and MCP transport normalization were copied near-verbatim from the Deep Agents adapter. | Move model-alias and MCP-transport normalization into `nemo-fabric-adapters-common` so third parties do not re-derive provider defaults and drift. |
+| 10 | **Naming is inconsistent.** | `nvidia.nemo.platform.nat`, `nemo_platform_fabric_adapter_nat`. | `nvidia.fabric.langgraph`, `nemo_fabric_adapters.langgraph`. | Adopt one provider token across repository, distribution, import package, `adapter_id`, and `harness`, as the toolkit's plugin naming table does. |
+
+Requirements 1 through 3 gate third-party adapters at all: without discovery an
+adapter cannot be installed, and without declared settings and conditional
+capability acceptance every adapter invents its own validation and failure
+behavior. Requirements 4 through 8 are correctness and uniformity of the shared
+contract. Requirements 9 and 10 reduce duplication and drift.
 
 ## LangGraph Behaviors That Shape The Design
 
@@ -272,22 +304,17 @@ factory agent additionally run against a live NVIDIA endpoint across two turns.
 
 ## Open Decisions
 
-1. Is `__` confirmed as the canonical cross-adapter tool-selector separator? This
-   adapter resolves it without renaming tools; NAT renames members. Should the
-   separator and the rename-or-resolve choice be specified centrally?
-2. Does NAT's in-memory runtime retention require a persistent Python adapter
-   runtime or a different adapter kind, given `adapter_kind: python` is
-   subprocess-per-invoke?
-3. Should installed-descriptor discovery land before this adapter is published? It
-   is the one blocked success criterion and also removes the packaging workaround
-   in `TODO.md`.
-4. Should `runnable_factory` and `current_context()` remain supported for NAT
+The ten contract requirements above each need a decision in the parent document.
+Decisions specific to this adapter:
+
+1. Which requirements gate publishing this adapter? Requirement 1 is the only
+   blocked success criterion, and it also removes the packaging workaround in
+   `TODO.md`.
+2. Should `runnable_factory` and `current_context()` remain supported for NAT
    portability, or should Fabric support only the explicit `factory` contract?
-5. Should a partner-owned LangGraph adapter use its own namespace, as NAT does with
-   `nvidia.nemo.platform.nat`, rather than `nvidia.fabric.langgraph`?
-6. Which production or partner agents replace the two example fixtures as long-term
+3. Which production or partner agents replace the two example fixtures as long-term
    compatibility cases?
-7. Which NeMo Relay LangGraph integration version has an approved validation path,
+4. Which NeMo Relay LangGraph integration version has an approved validation path,
    so telemetry can be declared?
 
 ## References
