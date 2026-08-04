@@ -55,10 +55,14 @@ def resolve_search_paths(entrypoint: EntrypointSettings, base_dir: str) -> list[
 def load_entrypoint(entrypoint: EntrypointSettings, base_dir: str) -> Any:
     """Import the configured target and validate it against the declared kind."""
 
+    # Appended rather than prepended: a prepended agent directory that happens to
+    # contain a module named like a standard-library or installed one would shadow
+    # it for the rest of the process, which fails in ways that look unrelated to
+    # this configuration.
     for path in resolve_search_paths(entrypoint, base_dir):
         text = str(path)
         if text not in sys.path:
-            sys.path.insert(0, text)
+            sys.path.append(text)
 
     try:
         module = importlib.import_module(entrypoint.module)

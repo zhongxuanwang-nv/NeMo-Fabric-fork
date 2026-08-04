@@ -104,7 +104,10 @@ All settings live under `harness.settings.langgraph`. Unknown keys are rejected.
 | --- | --- | --- |
 | `target` | required | `module.path:attribute` reference to the graph or factory |
 | `kind` | `compiled` | `compiled`, `factory`, or `runnable_factory` |
-| `search_paths` | `[]` | Directories relative to `base_dir` added to the import path |
+| `search_paths` | `[]` | Directories relative to `base_dir`, appended to the import path |
+
+Search paths must stay inside `base_dir`, and are appended rather than prepended so
+an agent directory cannot shadow the standard library or an installed package.
 
 | `kind` | Target shape | Fabric integration |
 | --- | --- | --- |
@@ -163,9 +166,18 @@ isolated.
   tools directly owns that boundary.
 - **Output must be JSON-safe.** An unserializable projection fails with a
   normalized error instead of a corrupted result.
-- **No streaming, cancellation, or interrupts.** Fabric's Python adapter runtime
-  invokes an adapter to completion and returns one result. A graph that
-  interrupts cannot resume through Fabric today.
+- **No streaming or cancellation.** Fabric's Python adapter runtime invokes an
+  adapter to completion and returns one result.
+- **Interrupts cannot be answered.** A graph that calls `interrupt()` returns a
+  normalized incomplete result with `interrupted: true` and the interrupt payload,
+  rather than a partial success. Under `state: graph` or `state: adapter` the
+  thread stays checkpointed, so LangGraph can resume it directly.
+- **Subgraph usage depends on state merging.** A composed subgraph whose messages
+  merge into the parent state is counted normally; one that keeps its messages in
+  a separate channel contributes no token usage.
+- **Adapter files are metadata, not artifacts.** The checkpoint database path is
+  reported as `checkpoint_path`, because Fabric promotes only relay artifacts into
+  the artifact manifest.
 - **No graph-level telemetry yet.** The descriptor advertises no telemetry
   provider until one is validated end to end; `context.callbacks` is the merge
   point for when it is.

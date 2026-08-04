@@ -380,6 +380,33 @@ def test_factory_agent_binds_model_tools_policy_and_state(
     assert "Review the case." in str(fake_model.calls[0])
 
 
+def test_blocked_mcp_tool_cannot_execute(
+    tmp_path: Path, fake_model: FakeChatModel, fake_mcp: None
+) -> None:
+    payload = build_payload(
+        tmp_path,
+        case_review_settings(output={"mode": "state"}),
+        request_input="what does the contract say?",
+        models={"default": {"provider": "nvidia", "model": "fake-model"}},
+        # Block the MCP-provided tool, not the application tool.
+        blocked=["search_docs"],
+        mcp_servers={"docs": {"transport": "streamable_http", "url": "http://localhost:1"}},
+    )
+
+    result = adapter.run(payload)
+
+    assert result["failed"] is False, result["error"]
+    findings = result["response"]["findings"]
+    assert any(
+        "search_docs: Tool 'search_docs' is blocked by the configured tools policy" in finding
+        for finding in findings
+    ), findings
+    # The MCP tool's real output never appeared.
+    assert not any("docs:what does the contract say?" in finding for finding in findings)
+    # The unblocked application tool still ran.
+    assert any("precedent:what does the contract say?" in finding for finding in findings)
+
+
 def test_factory_agent_projects_domain_field(
     tmp_path: Path, fake_model: FakeChatModel, fake_mcp: None
 ) -> None:
@@ -561,6 +588,154 @@ def test_runnable_factory_cannot_receive_adapter_owned_state(tmp_path: Path) -> 
 
     assert result["failed"] is True
     assert "state 'adapter' cannot be applied to a 'runnable_factory'" in result["error"]
+
+
+INTERRUPTING_AGENT = '''
+from typing import Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
+
+
+class State(TypedDict, total=False):
+    question: str
+    answer: str
+
+
+def build(_context: Any) -> Any:
+    def confirm(state: State) -> dict[str, Any]:
+        approved = interrupt({"confirm": state.get("question", "")})
+        return {"answer": f"approved:{approved}"}
+
+    workflow = StateGraph(State)
+    workflow.add_node("confirm", confirm)
+    workflow.add_edge(START, "confirm")
+    workflow.add_edge("confirm", END)
+    return workflow.compile(checkpointer=_context.checkpointer)
+'''
+
+
+def test_interrupting_graph_reports_an_incomplete_run(tmp_path: Path) -> None:
+    # A graph that interrupts returns normally with the interrupt in state, so
+    # without explicit detection this would surface as an unrelated projection
+    # error about the 'answer' field the graph never reached.
+    search_path = write_external_agent(tmp_path, INTERRUPTING_AGENT, name="interrupting_agent")
+    payload = build_payload(
+        tmp_path,
+        {
+            "entrypoint": {
+                "target": "interrupting_agent:build",
+                "kind": "factory",
+                "search_paths": [search_path],
+            },
+            "input": {"mode": "field", "field": "question"},
+            "output": {"mode": "field", "field": "answer"},
+            "state": "adapter",
+        },
+        request_input="ship it?",
+    )
+
+    result = adapter.run(payload)
+
+    assert result["failed"] is True
+    assert result["interrupted"] is True
+    assert len(result["interrupts"]) == 1, result["interrupts"]
+    interrupt = result["interrupts"][0]
+    assert interrupt["value"] == {"confirm": "ship it?"}
+    assert isinstance(interrupt["id"], str) and interrupt["id"]
+    assert "stopped at 1 pending interrupt(s)" in result["error"]
+    assert "no interaction contract" in result["error"]
+    # The thread is still checkpointed, so LangGraph can resume it directly.
+    assert result["checkpoint_path"], result
+    assert Path(result["checkpoint_path"]).is_file()
+
+
+def test_completed_run_reports_no_interrupts(tmp_path: Path, fake_model: FakeChatModel) -> None:
+    result = adapter.run(
+        build_payload(
+            tmp_path,
+            {
+                "entrypoint": {"target": TRIAGE_TARGET, "kind": "compiled"},
+                "input": {"mode": "field", "field": "ticket"},
+            },
+        )
+    )
+
+    assert result["failed"] is False, result["error"]
+    assert result["interrupted"] is False
+    assert result["interrupts"] == []
+    # No adapter-owned checkpoint exists for state 'none'.
+    assert result["checkpoint_path"] is None
+
+
+SUBGRAPH_AGENT = '''
+from typing import Annotated, Any, TypedDict
+
+from langchain_core.messages import AIMessage
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+
+
+class State(TypedDict, total=False):
+    question: str
+    messages: Annotated[list, add_messages]
+
+
+def _usage(tokens: int) -> dict[str, int]:
+    return {"input_tokens": tokens, "output_tokens": tokens, "total_tokens": tokens * 2}
+
+
+def build(_context: Any) -> Any:
+    def researcher(state: State) -> dict[str, Any]:
+        return {"messages": [AIMessage(content="researched", usage_metadata=_usage(5))]}
+
+    inner = StateGraph(State)
+    inner.add_node("researcher", researcher)
+    inner.add_edge(START, "researcher")
+    inner.add_edge("researcher", END)
+
+    def writer(state: State) -> dict[str, Any]:
+        return {"messages": [AIMessage(content="written", usage_metadata=_usage(1))]}
+
+    outer = StateGraph(State)
+    outer.add_node("research_team", inner.compile())
+    outer.add_node("writer", writer)
+    outer.add_edge(START, "research_team")
+    outer.add_edge("research_team", "writer")
+    outer.add_edge("writer", END)
+    return outer.compile()
+'''
+
+
+def test_composed_subgraph_usage_is_counted_once(tmp_path: Path) -> None:
+    # Validates the design claim that a multi-agent graph composing local
+    # subgraphs fits factory mode, and that a subgraph's tokens are counted
+    # exactly once rather than missed or double counted.
+    search_path = write_external_agent(tmp_path, SUBGRAPH_AGENT, name="subgraph_agent")
+    payload = build_payload(
+        tmp_path,
+        {
+            "entrypoint": {
+                "target": "subgraph_agent:build",
+                "kind": "factory",
+                "search_paths": [search_path],
+            },
+            "input": {"mode": "field", "field": "question"},
+            "output": {"mode": "last_message"},
+            "events": {"mode": "summary"},
+        },
+        request_input="summarize the filing",
+    )
+
+    result = adapter.run(payload)
+
+    assert result["failed"] is False, result["error"]
+    assert result["response"] == "written"
+    # Both the subgraph's and the parent's messages reach the final state.
+    assert [message["content"] for message in result["messages"]] == ["researched", "written"]
+    # 5 + 1 in and out; the subgraph message is neither dropped nor counted twice.
+    assert result["usage"] == {"prompt_tokens": 6, "completion_tokens": 6, "total_tokens": 12}
+    assert result["events"] == [{"nodes": ["research_team"]}, {"nodes": ["writer"]}]
 
 
 AMBIENT_CONTEXT_AGENT = '''

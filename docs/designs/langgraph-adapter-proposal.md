@@ -74,7 +74,8 @@ The adapter must:
   importing Fabric internals.
 - Preserve the current Fabric lifecycle: resolve, prepare, start, invoke, stop.
 - Surface normalized output, errors, runtime identifiers, and metadata through
-  `RunResult`.
+  `RunResult`, and report an unfinished run as unfinished rather than as a
+  success or as an unrelated projection error.
 - Be releasable and supportable as a third-party adapter, even while its first
   versions reside in this repository.
 
@@ -119,6 +120,15 @@ descriptor deployment step or a descriptor-discovery enhancement.
 `python -m <runner.module>` and communicates over stdin and stdout JSON; it never
 imports the named callable. The adapter must therefore expose a `__main__` entry
 that reads the payload, prints one JSON object, and exits non-zero on failure.
+
+A third constraint bounds what the adapter can promise about artifacts.
+`promote_relay_artifacts_to_manifest` is the only path from adapter output into
+`RunResult.artifacts`, and it accepts only the `atof` and `atif` kinds from a
+`relay_artifacts` list. An adapter therefore **cannot** register an arbitrary
+adapter-created file, such as a checkpoint database, as a first-class Fabric
+artifact today. The adapter reports such paths as result metadata instead, and
+first-class artifact registration waits on either a validated telemetry provider
+or a general adapter-artifact key.
 
 ## Third-Party Ownership Model
 
@@ -208,9 +218,11 @@ The adapter executes these stages for every invocation:
 6. Convert the Fabric request into graph input using the configured mapping.
 7. Stream the graph so token usage is attributable to this turn, buffering a
    bounded event summary.
-8. Project the final state into a normalized, JSON-safe response.
-9. Return failures as normalized adapter results, without exposing credentials or
-   raw tracebacks.
+8. Detect a pending interrupt before projecting output, and report an incomplete
+   run instead of a partial success.
+9. Project the final state into a normalized, JSON-safe response.
+10. Return failures as normalized adapter results, without exposing credentials or
+    raw tracebacks.
 
 The adapter does not cache a customer graph globally. A factory constructs its
 graph from the current runtime context, and adapter-owned state resources are
@@ -269,9 +281,10 @@ config.harness = HarnessConfig(
 The adapter rejects an entry point of the wrong kind before invoking the graph,
 and names the correct kind in the error. It resolves a module through the normal
 interpreter import path; `entrypoint.search_paths` may add directories, but they
-must be relative to `base_dir` and must not escape it. The application is
-responsible for installing the custom agent package in the adapter's Python
-environment.
+must be relative to `base_dir`, must not escape it, and are **appended** to
+`sys.path` rather than prepended, so an agent directory cannot shadow the standard
+library or an installed package. The application is responsible for installing the
+custom agent package in the adapter's Python environment.
 
 `search_paths` is the counterpart to the toolkit's `dependencies` list, which is
 what makes an unpackaged agent directory usable without code changes. It is
@@ -369,8 +382,33 @@ Relay versions. `context.callbacks` is the merge point for when it does.
 
 The adapter streams the graph so token usage can be attributed to the current
 turn, which matters on a resumed thread whose final state replays earlier turns.
-Events are always bounded; `events: summary` reports them after completion. This
-is not Fabric progressive streaming.
+Messages are de-duplicated by id, because a node that returns its whole message
+list rather than only new messages would otherwise have earlier messages counted
+again on every step. Events are always bounded; `events: summary` reports them
+after completion. This is not Fabric progressive streaming.
+
+The adapter deliberately does **not** stream with `subgraphs=True`, unlike the
+Deep Agents adapter. A composed LangGraph subgraph merges its output into the
+parent state, so the parent's node update already carries the subgraph's messages;
+enabling subgraph streaming emits them a second time and also emits subgraph-level
+final-state chunks that would overwrite the root graph's final state. Deep Agents
+needs it because a delegated subagent runs in a separate state channel. The
+consequence for LangGraph is that a subgraph which does not merge its messages
+into the parent state contributes no usage, which is a documented limitation
+rather than a silent miscount.
+
+### Interrupts
+
+A graph that calls `interrupt()` returns normally, recording the pending interrupt
+under a private `__interrupt__` state key rather than raising. Without explicit
+handling this is actively misleading: output projection would either report
+success on a partial state or fail with an unrelated error about the field the
+graph never reached. The adapter therefore checks for pending interrupts before
+projecting output and returns a normalized incomplete result that names the
+interrupt, reports `interrupted`, and includes each JSON-safe interrupt payload.
+Under `state: graph` or `state: adapter` the thread stays checkpointed, so
+LangGraph can resume it directly even though Fabric has no interaction contract
+to answer it.
 
 ### Tools and Permissions
 
@@ -409,10 +447,16 @@ implementation passes:
   JSON-safe `state` projection, and `passthrough` input.
 - Compiled mode failing clearly when asked for `tools.blocked`, Fabric MCP
   servers, or `state: adapter`, and succeeding with `state: graph`.
-- Factory mode binding a Fabric model alias, loading MCP tools, denying a blocked
-  application tool without executing it, and projecting a domain field.
+- Factory mode binding a Fabric model alias, loading MCP tools, and projecting a
+  domain field.
+- Tool policy denying a blocked **application** tool and a blocked **MCP** tool
+  without either one executing, while unblocked tools still run.
 - State reuse across two invocations on one runtime, including accurate `resumed`
   reporting, and isolation between distinct runtimes.
+- An interrupting graph reporting an incomplete run with its interrupt payload and
+  a preserved checkpoint, rather than a partial success.
+- A multi-agent graph composing a local subgraph, with the subgraph's tokens
+  counted exactly once.
 - The `runnable_factory` shape receiving Fabric's thread ID through a
   `RunnableConfig`, and the ambient `current_context()` shim.
 - Entry-point loading failures: unimportable module, missing attribute, wrong
@@ -431,9 +475,10 @@ and that a started runtime resumed the same LangGraph thread across two turns.
 
 These cases deliberately cover both ends of the intended support range. A
 multi-agent graph that composes local LangGraph subgraphs also fits factory mode,
-because the top-level factory can construct its subgraphs from the same context.
-Remote subgraphs remain a limitation because their internal tools, telemetry, and
-state are outside the local adapter process.
+because the top-level factory can construct its subgraphs from the same context;
+the validation suite covers that case directly. Remote subgraphs remain a
+limitation because their internal tools, telemetry, and state are outside the
+local adapter process.
 
 ## Configuration, Extension, or Dedicated Adapter
 
@@ -466,10 +511,16 @@ The first version documents these limits plainly:
 - Checkpoint behavior depends on the selected state mode. Cross-machine state,
   external database checkpointing, and graph-managed migrations are owned by the
   graph unless a later adapter state backend adds them.
-- The current Fabric adapter runtime does not expose LangGraph interrupts, live
-  token events, cancellation, or long-lived service operations. A graph that
-  interrupts cannot resume through Fabric until Fabric adds an interaction
-  contract.
+- The current Fabric adapter runtime does not expose live token events,
+  cancellation, or long-lived service operations. A graph that interrupts returns
+  a normalized incomplete result; it cannot be answered through Fabric until
+  Fabric adds an interaction contract, though a checkpointed thread can be resumed
+  by LangGraph directly.
+- A subgraph that does not merge its messages into the parent state contributes no
+  token usage, because the adapter does not stream subgraph namespaces.
+- Adapter-created files such as a checkpoint database are reported as result
+  metadata, not registered in `RunResult.artifacts`, because Fabric promotes only
+  relay `atof` and `atif` artifacts from adapter output.
 - Remote graphs and remote subgraphs can be invoked only if their client fits the
   local graph contract; Fabric cannot assert their internal permission or
   telemetry behavior.

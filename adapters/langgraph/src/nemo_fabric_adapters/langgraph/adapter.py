@@ -106,12 +106,14 @@ async def run_langgraph(payload: dict[str, Any]) -> dict[str, Any]:
 
     settings: LangGraphSettings | None = None
     thread_id: str | None = None
+    checkpoint_path: str | None = None
     resumed = False
     final_state: Any = None
     response: Any = None
     events: list[dict[str, Any]] = []
     turn_messages: list[dict[str, Any]] = []
     bound_models: list[dict[str, Any]] = []
+    interrupts: list[dict[str, Any]] = []
     error: str | None = None
     checkpointer: Any = None
 
@@ -132,9 +134,9 @@ async def run_langgraph(payload: dict[str, Any]) -> dict[str, Any]:
             thread_id = state_support.thread_id_for(str(runtime_id))
 
         if settings.state == "adapter":
-            checkpointer = await state_support.open_checkpointer(
-                state_support.checkpoint_path(payload, str(runtime_id))
-            )
+            checkpoint = state_support.checkpoint_path(payload, str(runtime_id))
+            checkpoint_path = str(checkpoint)
+            checkpointer = await state_support.open_checkpointer(checkpoint)
             resumed = await state_support.has_checkpoint(checkpointer, str(thread_id))
 
         runnable_config = build_runnable_config(settings, thread_id)
@@ -159,6 +161,15 @@ async def run_langgraph(payload: dict[str, Any]) -> dict[str, Any]:
         final_state, events, turn_messages = await invoke_graph(
             graph, graph_input, runnable_config, settings
         )
+
+        interrupts = normalize.pending_interrupts(final_state)
+        if interrupts:
+            raise normalize.GraphInterruptedError(
+                f"the graph stopped at {len(interrupts)} pending interrupt(s) and Fabric has no "
+                "interaction contract to answer them, so the run is incomplete. With state 'graph' "
+                "or 'adapter' the thread is checkpointed and can be resumed by LangGraph directly."
+            )
+
         response = normalize.project_output(settings.output, final_state)
     except Exception as exc:  # normalized adapter failure
         error = f"{type(exc).__name__}: {exc}"
@@ -173,8 +184,10 @@ async def run_langgraph(payload: dict[str, Any]) -> dict[str, Any]:
         events=events,
         turn_messages=turn_messages,
         bound_models=bound_models,
+        interrupts=interrupts,
         runtime_id=runtime_id,
         thread_id=thread_id,
+        checkpoint_path=checkpoint_path,
         resumed=resumed,
         error=error,
     )
@@ -241,7 +254,12 @@ def _state_messages(settings: LangGraphSettings, final_state: Any) -> list[dict[
 
 
 def _dedup_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Drop duplicate messages by id, preserving first-seen order."""
+    """Drop duplicate messages by id, preserving first-seen order.
+
+    A node that returns the whole message list instead of only new messages is a
+    common LangGraph pattern, and it would otherwise make usage count earlier
+    messages again on every step. Messages without an id are always kept.
+    """
 
     seen: set[str] = set()
     unique: list[dict[str, Any]] = []
@@ -263,8 +281,10 @@ def normalize_output(
     events: list[dict[str, Any]],
     turn_messages: list[dict[str, Any]],
     bound_models: list[dict[str, Any]],
+    interrupts: list[dict[str, Any]],
     runtime_id: str | None,
     thread_id: str | None,
+    checkpoint_path: str | None,
     resumed: bool,
     error: str | None,
 ) -> dict[str, Any]:
@@ -287,8 +307,13 @@ def normalize_output(
         "event_count": len(reported_events),
         "usage": normalize.aggregate_usage(turn_messages),
         "models": bound_models,
+        "interrupted": bool(interrupts),
+        "interrupts": interrupts,
         "runtime_id": runtime_id,
         "thread_id": thread_id,
+        # Reported so a resumed thread can be inspected; Fabric promotes only
+        # relay artifacts into the manifest, so this is metadata, not an artifact.
+        "checkpoint_path": checkpoint_path,
         "state_mode": settings.state if settings else None,
         "resumed": resumed,
         "completed": error is None,

@@ -12,6 +12,56 @@ from nemo_fabric_adapters.langgraph.config import AdapterConfigError
 from nemo_fabric_adapters.langgraph.config import InputSettings
 from nemo_fabric_adapters.langgraph.config import OutputSettings
 
+# LangGraph reports pending interrupts under this state key. It is private in
+# LangGraph 1.x (importing it from langgraph.constants is deprecated), so the key
+# is matched literally.
+INTERRUPT_KEY = "__interrupt__"
+
+
+class GraphInterruptedError(RuntimeError):
+    """Raised when a graph stops at an interrupt that Fabric cannot answer."""
+
+
+def pending_interrupts(final_state: Any) -> list[dict[str, Any]]:
+    """Return JSON-safe descriptions of the interrupts a graph is waiting on.
+
+    A graph that interrupts returns normally, with the interrupt recorded in state
+    rather than raised. Detecting it explicitly is what keeps an unfinished run
+    from being reported as a completed one, or as an unrelated projection error
+    about the field the graph never got to write.
+    """
+
+    if not isinstance(final_state, dict):
+        return []
+    raw = final_state.get(INTERRUPT_KEY)
+    if not raw:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        raw = [raw]
+    return [_interrupt_to_dict(item) for item in raw]
+
+
+def _interrupt_to_dict(item: Any) -> dict[str, Any]:
+    entry: dict[str, Any] = {"value": _json_or_repr(getattr(item, "value", item))}
+    identifier = getattr(item, "id", None)
+    if identifier is not None:
+        entry["id"] = str(identifier)
+    return entry
+
+
+def _json_or_repr(value: Any) -> Any:
+    """Keep an interrupt payload if it is JSON-safe, otherwise describe it.
+
+    Interrupt payloads are arbitrary agent values, and reporting the interrupt
+    must never fail because the payload could not be serialized.
+    """
+
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return repr(value)
+    return value
+
 
 def graph_input(settings: InputSettings, request_input: Any) -> Any:
     """Convert a Fabric request into graph input using the configured mapping."""
