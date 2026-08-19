@@ -155,10 +155,11 @@ expressions install the components shown in each column:
 | [Hermes Agent](docs/integrations/harness/hermes.mdx) | Install Hermes Agent separately, then install `nemo-fabric[hermes-agent]` | Install Hermes Agent separately, then install `nemo-fabric-adapters-hermes` | `nemo-fabric-adapters-hermes` |
 | [LangChain Deep Agents](docs/integrations/harness/deepagents.mdx) | `nemo-fabric[deepagents]` | `nemo-fabric-adapters-deepagents[harness]` | `nemo-fabric-adapters-deepagents` |
 | [mini-SWE-agent](docs/integrations/harness/mini-swe-agent.mdx) | `nemo-fabric[mini-swe-agent]` | `nemo-fabric-adapters-mini-swe-agent[harness]` | `nemo-fabric-adapters-mini-swe-agent` |
+| [Pi](docs/integrations/harness/pi.mdx) | `nemo-fabric[pi]` | `nemo-fabric-adapters-pi[harness]` | `nemo-fabric-adapters-pi` |
 
-The `nemo-fabric` package always installs the runtime. For harnesses available
-as Python packages, the root package extras install the corresponding adapter
-and supported harness. Hermes Agent 0.20 and later is not available from PyPI.
+The `nemo-fabric` package always installs the runtime. For package-installable
+harnesses, the root package extras install the corresponding adapter and
+supported harness. Hermes Agent 0.20 and later is not available from PyPI.
 Follow the [Hermes Agent installation guide](https://hermes-agent.nousresearch.com/docs/installation),
 then install either `nemo-fabric[hermes-agent]` for the runtime and adapter or
 `nemo-fabric-adapters-hermes` for the adapter only. Use the adapter-package
@@ -270,7 +271,5 @@ harnesses and custom agents. Use these references to compare and build them:
   [OOAgents](https://github.com/NVIDIA-NeMo/labs-OO-Agents).
 - **Remote-agent thin-client adapter:** Add a thin-client adapter for invoking
   remotely hosted agents through the NeMo Fabric lifecycle.
-- **Pi coding harness:** Add a bundled adapter for the
-  [Pi coding harness](https://pi.dev/).
 - **Third-party adapter registry:** Extend installed and explicit descriptor
   discovery with a provider-backed registry and catalog experience.

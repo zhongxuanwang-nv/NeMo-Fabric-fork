@@ -33,12 +33,14 @@ be managed separately.
 | `nemo-fabric-adapters-claude[harness]` | No | Yes | Yes | No | Yes |
 | `nemo-fabric-adapters-claude[full]` | No | Yes | Yes | No | Yes |
 | `nemo-fabric-adapters-deepagents[full]` | No | Yes | Yes | Yes | No |
+| `nemo-fabric-adapters-pi[harness]` | No | Yes | Yes | No | No |
 | `nemo-fabric-adapters-hermes[relay]` | No | Yes | No | Yes | No |
 | `nemo-fabric-adapters-claude` | No | Yes | No | No | No |
 
 An adapter package's `full` extra is scoped to the adapter environment and does
-not install the NeMo Fabric runtime. For Claude and Codex, `full` is equivalent
-to `harness`; both install the supported harness and `nemo-relay` CLI. For
+not install the NeMo Fabric runtime. For Claude, Codex, and Pi, `full` is
+equivalent to `harness`; Claude and Codex also install the supported
+`nemo-relay` CLI. For
 LangChain Deep Agents, `full` installs the harness and NeMo Relay Python package
 without the CLI. For Hermes Agent, `full` installs only the adapter and NeMo
 Relay Python package; Hermes Agent must be installed separately.
@@ -63,6 +65,7 @@ the same Python environment:
 pip install "nemo-fabric[claude]"
 pip install "nemo-fabric[codex]"
 pip install "nemo-fabric[deepagents]"
+pip install "nemo-fabric[pi]"
 ```
 
 Each `nemo-fabric` harness extra installs the corresponding adapter package
@@ -106,6 +109,7 @@ Fabric:
 pip install "nemo-fabric-adapters-claude[harness]"
 pip install "nemo-fabric-adapters-codex[harness]"
 pip install "nemo-fabric-adapters-deepagents[harness]"
+pip install "nemo-fabric-adapters-pi[harness]"
 ```
 
 This installation mode keeps the runtime dependencies out of the adapter
@@ -125,6 +129,7 @@ pip install nemo-fabric-adapters-claude
 pip install nemo-fabric-adapters-codex
 pip install nemo-fabric-adapters-deepagents
 pip install nemo-fabric-adapters-hermes
+pip install nemo-fabric-adapters-pi
 ```
 
 Bare adapter distributions install only adapter-owned dependencies. They do not
