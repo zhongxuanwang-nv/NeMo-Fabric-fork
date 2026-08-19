@@ -23,17 +23,21 @@ variations notebook shows advanced composition against a real, maintained agent.
   Live runs require the prerequisites below.
 - To actually *run* a harness (rather than just inspect its config), that
   harness's adapter and credentials must be present:
-  - **Hermes Agent** (both notebooks): follow the
-    [Hermes Agent quick start](../../README.md#quick-start-hermes-agent) through
-    the environment installation steps and set `NVIDIA_API_KEY`. The setup cells
-    auto-detect the resulting `.tmp/hermes-venv`.
+  - **Hermes Agent** (both notebooks): from the repository root, run
+    `just install-hermes-agent`, then set `NVIDIA_API_KEY`. The recipe checks out
+    the pinned Hermes Agent source and synchronizes it into the project
+    environment. End users installing outside a source checkout must follow the
+    [Hermes Agent installation guide](https://hermes-agent.nousresearch.com/docs/installation);
+    Hermes Agent 0.20 and later is no longer installable from PyPI.
   - **Deep Agents, Codex, Claude** (variations notebook): the matching adapter
     installed in the NeMo Fabric environment, plus that harness's credentials
     (`NVIDIA_API_KEY` for Deep Agents; an existing ChatGPT or provisioned API-key
     login for Codex; `ANTHROPIC_API_KEY` for the documented Claude run).
     Relay-enabled Hermes Agent and Deep Agents runs also need the `nemo-relay`
     Python package in the selected adapter environment.
-- `NVIDIA_API_KEY` is loaded from a gitignored `.env` at the repo root if present.
+- API keys are loaded from a gitignored `.env` at the repo root if present.
+  Each notebook securely prompts for any missing keys it uses. Press Enter to
+  skip a key and the live harness calls that require it.
 
 Every live cell checks the prerequisites it can inspect. Missing key-based
 credentials skip their harness and still show its resolved plan. Codex
@@ -43,7 +47,12 @@ variant is attempted, the notebook raises on any attempted-run failure. The
 Relay cell also requires a succeeded result, a Relay telemetry reference, and a
 nonempty, parseable ATOF trace.
 
-## Launch
+## Google Colab
+
+To open these notebooks in a Google Colab environment, you can click the following link: [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/NVIDIA/NeMo-Fabric)
+
+
+## Jupyter Lab
 
 ```bash
 just notebooks

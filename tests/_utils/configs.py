@@ -5,7 +5,31 @@
 
 from __future__ import annotations
 
-from nemo_fabric import EnvironmentConfig, FabricConfig, HarnessConfig, MetadataConfig, ModelConfig, RuntimeConfig
+from typing import Any
+
+from nemo_fabric import DiscoveryConfig, EnvironmentConfig, FabricConfig, HarnessConfig, MetadataConfig, ModelConfig, RuntimeConfig
+
+
+def minimal_config(
+    settings: dict[str, Any] | None = None,
+    *,
+    name: str,
+    adapter_id: str,
+    resolution: str | None = None,
+) -> FabricConfig:
+    """Build a minimal config for adapter resolution and settings tests."""
+    harness: dict[str, Any] = {
+        "adapter_id": adapter_id,
+        "settings": settings or {},
+    }
+    if resolution is not None:
+        harness["resolution"] = resolution
+    return FabricConfig.from_mapping(
+        {
+            "metadata": {"name": name},
+            "harness": harness,
+        }
+    )
 
 
 def hermes_shim_config() -> FabricConfig:
@@ -16,6 +40,7 @@ def hermes_shim_config() -> FabricConfig:
             resolution="preinstalled",
             settings={},
         ),
+        discovery=DiscoveryConfig(local_paths=["adapters"]),
         models={"default": ModelConfig(provider="test", model="test-model", temperature=0.0)},
         runtime=RuntimeConfig(input_schema="chat", output_schema="message", artifacts="./artifacts"),
         environment=EnvironmentConfig(

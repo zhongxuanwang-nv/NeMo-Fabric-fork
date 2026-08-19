@@ -58,7 +58,7 @@ This run checks Harbor setup, spec upload, sandbox-local SDK execution,
 workspace mutation, result download, and verification:
 
 ```bash
-uv run --extra runtime --extra harbor harbor run \
+uv run --extra harbor harbor run \
   --path "$TASK_DIR" \
   --agent nemo_fabric.integrations.harbor:FabricAgent \
   --ak fabric_adapter_id=demo.fabric.scripted \
@@ -78,10 +78,10 @@ Expected Harbor summary: one trial, zero exceptions, and mean reward `1.000`.
 ```bash
 : "${NVIDIA_API_KEY:?Export NVIDIA_API_KEY before running Hermes Agent}"
 
-uv run --extra runtime --extra harbor --extra hermes-agent harbor run \
+uv run --extra harbor harbor run \
   --path "$TASK_DIR" \
   --agent nemo_fabric.integrations.harbor:FabricAgent \
-  --model nvidia/nemotron-3-nano-30b-a3b \
+  --model nvidia/nemotron-3-nano-omni-30b-a3b-reasoning \
   --ak fabric_adapter_id=nvidia.fabric.hermes \
   --ak fabric_config_base_dir=/opt/fabric-calculator \
   --ak fabric_workspace=/app \
@@ -103,17 +103,16 @@ typed config. The API key is passed separately as a task credential.
 ```bash
 : "${NVIDIA_API_KEY:?Export NVIDIA_API_KEY before running Hermes Agent}"
 
-uv run --extra runtime --extra harbor --extra hermes-agent --extra relay harbor run \
+uv run --extra harbor harbor run \
   --path "$TASK_DIR" \
   --agent nemo_fabric.integrations.harbor:FabricAgent \
-  --model nvidia/nemotron-3-nano-30b-a3b \
+  --model nvidia/nemotron-3-nano-omni-30b-a3b-reasoning \
   --ak fabric_adapter_id=nvidia.fabric.hermes \
   --ak fabric_config_base_dir=/opt/fabric-calculator \
   --ak fabric_workspace=/app \
   --ak fabric_telemetry=relay \
   --ak fabric_model_base_url=https://integrate.api.nvidia.com/v1 \
   --ak fabric_max_turns=4 \
-  --ak 'fabric_harness_settings={"terminal_timeout":120}' \
   --ae "NVIDIA_API_KEY=$NVIDIA_API_KEY" \
   --job-name fabric-hermes-relay \
   --jobs-dir "$RUNS_DIR" \
@@ -145,7 +144,7 @@ Claude authentication variables selected by the adapter; this command uses
 ```bash
 : "${ANTHROPIC_API_KEY:?Export ANTHROPIC_API_KEY before running Claude}"
 
-uv run --extra runtime --extra harbor --extra claude harbor run \
+uv run --extra harbor harbor run \
   --path "$TASK_DIR" \
   --agent nemo_fabric.integrations.harbor:FabricAgent \
   --model anthropic/claude-sonnet-4-5 \
@@ -174,7 +173,7 @@ NeMo Fabric result files use unique names in each trial's agent logs:
 ```bash
 find "$RUNS_DIR/fabric-smoke" -path '*/agent/fabric-result-*.json' -print -exec cat {} \;
 cat "$RUNS_DIR/fabric-smoke/result.json"
-uv run --extra runtime --extra harbor harbor view "$RUNS_DIR"
+uv run --extra harbor harbor view "$RUNS_DIR"
 ```
 
 Check NeMo Fabric status, harness and adapter identity, runtime and invocation IDs,

@@ -37,6 +37,28 @@ just build-all
   --input "Reply with exactly: NeMo Fabric works"
 ```
 
+## Pi JSONL-RPC Code Review
+
+[`pi_jsonl_rpc_code_review`](pi_jsonl_rpc_code_review/README.md) exercises the
+first-party [Pi adapter](../adapters/pi/README.md). It maps only the default
+typed model and explicit skill paths into one persistent Pi JSONL-RPC process
+per NeMo Fabric runtime.
+
+## LangGraph Custom Agent
+
+[`langgraph_custom_agent`](langgraph_custom_agent/README.md) demonstrates how
+to build a dedicated NeMo Fabric adapter for a custom agent. It uses a small
+email-phishing agent built directly with LangGraph and keeps each responsibility
+in a separate directory:
+
+- `consumer/` configures and runs the example with `FabricConfig`.
+- `adapter/` receives `AgentConfig` and manages `start`, `invoke`, and `stop`.
+- `agent/` contains the LangGraph application without NeMo Fabric-specific
+  code.
+
+Start with the model-backed example. You can then vary its model settings, add
+a stdio MCP tool, or enable NeMo Relay telemetry.
+
 ## Harbor
 
 [`harbor`](harbor/README.md) demonstrates how to evaluate NeMo Fabric agents with

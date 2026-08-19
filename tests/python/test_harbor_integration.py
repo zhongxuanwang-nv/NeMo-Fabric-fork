@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import tomllib
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -353,10 +354,16 @@ def test_harbor_propagates_runtime_identity(tmp_path: Path):
 
 
 async def test_harbor_structured_package_install_is_shell_safe(tmp_path: Path):
+    with (
+        Path(__file__).resolve().parents[2]
+        / "sdk/python/nemo-fabric/pyproject.toml"
+    ).open("rb") as file:
+        package_version = tomllib.load(file)["project"]["version"]
+    fabric_package = f"nemo-fabric[codex,harbor]=={package_version}"
     agent = FabricAgent(
         logs_dir=tmp_path,
         fabric_adapter_id="nvidia.fabric.hermes",
-        fabric_package="nemo-fabric[codex,harbor,runtime]==0.1.0",
+        fabric_package=fabric_package,
         extra_env={
             "NVIDIA_API_KEY": "test-key",
             "PIP_FIND_LINKS": "/tmp/nemo-fabric-config/wheelhouse",
@@ -370,7 +377,7 @@ async def test_harbor_structured_package_install_is_shell_safe(tmp_path: Path):
     assert environment.commands[1] == (
         "python3 -m venv /tmp/nemo-fabric-venv && "
         "/tmp/nemo-fabric-venv/bin/python -m pip install "
-        "--disable-pip-version-check 'nemo-fabric[codex,harbor,runtime]==0.1.0'"
+        f"--disable-pip-version-check '{fabric_package}'"
     )
     assert environment.environments[1] == {
         "PIP_FIND_LINKS": "/tmp/nemo-fabric-config/wheelhouse",

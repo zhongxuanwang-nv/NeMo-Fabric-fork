@@ -3,9 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Generate the Python SDK API reference (Markdown) from the SDK docstrings via
-# lazydocs, for the Fern docs site. The docstrings in python/src/nemo_fabric are
-# the source of truth; run this before publishing docs (and in CI) so the
-# reference stays in sync with the code.
+# lazydocs, for the Fern docs site. The docstrings in
+# sdk/python/nemo-fabric-runtime/src/nemo_fabric are the source of truth; run
+# this before publishing docs (and in CI) so the reference stays in sync with
+# the code.
 #
 #   pip install -e ".[docs]"        # provides lazydocs
 #   scripts/generate_api_docs.sh
@@ -18,12 +19,13 @@ out="docs/reference/api/python-library-reference"
 rm -rf "$out"
 mkdir -p "$out"
 
-PYTHONPATH="python/src" lazydocs \
+PYTHONPATH="sdk/python/nemo-fabric-runtime/src" lazydocs \
   --output-path "$out" \
   --overview-file "index.md" \
   "nemo_fabric.client" \
   "nemo_fabric.runtime" \
   "nemo_fabric.streaming" \
+  "nemo_fabric.openai_streaming" \
   "nemo_fabric.models" \
   "nemo_fabric.types" \
   "nemo_fabric.errors"
@@ -45,11 +47,12 @@ perl -0pi -e 's/(^#{1,2} <kbd>(?:module|class)<\/kbd> `[^`]+`\n)(?!\n)/$1\n/gm' 
   "$out"/*.md
 # lazydocs omits the async marker from generated method signatures.
 perl -0pi -e 's/(### <kbd>method<\/kbd> `(aclose|result)`\n\n```python\n)\2\(/${1}async def ${2}(/g' \
-  "$out/nemo_fabric.streaming.md"
+  "$out/nemo_fabric.streaming.md" \
+  "$out/nemo_fabric.openai_streaming.md"
 
 # Restore signature semantics that lazydocs drops and add field-level contracts
 # for the SDK's Pydantic and immutable mapping models.
-PYTHONPATH="python/src" python scripts/docs/enhance_python_api_reference.py "$out"
+PYTHONPATH="sdk/python/nemo-fabric-runtime/src" python scripts/docs/enhance_python_api_reference.py "$out"
 
 add_frontmatter() {
   local file="$1"
@@ -85,9 +88,14 @@ add_frontmatter \
   "/reference/api/python-library-reference/runtime"
 add_frontmatter \
   "$out/nemo_fabric.streaming.md" \
-  "Streaming" \
+  "Relay Streaming" \
   "Consume raw NVIDIA NeMo Relay ATOF records and terminal invocation results." \
   "/reference/api/python-library-reference/streaming"
+add_frontmatter \
+  "$out/nemo_fabric.openai_streaming.md" \
+  "OpenAI Streaming" \
+  "Consume adapter-native OpenAI Chat Completions chunks and terminal invocation results." \
+  "/reference/api/python-library-reference/openai-streaming"
 add_frontmatter \
   "$out/nemo_fabric.models.md" \
   "Models" \

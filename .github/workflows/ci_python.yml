@@ -21,6 +21,11 @@ on:
         required: false
         default: ''
         type: string
+      skip_tests:
+        description: 'Skip the Python test matrix and only build wheels'
+        required: false
+        default: false
+        type: boolean
   pull_request:
   push:
     branches: [main]
@@ -37,6 +42,7 @@ defaults:
 jobs:
   test:
     name: Test (Python ${{ matrix.python-version }}, ${{ matrix.platform }})
+    if: ${{ (inputs.ref_type || github.ref_type) != 'tag' && !inputs.skip_tests }}
     strategy:
       fail-fast: false
       matrix:
@@ -83,21 +89,30 @@ jobs:
         with:
           shared-key: fabric-rust-${{ runner.os }}-${{ runner.arch }}
 
-      # PyYAML is not a project dependency, but test_hermes_config_mapping
-      # imports it to read Hermes Agent config fixtures, so install it for the tests.
-      - name: Build SDK with native extension
+      - name: Create virtual environment
         run: |
           uv venv --python "${UV_PYTHON:-${{ matrix.python-version }}}" .venv
-          uv sync --group test --no-group dev --extra claude --extra codex --extra deepagents ${{ matrix.python-version != '3.11' && '--extra harbor' || '' }} ${{ matrix.python-version != '3.14' && '--extra hermes-agent' || '' }} --extra relay --extra runtime
+
+      - name: Install Hermes Agent
+        if: ${{ matrix.python-version != '3.14' }}
+        run: just install-hermes-agent
+
+      # Exercise the supported root adapter and harness compositions. The
+      # adapter-tests group also keeps local test dependencies independently
+      # installable for leaf adapter development.
+      - name: Build SDK with native extension
+        run: |
+          uv sync --no-default-groups --group adapter-tests --group test --extra claude --extra codex --extra deepagents --extra mini-swe-agent --extra pi ${{ matrix.python-version != '3.11' && '--extra harbor' || '' }} ${{ matrix.python-version != '3.14' && '--extra hermes-agent' || '' }} --extra relay ${{ matrix.python-version == '3.14' && '--frozen --no-sources-package hermes-agent' || '' }}
 
       - name: Run pytest
         run: |
           set -euo pipefail
-          just test-python
+          just --set no_uv true test-python
 
   build-wheels:
     name: Build wheels (${{ matrix.platform }})
     needs: [test]
+    if: ${{ always() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix:
@@ -139,6 +154,12 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      - name: Create virtual environment
+        run: uv venv --python "${UV_PYTHON:-${{ 3.12 }}}" .venv
+
+      - name: Install Hermes Agent
+        run: just install-hermes-agent
+
       - name: Set version from tag
         if: ${{ (inputs.ref_type || github.ref_type) == 'tag' }}
         env:
@@ -152,6 +173,9 @@ jobs:
 
       - name: Build wheels
         run: just wheels
+
+      - name: Validate wheel licenses
+        run: just check-wheel-licenses
 
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

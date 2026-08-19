@@ -63,6 +63,26 @@ verifier run inside the isolated task container. Constructing the config does
 not read task paths; adapter and asset resolution is deferred to
 `Fabric.run()` with the task-local `base_dir`.
 
+## Install the Host and Task Environments
+
+Use the following package requirements for the two-environment model. Pin the
+host and task packages to the same NeMo Fabric release. These examples use
+version `0.3.0`.
+
+| Environment | Required Dependencies | Purpose |
+| --- | --- | --- |
+| Harbor host | `nemo-fabric[harbor]==0.3.0` | Harbor CLI, `FabricAgent`, and typed `FabricConfig` construction |
+| Claude task without Relay | `nemo-fabric[claude]==0.3.0` | NeMo Fabric runner, Claude adapter, and supported Claude harness |
+| Claude task with Relay | `nemo-fabric[claude]==0.3.0` plus a NeMo Relay CLI in the `>=0.7.2,<0.8` range on `PATH` | NeMo Fabric runner, Claude adapter and harness, and the adapter-managed Relay gateway and hooks |
+| Hermes Agent task with Relay | Task image with Hermes Agent, `nemo-fabric==0.3.0`, `nemo-fabric-adapters-hermes==0.3.0`, and `nemo-relay>=0.7.2,<0.8` | NeMo Fabric runner, preinstalled Hermes Agent and adapter, and the NeMo Relay Python package |
+
+The `nemo-fabric` package installs the runtime. The `relay` extra installs the
+NeMo Relay Python package, not the CLI required by Claude.
+Hermes Agent 0.20 and later is no longer installable from PyPI. Prepare Hermes
+Agent task images by following the
+[Hermes Agent installation guide](https://hermes-agent.nousresearch.com/docs/installation),
+then install the bare Hermes adapter into the same Python environment.
+
 ## How Harbor Inputs Become FabricConfig
 
 `FabricAgent` starts with the selected adapter and Harbor task workspace, then
@@ -83,7 +103,7 @@ container boundary:
 | `--ak fabric_environment_env='{...}'` | `environment.env` |
 | `--ak fabric_blocked_tools='[...]'` | `tools.blocked` |
 | `--ak fabric_enabled_tools='[...]'` | `tools.enabled` |
-| `--ak fabric_harness_settings='{...}'` | `harness.settings` |
+| `--ak fabric_harness_settings='{...}'` | Merged into `harness.settings`; planning rejects non-empty settings when the selected descriptor does not declare `settings_schema` |
 
 The result is the complete `FabricConfig` uploaded with the `RunRequest` and
 task-local `base_dir`. The container-side runner deserializes that payload and
@@ -99,9 +119,9 @@ and verify the relevant entry points:
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
-uv sync --python 3.12 --extra runtime --extra harbor
-uv run --extra runtime --extra harbor harbor --version
-uv run --extra runtime --extra harbor python -c \
+uv sync --python 3.12 --extra harbor
+uv run --extra harbor harbor --version
+uv run --extra harbor python -c \
   'from nemo_fabric.integrations.harbor import FabricAgent; print(FabricAgent.import_path())'
 docker version
 docker compose version
@@ -119,7 +139,7 @@ prints `/snap/bin/docker`, run this in every shell used for Harbor:
 ```bash
 mkdir -p "$HOME/harbor-tmp"
 export TMPDIR="$HOME/harbor-tmp"
-uv run --extra runtime --extra harbor python -c \
+uv run --extra harbor python -c \
   'import tempfile; print(tempfile.gettempdir())'
 ```
 

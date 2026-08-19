@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = [
+  "setuptools>=77",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nemo-fabric-adapters-pi"
+version = "0.3.0"
+description = "Pi adapter for NeMo Fabric"
+authors = [
+  { name = "NVIDIA Corporation" },
+]
+keywords = ["agents", "ai", "nemo-fabric", "pi", "runtime", "tools"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+readme = "pypi.md"
+requires-python = ">=3.11"
+dependencies = [
+  "nemo-fabric-adapter-contract == 0.3.0",
+  "nemo-fabric-adapters-common == 0.3.0",
+]
+
+[project.optional-dependencies]
+harness = [
+  "nemo-fabric-pi-cli-bin == 0.3.0",
+]
+full = [
+  "nemo-fabric-pi-cli-bin == 0.3.0",
+]
+
+[project.urls]
+Repository = "https://github.com/NVIDIA/NeMo-Fabric"
+Homepage = "https://github.com/NVIDIA/NeMo-Fabric"
+Issues = "https://github.com/NVIDIA/NeMo-Fabric/issues"
+Documentation = "https://docs.nvidia.com/nemo/fabric"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["nemo_fabric_adapters.pi*"]
+
+[tool.setuptools.data-files]
+"share/nemo-fabric/adapters/pi" = ["pi.fabric-adapter.json"]
+
+[tool.uv.sources]
+nemo-fabric-adapter-contract = { path = "../../adapter-contract/python", editable = true }
+nemo-fabric-adapters-common = { path = "../common", editable = true }
+nemo-fabric-pi-cli-bin = { path = "../pi-cli-bin", editable = true }

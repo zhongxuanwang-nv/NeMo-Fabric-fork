@@ -11,18 +11,534 @@ from typing import Any
 
 import pytest
 from nemo_fabric_adapters.common import lifecycle
+from nemo_fabric_adapter_contract.models import AgentConfig
+from nemo_fabric_adapter_contract.models import AgentRunRequest
+from nemo_fabric_adapter_contract.models import AgentRunResult
+from nemo_fabric_adapter_contract.models import AgentRunStatus
+from nemo_fabric_adapter_contract.models import RuntimeContext
+from nemo_fabric.openai_streaming import (
+    _END,
+    _OpenAIStreamListener,
+    _ProtocolError,
+    _validate_openai_chunk,
+)
 
 
 def _request(operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if operation in {"invoke", "invoke_openai_stream"}:
+        payload = dict(payload)
+        raw_context = payload.get("runtime_context")
+        if not isinstance(raw_context, dict):
+            return {"operation": operation, "payload": payload}
+        context = dict(raw_context)
+        runtime_id = context.get("runtime_id", "runtime-1")
+        context.setdefault("invocation_id", "invocation-1")
+        context.setdefault("request_id", "request-1")
+        context.setdefault(
+            "environment",
+            {
+                "environment_id": f"environment-{runtime_id}",
+                "provider": "local",
+                "control_location": "external_control",
+                "ownership": "caller_owned",
+            },
+        )
+        context.setdefault("artifacts", {})
+        if isinstance(context.get("telemetry"), dict):
+            context["telemetry"] = {
+                "relay_enabled": False,
+                **context["telemetry"],
+            }
+        payload["runtime_context"] = context
+        request = dict(payload.get("request") or {})
+        request.pop("request_id", None)
+        payload["request"] = request
     return {
         "operation": operation,
         "payload": payload,
     }
 
 
+def _success(output: Any) -> AgentRunResult:
+    return AgentRunResult(status=AgentRunStatus.SUCCEEDED, output=output)
+
+
 def _streams(requests: list[dict[str, Any]]) -> tuple[io.StringIO, io.StringIO]:
     input_stream = io.StringIO("".join(f"{json.dumps(item)}\n" for item in requests))
     return input_stream, io.StringIO()
+
+
+class _BackpressuredStreamWriter:
+    def __init__(self) -> None:
+        self.parts: list[bytes] = []
+        self.drain_calls = 0
+        self.first_drain_started = asyncio.Event()
+        self.release_first_drain = asyncio.Event()
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.parts.append(data)
+
+    async def drain(self) -> None:
+        self.drain_calls += 1
+        if self.drain_calls == 1:
+            self.first_drain_started.set()
+            await self.release_first_drain.wait()
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        pass
+
+
+def _openai_stream_payload(
+    listener: _OpenAIStreamListener,
+    *,
+    runtime_id: str = "runtime-1",
+    invocation_id: str = "invocation-1",
+    request_id: str = "request-1",
+) -> dict[str, Any]:
+    return {
+        "runtime_context": {
+            "runtime_id": runtime_id,
+            "invocation_id": invocation_id,
+            "request_id": request_id,
+        },
+        "request": {"request_id": request_id, "input": "hello"},
+        "stream": {
+            "protocol_version": "fabric.openai_stream/v1alpha1",
+            "profile": "openai.chat_completions.chunk/v1",
+            "host": "127.0.0.1",
+            **listener.transport,
+            "runtime_id": runtime_id,
+            "invocation_id": invocation_id,
+            "request_id": request_id,
+        },
+    }
+
+
+async def test_lifecycle_host_streams_openai_chunks_out_of_band():
+    listener = _OpenAIStreamListener(runtime_id="runtime-1", request_id="request-1")
+    await listener.start()
+    stream_payload = _openai_stream_payload(listener)
+    input_stream, output_stream = _streams(
+        [
+            _request("start", {"runtime_context": {"runtime_id": "runtime-1"}}),
+            _request("invoke_openai_stream", stream_payload),
+            _request("stop", {"runtime_id": "runtime-1"}),
+        ]
+    )
+    received_payloads = []
+
+    class Runtime:
+        async def start(self, _payload):
+            pass
+
+        async def invoke(self, _request, _context):
+            raise AssertionError("ordinary invoke is not expected")
+
+        async def invoke_openai_stream(self, request, context, emit):
+            received_payloads.append((request, context))
+            await emit(
+                {
+                    "id": "chunk-1",
+                    "object": "chat.completion.chunk",
+                    "created": (1 << 64) - 1,
+                    "model": "test-model",
+                    "choices": [{"index": 0, "delta": {"content": "hel"}}],
+                }
+            )
+            await emit(
+                {
+                    "id": "chunk-2",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "test-model",
+                    "choices": [{"index": 0, "delta": {"content": "lo"}}],
+                }
+            )
+            return _success({"response": "hello"})
+
+        async def stop(self):
+            pass
+
+    try:
+        await lifecycle._serve(
+            Runtime,
+            config_loader=None,
+            input_stream=input_stream,
+            output_stream=output_stream,
+        )
+        records = [
+            await asyncio.wait_for(listener.records.get(), timeout=1),
+            await asyncio.wait_for(listener.records.get(), timeout=1),
+            await asyncio.wait_for(listener.records.get(), timeout=1),
+        ]
+    finally:
+        await listener.close()
+
+    responses = [json.loads(line) for line in output_stream.getvalue().splitlines()]
+    assert [response["operation"] for response in responses] == [
+        "start",
+        "invoke_openai_stream",
+        "stop",
+    ]
+    assert responses[1]["outcome"] == {
+        "status": "succeeded",
+        "output": {"status": "succeeded", "output": {"response": "hello"}},
+    }
+    assert [record["id"] for record in records[:2]] == ["chunk-1", "chunk-2"]
+    assert records[2] is _END
+    assert len(received_payloads) == 1
+    request, context = received_payloads[0]
+    assert isinstance(request, AgentRunRequest)
+    assert request.input == "hello"
+    assert isinstance(context, RuntimeContext)
+    assert context.runtime_id == "runtime-1"
+
+
+async def test_openai_stream_writer_serializes_concurrent_emits_under_backpressure():
+    transport = _BackpressuredStreamWriter()
+    writer = lifecycle._OpenAIStreamWriter(
+        asyncio.StreamReader(),
+        transport,
+        {
+            "runtime_id": "runtime-1",
+            "invocation_id": "invocation-1",
+            "request_id": "request-1",
+        },
+    )
+
+    def chunk(identifier: str) -> dict[str, Any]:
+        return {
+            "id": identifier,
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "test-model",
+            "choices": [],
+        }
+
+    first = asyncio.create_task(writer.emit(chunk("chunk-1")))
+    await asyncio.wait_for(transport.first_drain_started.wait(), timeout=1)
+    second = asyncio.create_task(writer.emit(chunk("chunk-2")))
+    await asyncio.sleep(0)
+    transport.release_first_drain.set()
+    await asyncio.gather(first, second)
+
+    records = [json.loads(part) for part in transport.parts if part.startswith(b"{")]
+    assert [record["sequence"] for record in records] == [0, 1]
+    assert [record["chunk"]["id"] for record in records] == ["chunk-1", "chunk-2"]
+
+
+async def test_openai_stream_writer_serializes_finish_after_an_inflight_emit():
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"HTTP/1.1 200 OK\r\n\r\n")
+    reader.feed_eof()
+    transport = _BackpressuredStreamWriter()
+    writer = lifecycle._OpenAIStreamWriter(
+        reader,
+        transport,
+        {
+            "runtime_id": "runtime-1",
+            "invocation_id": "invocation-1",
+            "request_id": "request-1",
+        },
+    )
+    chunk = {
+        "id": "chunk-1",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "test-model",
+        "choices": [],
+    }
+
+    emit = asyncio.create_task(writer.emit(chunk))
+    await asyncio.wait_for(transport.first_drain_started.wait(), timeout=1)
+    finish = asyncio.create_task(writer.finish())
+    await asyncio.sleep(0)
+    transport.release_first_drain.set()
+    await asyncio.gather(emit, finish)
+
+    records = [json.loads(part) for part in transport.parts if part.startswith(b"{")]
+    assert [(record["type"], record["sequence"]) for record in records] == [
+        ("chunk", 0),
+        ("end", 1),
+    ]
+    assert transport.parts[-1] == b"0\r\n\r\n"
+    assert transport.closed
+
+
+async def test_openai_stream_connect_preserves_cancellation_during_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    listener = _OpenAIStreamListener(runtime_id="runtime-1", request_id="request-1")
+    await listener.start()
+
+    class CancellingWriter:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def write(self, _data: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            raise asyncio.CancelledError
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            raise OSError("secondary cleanup failure")
+
+    writer = CancellingWriter()
+
+    async def open_connection(*_args, **_kwargs):
+        return asyncio.StreamReader(), writer
+
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await lifecycle._OpenAIStreamWriter.connect(
+                _openai_stream_payload(listener)
+            )
+    finally:
+        await listener.close()
+
+    assert writer.closed
+
+
+@pytest.mark.parametrize(
+    "primary_error",
+    [
+        lifecycle.LifecycleError("adapter_failure", "adapter failed"),
+        asyncio.CancelledError(),
+    ],
+)
+async def test_openai_stream_preserves_adapter_failure_over_finish_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    primary_error: BaseException,
+):
+    finish_error = lifecycle.LifecycleError("finish_failure", "finish failed")
+
+    class FailingWriter:
+        async def emit(self, _chunk) -> None:
+            pass
+
+        async def finish(self) -> None:
+            raise finish_error
+
+    async def connect(_payload):
+        adapter_payload = _request(
+            "invoke",
+            {
+                "runtime_context": {"runtime_id": "runtime-1"},
+                "request": {"input": "fail"},
+            },
+        )["payload"]
+        return FailingWriter(), adapter_payload
+
+    monkeypatch.setattr(lifecycle._OpenAIStreamWriter, "connect", connect)
+
+    class Runtime:
+        async def invoke_openai_stream(self, _request, _context, _emit):
+            raise primary_error
+
+    with pytest.raises(type(primary_error)) as caught:
+        await lifecycle._handle_invoke_openai_stream(
+            lifecycle._HostState(),
+            Runtime(),
+            {},
+        )
+
+    if isinstance(primary_error, lifecycle.LifecycleError):
+        assert caught.value.code == primary_error.code
+    assert caught.value.__cause__ is finish_error
+
+
+def test_lifecycle_host_rejects_unimplemented_openai_stream_without_poisoning_runtime():
+    runtime_id = "runtime-1"
+    payload = {
+        "runtime_context": {
+            "runtime_id": runtime_id,
+            "invocation_id": "invocation-1",
+            "request_id": "request-1",
+        },
+        "request": {"request_id": "request-1", "input": "hello"},
+        "stream": {},
+    }
+    input_stream, output_stream = _streams(
+        [
+            _request("start", {"runtime_context": {"runtime_id": runtime_id}}),
+            _request("invoke_openai_stream", payload),
+            _request(
+                "invoke",
+                {
+                    "runtime_context": {"runtime_id": runtime_id},
+                    "request": {"input": "still works"},
+                },
+            ),
+            _request("stop", {"runtime_id": runtime_id}),
+        ]
+    )
+
+    class Runtime:
+        async def start(self, _payload):
+            pass
+
+        async def invoke(self, request, _context):
+            return _success({"input": request.input})
+
+        async def stop(self):
+            pass
+
+    lifecycle.serve(Runtime, input_stream=input_stream, output_stream=output_stream)
+
+    responses = [json.loads(line) for line in output_stream.getvalue().splitlines()]
+    assert responses[1]["outcome"]["error"] == {
+        "stage": "invoke",
+        "code": "lifecycle_openai_stream_unsupported",
+        "message": "Adapter runtime does not implement OpenAI streaming",
+        "retryable": False,
+    }
+    assert responses[2]["outcome"] == {
+        "status": "succeeded",
+        "output": {"status": "succeeded", "output": {"input": "still works"}},
+    }
+
+
+def _openai_profile_choice(**overrides: object) -> dict[str, Any]:
+    choice: dict[str, Any] = {"index": 0, "delta": {}}
+    choice.update(overrides)
+    return choice
+
+
+def _openai_profile_chunk(**overrides: object) -> dict[str, Any]:
+    chunk: dict[str, Any] = {
+        "id": "chunk-1",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "test-model",
+        "choices": [],
+    }
+    chunk.update(overrides)
+    return chunk
+
+
+@pytest.mark.parametrize(
+    "chunk",
+    [
+        {
+            "id": "minimal",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "test-model",
+            "choices": [],
+        },
+        {
+            "id": "complete",
+            "object": "chat.completion.chunk",
+            "created": (1 << 64) - 1,
+            "model": "test-model",
+            "choices": [
+                {
+                    "index": (1 << 32) - 1,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "hello",
+                        "refusal": None,
+                        "function_call": {},
+                        "tool_calls": [{}],
+                    },
+                    "finish_reason": "stop",
+                    "logprobs": {},
+                }
+            ],
+            "usage": {},
+        },
+    ],
+)
+def test_openai_chunk_validators_accept_shared_profile_fixtures(chunk):
+    assert lifecycle._validated_openai_chunk(chunk) == chunk
+    assert _validate_openai_chunk(chunk) == chunk
+
+
+@pytest.mark.parametrize(
+    "chunk",
+    [
+        _openai_profile_chunk(object="chat.completion"),
+        _openai_profile_chunk(id="   "),
+        _openai_profile_chunk(model="\t"),
+        _openai_profile_chunk(created=False),
+        _openai_profile_chunk(created=-1),
+        _openai_profile_chunk(created="0"),
+        _openai_profile_chunk(created=1 << 64),
+        _openai_profile_chunk(choices={}),
+        _openai_profile_chunk(choices=[None]),
+        _openai_profile_chunk(choices=[_openai_profile_choice(index=False)]),
+        _openai_profile_chunk(choices=[_openai_profile_choice(index=-1)]),
+        _openai_profile_chunk(choices=[_openai_profile_choice(index="0")]),
+        _openai_profile_chunk(choices=[_openai_profile_choice(index=1 << 32)]),
+        _openai_profile_chunk(choices=[{"index": 0}]),
+        _openai_profile_chunk(choices=[_openai_profile_choice(delta=[])]),
+        _openai_profile_chunk(choices=[_openai_profile_choice(delta={"content": 1})]),
+        _openai_profile_chunk(choices=[_openai_profile_choice(delta={"refusal": 1})]),
+        _openai_profile_chunk(choices=[_openai_profile_choice(delta={"role": 1})]),
+        _openai_profile_chunk(
+            choices=[_openai_profile_choice(delta={"function_call": []})]
+        ),
+        _openai_profile_chunk(
+            choices=[_openai_profile_choice(delta={"tool_calls": {}})]
+        ),
+        _openai_profile_chunk(
+            choices=[_openai_profile_choice(delta={"tool_calls": [None]})]
+        ),
+        _openai_profile_chunk(choices=[_openai_profile_choice(finish_reason=1)]),
+        _openai_profile_chunk(choices=[_openai_profile_choice(logprobs=[])]),
+        _openai_profile_chunk(usage=[]),
+    ],
+)
+def test_openai_chunk_validators_reject_shared_profile_fixtures(chunk):
+    with pytest.raises(lifecycle.LifecycleError) as caught:
+        lifecycle._validated_openai_chunk(chunk)
+
+    assert caught.value.code == "lifecycle_invalid_openai_stream_event"
+    with pytest.raises(_ProtocolError):
+        _validate_openai_chunk(chunk)
+
+
+def test_malformed_openai_stream_request_uses_the_invoke_error_stage():
+    runtime_id = "runtime-1"
+    input_stream, output_stream = _streams(
+        [
+            _request("start", {"runtime_context": {"runtime_id": runtime_id}}),
+            _request(
+                "invoke_openai_stream",
+                {"runtime_context": ["not", "a", "mapping"]},
+            ),
+            _request("stop", {"runtime_id": runtime_id}),
+        ]
+    )
+
+    class Runtime:
+        async def start(self, _payload):
+            pass
+
+        async def invoke(self, _request, _context):
+            pass
+
+        async def stop(self):
+            pass
+
+    lifecycle.serve(Runtime, input_stream=input_stream, output_stream=output_stream)
+
+    responses = [json.loads(line) for line in output_stream.getvalue().splitlines()]
+    assert responses[1]["outcome"]["error"] == {
+        "stage": "invoke",
+        "code": "lifecycle_invalid_request",
+        "message": "Invalid lifecycle request",
+        "retryable": False,
+    }
 
 
 def test_lifecycle_host_reuses_one_runtime_and_one_event_loop():
@@ -61,13 +577,10 @@ def test_lifecycle_host_reuses_one_runtime_and_one_event_loop():
         async def start(self, _payload):
             self.loop_ids.append(id(asyncio.get_running_loop()))
 
-        async def invoke(self, payload):
+        async def invoke(self, request, _context):
             self.loop_ids.append(id(asyncio.get_running_loop()))
             self.invocations += 1
-            return {
-                "count": self.invocations,
-                "input": payload["request"]["input"],
-            }
+            return _success({"count": self.invocations, "input": request.input})
 
         async def stop(self):
             self.loop_ids.append(id(asyncio.get_running_loop()))
@@ -83,13 +596,19 @@ def test_lifecycle_host_reuses_one_runtime_and_one_event_loop():
     ]
     assert all(item["outcome"]["status"] == "succeeded" for item in responses)
     assert all(set(item) == {"operation", "outcome"} for item in responses)
-    assert responses[1]["outcome"]["output"] == {"count": 1, "input": "first"}
-    assert responses[2]["outcome"]["output"] == {"count": 2, "input": "second"}
+    assert responses[1]["outcome"]["output"] == {
+        "status": "succeeded",
+        "output": {"count": 1, "input": "first"},
+    }
+    assert responses[2]["outcome"]["output"] == {
+        "status": "succeeded",
+        "output": {"count": 2, "input": "second"},
+    }
     assert len(instances) == 1
     assert len(set(instances[0].loop_ids)) == 1
 
 
-def test_lifecycle_host_passes_minimal_invoke_payload_unchanged():
+def test_lifecycle_host_passes_typed_invocation_objects():
     runtime_id = "runtime-1"
     start_payload = {
         "agent_name": "agent",
@@ -121,16 +640,99 @@ def test_lifecycle_host_passes_minimal_invoke_payload_unchanged():
         async def start(self, _payload) -> None:
             pass
 
-        async def invoke(self, payload) -> dict[str, str]:
-            invocations.append(payload)
-            return {"input": payload["request"]["input"]}
+        async def invoke(self, request, context) -> AgentRunResult:
+            invocations.append((request, context))
+            return _success({"input": request.input})
 
         async def stop(self) -> None:
             pass
 
     lifecycle.serve(Runtime, input_stream=input_stream, output_stream=output_stream)
 
-    assert invocations == [invoke_payload]
+    assert len(invocations) == 1
+    request, context = invocations[0]
+    assert isinstance(request, AgentRunRequest)
+    assert request.input == "hello"
+    assert isinstance(context, RuntimeContext)
+    assert context.runtime_id == runtime_id
+
+
+def test_lifecycle_host_validates_opt_in_typed_config_before_adapter_start():
+    runtime_id = "runtime-1"
+    input_stream, output_stream = _streams(
+        [
+            _request(
+                "start",
+                {
+                    "config": {"harness": {"settings": {"profile": "typed"}}},
+                    "runtime_context": {"runtime_id": runtime_id},
+                },
+            ),
+            _request("stop", {"runtime_id": runtime_id}),
+        ]
+    )
+    starts: list[AgentConfig] = []
+
+    class Runtime:
+        async def start(self, payload) -> None:
+            starts.append(payload["config"])
+
+        async def invoke(self, _request, _context):
+            raise AssertionError("invoke is not expected")
+
+        async def stop(self) -> None:
+            pass
+
+    lifecycle.serve(
+        Runtime,
+        config_loader=AgentConfig.from_mapping,
+        input_stream=input_stream,
+        output_stream=output_stream,
+    )
+
+    assert len(starts) == 1
+    assert isinstance(starts[0], AgentConfig)
+    assert starts[0].harness.settings == {"profile": "typed"}
+
+
+def test_lifecycle_host_rejects_invalid_opt_in_config_before_runtime_creation():
+    input_stream, output_stream = _streams(
+        [
+            _request(
+                "start",
+                {
+                    "config": {"unknown": True},
+                    "runtime_context": {"runtime_id": "runtime-1"},
+                },
+            )
+        ]
+    )
+    created = 0
+
+    class Runtime:
+        def __init__(self) -> None:
+            nonlocal created
+            created += 1
+
+        async def start(self, _payload) -> None:
+            pass
+
+        async def invoke(self, _request, _context):
+            raise AssertionError("invoke is not expected")
+
+        async def stop(self) -> None:
+            pass
+
+    lifecycle.serve(
+        Runtime,
+        config_loader=AgentConfig.from_mapping,
+        input_stream=input_stream,
+        output_stream=output_stream,
+    )
+
+    response = json.loads(output_stream.getvalue())
+    assert response["outcome"]["error"]["code"] == "lifecycle_invalid_config"
+    assert created == 0
 
 
 def test_lifecycle_host_rejects_runtime_mismatch_without_poisoning_runtime():
@@ -160,9 +762,9 @@ def test_lifecycle_host_rejects_runtime_mismatch_without_poisoning_runtime():
         async def start(self, _payload):
             pass
 
-        async def invoke(self, payload):
-            invocations.append(payload)
-            return {"input": payload["request"]["input"]}
+        async def invoke(self, request, context):
+            invocations.append((request, context))
+            return _success({"input": request.input})
 
         async def stop(self):
             pass
@@ -174,7 +776,7 @@ def test_lifecycle_host_rejects_runtime_mismatch_without_poisoning_runtime():
     assert responses[1]["outcome"]["error"]["code"] == "lifecycle_runtime_mismatch"
     assert responses[2]["outcome"] == {
         "status": "succeeded",
-        "output": {"input": "run"},
+        "output": {"status": "succeeded", "output": {"input": "run"}},
     }
     assert len(invocations) == 1
 
@@ -199,9 +801,9 @@ def test_lifecycle_host_keeps_adapter_stdout_out_of_protocol(capsys):
         async def start(self, _payload):
             pass
 
-        async def invoke(self, _payload):
+        async def invoke(self, _request, _context):
             print("adapter diagnostic")
-            return {"failed": False}
+            return _success({})
 
         async def stop(self):
             pass
@@ -237,8 +839,8 @@ def test_lifecycle_host_scopes_invocation_telemetry_environment():
         async def start(self, _payload):
             pass
 
-        async def invoke(self, _payload):
-            return {"value": os.environ[variable]}
+        async def invoke(self, _request, _context):
+            return _success({"value": os.environ[variable]})
 
         async def stop(self):
             pass
@@ -246,7 +848,10 @@ def test_lifecycle_host_scopes_invocation_telemetry_environment():
     lifecycle.serve(Runtime, input_stream=input_stream, output_stream=output_stream)
 
     responses = [json.loads(line) for line in output_stream.getvalue().splitlines()]
-    assert responses[1]["outcome"]["output"] == {"value": "invocation-value"}
+    assert responses[1]["outcome"]["output"] == {
+        "status": "succeeded",
+        "output": {"value": "invocation-value"},
+    }
     assert os.environ[variable] == "host-value"
 
 
@@ -260,7 +865,7 @@ def test_lifecycle_host_stops_runtime_when_fabric_closes_stdin():
         async def start(self, _payload):
             pass
 
-        async def invoke(self, _payload):
+        async def invoke(self, _request, _context):
             return None
 
         async def stop(self):
@@ -301,8 +906,8 @@ def test_lifecycle_host_rejects_invoke_after_adapter_failure(failure, expected_c
         async def start(self, _payload):
             pass
 
-        async def invoke(self, payload):
-            invocations.append(payload)
+        async def invoke(self, request, context):
+            invocations.append((request, context))
             raise failure
 
         async def stop(self) -> None:
@@ -326,7 +931,7 @@ def test_lifecycle_host_cleans_up_and_exits_after_start_failure():
         async def start(self, _payload):
             raise RuntimeError("start failed")
 
-        async def invoke(self, _payload):
+        async def invoke(self, _request, _context):
             raise AssertionError("failed runtime must not be invoked")
 
         async def stop(self):

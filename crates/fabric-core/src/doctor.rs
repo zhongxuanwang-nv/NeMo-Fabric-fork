@@ -56,6 +56,9 @@ pub struct DoctorReport {
 pub fn doctor_plan(plan: &RunPlan) -> DoctorReport {
     let mut checks = Vec::new();
     checks.push(check_adapter_descriptor(plan));
+    if plan.config.workflow.is_some() {
+        checks.push(check_adapter_target_descriptor(plan));
+    }
     checks.extend(check_adapter_config_compatibility(plan));
     checks.push(check_resolution(plan));
     checks.extend(check_runtime_execution_surface(plan));
@@ -70,6 +73,36 @@ pub fn doctor_plan(plan: &RunPlan) -> DoctorReport {
         status,
         checks,
     }
+}
+
+fn check_adapter_target_descriptor(plan: &RunPlan) -> DoctorCheck {
+    if let Some(target) = &plan.adapter_target_descriptor {
+        let provenance = target.primary();
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "source".to_string(),
+            Value::String(provenance.source.as_str().to_string()),
+        );
+        metadata.insert(
+            "adapter_id".to_string(),
+            Value::String(target.descriptor.adapter_id.clone()),
+        );
+        return check_with_metadata(
+            "adapter_target_descriptor",
+            DoctorStatus::Pass,
+            format!(
+                "resolved {} adapter target descriptor `{}`",
+                provenance.source.as_str(),
+                target.descriptor.id
+            ),
+            metadata,
+        );
+    }
+    check(
+        "adapter_target_descriptor",
+        DoctorStatus::Fail,
+        "workflow target was configured but no adapter target descriptor was resolved",
+    )
 }
 
 fn check_adapter_config_compatibility(plan: &RunPlan) -> Vec<DoctorCheck> {
@@ -99,17 +132,18 @@ fn check_adapter_config_compatibility(plan: &RunPlan) -> Vec<DoctorCheck> {
 
 fn check_adapter_descriptor(plan: &RunPlan) -> DoctorCheck {
     if let Some(adapter) = &plan.adapter_descriptor {
+        let provenance = adapter.primary();
         let mut metadata = BTreeMap::new();
         metadata.insert(
             "source".to_string(),
-            Value::String(format!("{:?}", adapter.source).to_lowercase()),
+            Value::String(provenance.source.as_str().to_string()),
         );
         return check_with_metadata(
             "adapter_descriptor",
             DoctorStatus::Pass,
             format!(
                 "resolved {} adapter descriptor `{}`",
-                format!("{:?}", adapter.source).to_lowercase(),
+                provenance.source.as_str(),
                 adapter.descriptor.adapter_id
             ),
             metadata,
@@ -288,7 +322,7 @@ fn check_requirements(plan: &RunPlan) -> Vec<DoctorCheck> {
         });
     }
     for file in &descriptor.requirements.files {
-        let path = resolve_path(&adapter.root, file);
+        let path = resolve_path(&adapter.primary().root, file);
         checks.push(if path.exists() {
             check(
                 "requirement.file",
@@ -410,7 +444,12 @@ struct BinaryRequirement {
 
 fn binary_requirement(plan: &RunPlan, binary: &str) -> BinaryRequirement {
     let setting_key = binary_command_setting_key(binary);
-    if let Some(Value::String(command)) = plan.config.harness.settings.get(&setting_key) {
+    if let Some(Value::String(command)) = plan
+        .config
+        .harness
+        .as_ref()
+        .and_then(|harness| harness.settings.get(&setting_key))
+    {
         let command_path = resolve_command(&plan.base_dir, command);
         let display = command_path.to_string_lossy().into_owned();
         return BinaryRequirement {
@@ -509,6 +548,7 @@ mod tests {
                 "resolution": "preinstalled",
                 "settings": {"python3_command": "bin/tool"}
             },
+            "discovery": {"local_paths": ["adapters"]},
             "runtime": {},
             "environment": {"provider": "local"}
         }))

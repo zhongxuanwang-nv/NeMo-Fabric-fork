@@ -75,6 +75,7 @@ def _shim_adapter_config() -> FabricConfig:
         "adapter_id": "test.fabric.hermes_shim",
         "resolution": "preinstalled",
     }
+    config["discovery"] = {"local_paths": ["adapters"]}
     config["models"] = {
         "default": {"provider": "test", "model": "test-model", "temperature": 0.0}
     }
@@ -95,7 +96,7 @@ async def resolves_and_diagnoses_typed_config(client: Fabric) -> None:
 
     descriptor = plan["adapter_descriptor"]
     assert descriptor["descriptor"]["adapter_id"] == "nvidia.fabric.hermes"
-    assert descriptor["source"] == "repository", descriptor["source"]
+    assert descriptor["provenance"][0]["source"] == "bundled"
 
     assert report["agent_name"] == "typed-only-agent"
     assert report.checks, "doctor produced no checks"
@@ -158,6 +159,99 @@ async def diagnoses_adapter_incompatibility_without_weakening_plan(client: Fabri
     assert any(
         check.name == "capability.unsupported"
         and "tools.enabled" in check.message
+        for check in report.checks
+    )
+
+
+def _model_provider_config(adapter_id: str, provider: str) -> FabricConfig:
+    """Build a repository-backed config for model compatibility tests."""
+
+    config = _repository_adapter_config().to_mapping()
+    config["harness"]["adapter_id"] = adapter_id
+    config["models"]["default"] = {
+        "provider": provider,
+        "model": "test-model",
+    }
+    return FabricConfig.from_mapping(config)
+
+
+@pytest.mark.parametrize(
+    ("adapter_id", "provider"),
+    [
+        ("nvidia.fabric.claude", "openai"),
+        ("nvidia.fabric.codex", "anthropic"),
+    ],
+)
+async def test_plan_and_doctor_require_custom_provider_connection(
+    adapter_id: str,
+    provider: str,
+):
+    config = _model_provider_config(adapter_id, provider)
+
+    with pytest.raises(FabricConfigError, match=r"models\.default\.base_url"):
+        Fabric().plan(config, base_dir=ROOT)
+
+    report = await Fabric().doctor(config, base_dir=ROOT)
+
+    assert report.status == "fail"
+    assert any(
+        check.name == "config.unsupported"
+        and check.metadata.get("field") == "models.default.base_url"
+        for check in report.checks
+    )
+    assert any(
+        check.name == "config.unsupported"
+        and check.metadata.get("field") == "models.default.api_key_env"
+        for check in report.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("adapter_id", "provider"),
+    [
+        ("nvidia.fabric.claude", "anthropic"),
+        ("nvidia.fabric.codex", "openai"),
+    ],
+)
+def test_plan_accepts_native_model_provider(adapter_id: str, provider: str):
+    config = _model_provider_config(adapter_id, provider)
+
+    plan = Fabric().plan(config, base_dir=ROOT)
+
+    assert plan.config.models["default"]["provider"] == provider
+
+
+@pytest.mark.parametrize(
+    "adapter_id",
+    ["nvidia.fabric.claude", "nvidia.fabric.codex"],
+)
+def test_plan_accepts_explicit_custom_provider_connection(adapter_id: str):
+    config = _model_provider_config(adapter_id, "acme")
+    config.models["default"].base_url = "https://models.example/v1"
+    config.models["default"].api_key_env = "ACME_API_KEY"
+
+    plan = Fabric().plan(config, base_dir=ROOT)
+
+    assert plan.config.models["default"]["provider"] == "acme"
+
+
+async def test_plan_and_doctor_reject_undeclared_model_setting():
+    config = _model_provider_config("nvidia.fabric.claude", "anthropic")
+    config.models["default"].settings["api_timeout"] = 30
+
+    with pytest.raises(
+        FabricConfigError,
+        match=r"models\.default\.settings\.api_timeout",
+    ):
+        Fabric().plan(config, base_dir=ROOT)
+
+    report = await Fabric().doctor(config, base_dir=ROOT)
+
+    assert report.status == "fail"
+    assert any(
+        check.name == "config.unsupported"
+        and check.metadata.get("field")
+        == "models.default.settings.api_timeout"
         for check in report.checks
     )
 

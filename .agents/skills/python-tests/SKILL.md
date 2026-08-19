@@ -46,6 +46,12 @@ uv run pytest -k "<pattern>"
 uv run pytest
 ```
 
+## Do Not Write Tests For
+
+- Documentation.
+- Test helper code under `tests/_utils/`.
+- Package metadata or wheel installation behavior.
+
 ## References
 
 - `pyproject.toml`

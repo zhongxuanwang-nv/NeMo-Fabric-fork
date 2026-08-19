@@ -15,7 +15,9 @@ import nemo_fabric
 import nemo_fabric.errors as fabric_errors
 import pytest
 from nemo_fabric import AdapterInfo
+from nemo_fabric import ArtifactRef
 from nemo_fabric import DoctorReport
+from nemo_fabric import DiscoveryConfig
 from nemo_fabric import EnvironmentConfig
 from nemo_fabric import Fabric
 from nemo_fabric import FabricCapabilityError
@@ -28,26 +30,34 @@ from nemo_fabric import FabricStateError
 from nemo_fabric import HarnessConfig
 from nemo_fabric import InstructionConfig
 from nemo_fabric import InstructionsConfig
+from nemo_fabric import McpAuthenticationConfig
 from nemo_fabric import McpConfig
+from nemo_fabric import McpServerConfig
 from nemo_fabric import MetadataConfig
 from nemo_fabric import RelayAtifConfig
 from nemo_fabric import RelayAtofConfig
 from nemo_fabric import RelayAtofFileSinkConfig
 from nemo_fabric import RelayAtofStreamSinkConfig
 from nemo_fabric import RelayComponentConfig
+from nemo_fabric import RelayConfig
 from nemo_fabric import RelayConfigPolicy
 from nemo_fabric import RelayObservabilityConfig
+from nemo_fabric import RelayOpenTelemetryConfig
+from nemo_fabric import RelayOpenTelemetryEndpointConfig
 from nemo_fabric import RunOutput
 from nemo_fabric import RunPlan
 from nemo_fabric import RunRequest
 from nemo_fabric import RunResult
+from nemo_fabric import RunUsage
 from nemo_fabric import Runtime
 from nemo_fabric import RuntimeCapabilities
 from nemo_fabric import RuntimeConfig
 from nemo_fabric import RuntimeHandle
 from nemo_fabric import SkillConfig
 from nemo_fabric import TelemetryConfig
+from nemo_fabric import ToolDefinitionConfig
 from nemo_fabric import ToolsConfig
+from nemo_fabric import WorkflowConfig
 from nemo_fabric.types import _FabricConfigSnapshot
 from nemo_fabric.types import _ToolsConfig
 from pydantic import ValidationError
@@ -123,6 +133,63 @@ def test_typed_config_validates_required_fields_and_preserves_extensions():
         )
 
 
+def test_typed_workflow_round_trips_through_config_and_plan_snapshot():
+    config = FabricConfig(
+        metadata=MetadataConfig(name="demo"),
+        workflow=WorkflowConfig(
+            target_id="example.test-agent",
+            settings={"llm_name": "default"},
+            revision="v1",
+        ),
+        discovery=DiscoveryConfig(local_paths=["./descriptors"]),
+    )
+
+    assert config.to_mapping()["workflow"] == {
+        "target_id": "example.test-agent",
+        "settings": {"llm_name": "default"},
+        "revision": "v1",
+    }
+
+    snapshot = _FabricConfigSnapshot.from_mapping(config.to_mapping())
+    assert snapshot.harness is None
+    assert snapshot.workflow.target_id == "example.test-agent"
+    assert snapshot.workflow.settings == {"llm_name": "default"}
+    assert snapshot.workflow.revision == "v1"
+    assert snapshot.discovery.local_paths == ["./descriptors"]
+    assert snapshot.to_mapping()["workflow"] == config.to_mapping()["workflow"]
+
+    config.workflow.settings.clear()
+    workflow_mapping = config.to_mapping()["workflow"]
+    assert "settings" not in workflow_mapping
+    snapshot = _FabricConfigSnapshot.from_mapping(config.to_mapping())
+    assert snapshot.to_mapping()["workflow"] == workflow_mapping
+
+
+def test_typed_workflow_rejects_blank_target_id():
+    with pytest.raises(ValidationError):
+        WorkflowConfig(target_id=" ")
+
+    raw = _plan()["config"]
+    raw["workflow"] = {"target_id": " "}
+    with pytest.raises(FabricConfigError, match="target_id"):
+        _FabricConfigSnapshot.from_mapping(raw)
+
+
+@pytest.mark.parametrize("path", ["", " ", "\t"])
+def test_discovery_config_rejects_blank_local_paths(path: str):
+    with pytest.raises(
+        ValidationError, match="discovery local paths must not be empty"
+    ):
+        DiscoveryConfig(local_paths=[path])
+
+    raw = _plan()["config"]
+    raw["discovery"] = {"local_paths": [path]}
+    with pytest.raises(
+        FabricConfigError, match="discovery local paths must not be empty"
+    ):
+        _FabricConfigSnapshot.from_mapping(raw)
+
+
 def test_typed_config_authoring_helpers_emit_schema_shape():
     config = FabricConfig(
         metadata=MetadataConfig(name="demo"),
@@ -140,13 +207,28 @@ def test_typed_config_authoring_helpers_emit_schema_shape():
         "github",
         transport="streamable-http",
         url="${GITHUB_MCP_URL}",
+        args=["--read-only"],
+        authentication=McpAuthenticationConfig(
+            type="oauth2",
+            client_id="fabric-client",
+            scopes=["repo"],
+        ),
+        custom_headers={"X-Tenant": "fabric"},
         exposure="fabric_managed",
+        allowed_tools=["issues.read", "pull_requests.read"],
+        blocked_tools=["issues.delete"],
     )
     config.enable_relay(
         project="fabric-tests",
         output_dir="./artifacts/relay",
     )
     config.block_tools("browser", "shell", "browser")
+    config.add_tool_definition(
+        "email_phishing_analyzer",
+        kind="function",
+        ref="email_phishing_analyzer",
+        settings={"llm": "default"},
+    )
     assert config.tools is not None
     config.tools.enabled = ["terminal"]
 
@@ -154,8 +236,19 @@ def test_typed_config_authoring_helpers_emit_schema_shape():
     assert isinstance(config.skills, SkillConfig)
     assert isinstance(config.telemetry, TelemetryConfig)
     assert isinstance(config.tools, ToolsConfig)
+    assert isinstance(
+        config.tools.definitions["email_phishing_analyzer"],
+        ToolDefinitionConfig,
+    )
 
     assert config.to_mapping()["tools"] == {
+        "definitions": {
+            "email_phishing_analyzer": {
+                "kind": "function",
+                "ref": "email_phishing_analyzer",
+                "settings": {"llm": "default"},
+            }
+        },
         "enabled": ["terminal"],
         "blocked": ["browser", "shell"],
     }
@@ -165,7 +258,16 @@ def test_typed_config_authoring_helpers_emit_schema_shape():
             "github": {
                 "transport": "streamable-http",
                 "url": "${GITHUB_MCP_URL}",
+                "args": ["--read-only"],
+                "authentication": {
+                    "type": "oauth2",
+                    "client_id": "fabric-client",
+                    "scopes": ["repo"],
+                },
+                "custom_headers": {"X-Tenant": "fabric"},
                 "exposure": "fabric_managed",
+                "allowed_tools": ["issues.read", "pull_requests.read"],
+                "blocked_tools": ["issues.delete"],
             }
         }
     }
@@ -196,6 +298,284 @@ def test_typed_config_authoring_helpers_emit_schema_shape():
         TelemetryConfig(providers={"sideways": {}})
 
 
+def test_remove_last_tool_definition_preserves_tools_extensions():
+    config = FabricConfig(
+        metadata=MetadataConfig(name="demo"),
+        harness=HarnessConfig(adapter_id="test.fabric.shim"),
+        tools=ToolsConfig(
+            definitions={
+                "web": ToolDefinitionConfig(kind="function_group", ref="web_tools")
+            },
+            profile="strict",
+        ),
+    )
+
+    config.remove_tool_definition("web")
+
+    assert config.to_mapping()["tools"] == {"profile": "strict"}
+
+
+def test_mcp_server_tool_policy_preserves_empty_allowlist():
+    server = McpServerConfig(
+        transport="streamable-http",
+        url="https://mcp.example.test",
+        allowed_tools=[],
+    )
+
+    expected = {
+        "transport": "streamable-http",
+        "url": "https://mcp.example.test",
+        "exposure": "harness_native",
+        "allowed_tools": [],
+    }
+    assert server.model_dump(mode="python") == expected
+    assert McpConfig(servers={"docs": server}).model_dump(mode="python") == {
+        "servers": {"docs": expected}
+    }
+    assert server.to_mapping() == expected
+
+
+def test_mcp_server_rejects_unknown_transport():
+    with pytest.raises(ValidationError, match="transport"):
+        McpServerConfig(transport="websocket", url="https://mcp.example.test")
+
+    server = McpServerConfig(
+        transport="streamable-http", url="https://mcp.example.test"
+    )
+    with pytest.raises(ValidationError, match="transport"):
+        server.transport = "websocket"  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize("transport", ["sse", "streamable-http"])
+def test_mcp_server_rejects_env_for_http_transport(transport):
+    with pytest.raises(ValidationError, match="env is only valid for stdio transport"):
+        McpServerConfig(
+            transport=transport,
+            url="https://mcp.example.test",
+            env={"MCP_SECRET": "secret"},
+        )
+
+
+def test_mcp_server_serializes_oauth2_authentication_and_custom_headers():
+    server = McpServerConfig(
+        transport="streamable-http",
+        url="https://mcp.example.test/jira",
+        custom_headers={"X-Tenant": "fabric"},
+        authentication={
+            "type": "oauth2",
+            "client_id": "fabric-client",
+            "client_secret_env": "MCP_CLIENT_SECRET",
+            "scopes": ["read:jira", "write:jira"],
+            "redirect_uri": "http://127.0.0.1:8765/callback",
+            "enable_dynamic_registration": False,
+            "client_name": "NeMo Fabric",
+            "token_endpoint_auth_method": "client_secret_post",
+            "authorization_timeout_seconds": 120,
+        },
+    )
+
+    assert isinstance(server.authentication, McpAuthenticationConfig)
+    assert server.custom_headers == {"X-Tenant": "fabric"}
+    assert "custom_headers" not in server.extra_fields
+    assert server.to_mapping() == {
+        "transport": "streamable-http",
+        "url": "https://mcp.example.test/jira",
+        "authentication": {
+            "type": "oauth2",
+            "client_id": "fabric-client",
+            "client_secret_env": "MCP_CLIENT_SECRET",
+            "scopes": ["read:jira", "write:jira"],
+            "redirect_uri": "http://127.0.0.1:8765/callback",
+            "enable_dynamic_registration": False,
+            "client_name": "NeMo Fabric",
+            "token_endpoint_auth_method": "client_secret_post",
+            "authorization_timeout_seconds": 120,
+        },
+        "custom_headers": {"X-Tenant": "fabric"},
+        "exposure": "harness_native",
+    }
+
+
+def test_mcp_server_serializes_service_account_authentication():
+    server = McpServerConfig(
+        transport="streamable-http",
+        url="https://mcp.example.test/automation",
+        authentication=McpAuthenticationConfig(
+            type="service_account",
+            client_id="fabric-client",
+            client_secret_env="MCP_CLIENT_SECRET",
+            token_url="https://auth.example.test/token",
+            scopes=["mcp:invoke"],
+            token_endpoint_auth_method="client_secret_basic",
+            token_cache_buffer_seconds=60,
+        ),
+    )
+
+    assert server.to_mapping()["authentication"] == {
+        "type": "service_account",
+        "client_id": "fabric-client",
+        "client_secret_env": "MCP_CLIENT_SECRET",
+        "token_url": "https://auth.example.test/token",
+        "scopes": ["mcp:invoke"],
+        "token_endpoint_auth_method": "client_secret_basic",
+        "token_cache_buffer_seconds": 60,
+    }
+
+
+def test_mcp_oauth_allows_dynamic_registration_to_supply_client_secret():
+    authentication = McpAuthenticationConfig(
+        type="oauth2",
+        token_endpoint_auth_method="client_secret_post",
+    )
+
+    assert authentication.client_id is None
+    assert authentication.client_secret_env is None
+    assert authentication.enable_dynamic_registration is True
+
+
+@pytest.mark.parametrize(
+    "authentication",
+    [
+        {"type": "oauth2", "enable_dynamic_registration": False},
+        {
+            "type": "service_account",
+            "client_id": "fabric-client",
+            "client_secret_env": "MCP_CLIENT_SECRET",
+        },
+        {
+            "type": "service_account",
+            "client_id": "fabric-client",
+            "client_secret_env": "MCP_CLIENT_SECRET",
+            "token_url": "https://auth.example.test/token",
+            "token_endpoint_auth_method": "none",
+        },
+    ],
+)
+def test_mcp_authentication_rejects_invalid_policy(authentication):
+    with pytest.raises(ValidationError):
+        McpAuthenticationConfig.model_validate(authentication)
+
+
+@pytest.mark.parametrize(
+    "authentication",
+    [
+        {"type": "oauth2", "unknown": True},
+        {
+            "type": "service_account",
+            "client_id": "fabric-client",
+            "client_secret_env": "MCP_CLIENT_SECRET",
+            "token_url": "https://auth.example.test/token",
+            "unknown": True,
+        },
+    ],
+)
+def test_mcp_authentication_rejects_unknown_variant_fields(authentication):
+    with pytest.raises(ValidationError, match="unknown"):
+        McpAuthenticationConfig(**authentication)
+
+
+@pytest.mark.parametrize(
+    ("authentication_type", "field", "value"),
+    [
+        ("oauth2", "token_url", None),
+        ("oauth2", "token_cache_buffer_seconds", 300),
+        ("service_account", "redirect_uri", None),
+        ("service_account", "enable_dynamic_registration", True),
+        ("service_account", "client_name", None),
+        ("service_account", "authorization_timeout_seconds", 300),
+    ],
+)
+def test_mcp_authentication_rejects_explicit_cross_variant_fields(
+    authentication_type, field, value
+):
+    authentication = {"type": authentication_type, field: value}
+    if authentication_type == "service_account":
+        authentication.update(
+            {
+                "client_id": "fabric-client",
+                "client_secret_env": "MCP_CLIENT_SECRET",
+                "token_url": "https://auth.example.test/token",
+            }
+        )
+
+    with pytest.raises(ValidationError, match=field):
+        McpAuthenticationConfig(**authentication)
+
+
+def test_mcp_config_add_server_preserves_legacy_mcp_extra_fields():
+    config = McpConfig().add_server(
+        "docs",
+        transport="streamable-http",
+        url="https://mcp.example.test",
+        extra_fields={
+            "authentication": {"type": "oauth2"},
+            "custom_headers": {"X-Tenant": "fabric"},
+        },
+    )
+
+    assert config.to_mapping()["servers"]["docs"]["authentication"] == {
+        "type": "oauth2"
+    }
+    assert config.to_mapping()["servers"]["docs"]["custom_headers"] == {
+        "X-Tenant": "fabric"
+    }
+
+
+def test_mcp_config_add_server_accepts_custom_headers():
+    config = McpConfig().add_server(
+        "docs",
+        transport="streamable-http",
+        url="https://mcp.example.test",
+        custom_headers={"X-Tenant": "fabric"},
+    )
+
+    assert config.servers["docs"].custom_headers == {"X-Tenant": "fabric"}
+    assert config.to_mapping()["servers"]["docs"]["custom_headers"] == {
+        "X-Tenant": "fabric"
+    }
+
+
+def test_mcp_authentication_rejects_unsupported_type():
+    with pytest.raises(ValidationError, match="oauth2"):
+        McpAuthenticationConfig(type="bearer")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["allowed_tools", "blocked_tools"])
+def test_mcp_config_rejects_string_tool_policy(field: str):
+    with pytest.raises(
+        TypeError,
+        match=rf"{field} must be a sequence of strings, not a string",
+    ):
+        McpConfig().add_server(
+            "docs",
+            transport="streamable-http",
+            url="https://mcp.example.test",
+            **{field: "search"},  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("allowed_tools", "blocked_tools", "message"),
+    [
+        (["search"], ["search"], "cannot be both allowed and blocked"),
+        ([""], [], "MCP tool names must not be empty"),
+        (None, ["  "], "MCP tool names must not be empty"),
+    ],
+)
+def test_mcp_server_tool_policy_rejects_invalid_names_and_overlap(
+    allowed_tools: list[str] | None,
+    blocked_tools: list[str],
+    message: str,
+):
+    with pytest.raises(ValidationError, match=message):
+        McpServerConfig(
+            transport="streamable-http",
+            url="https://mcp.example.test",
+            allowed_tools=allowed_tools,
+            blocked_tools=blocked_tools,
+        )
+
+
 def test_typed_tools_config_serializes_blocked_policy():
     config = FabricConfig(
         metadata=MetadataConfig(name="demo"),
@@ -206,6 +586,20 @@ def test_typed_tools_config_serializes_blocked_policy():
     config.block_tools("shell", "browser")
 
     assert config.to_mapping()["tools"] == {"blocked": ["browser", "shell"]}
+
+
+@pytest.mark.parametrize(
+    ("enabled", "expected"),
+    [
+        (None, {}),
+        ([], {"enabled": []}),
+    ],
+)
+def test_typed_tools_config_preserves_explicit_empty_policy(
+    enabled: list[str] | None,
+    expected: dict[str, object],
+):
+    assert ToolsConfig(enabled=enabled).to_mapping() == expected
 
 
 def test_typed_config_serializes_normalized_execution_fields():
@@ -235,9 +629,7 @@ def test_typed_config_serializes_normalized_execution_fields():
     assert mapping["runtime"]["max_turns"] == 7
     assert mapping["runtime"]["timeout_seconds"] == 12.5
     assert mapping["environment"]["env"] == {"VISIBLE": "yes"}
-    assert mapping["models"]["default"]["base_url"] == (
-        "https://models.example/v1"
-    )
+    assert mapping["models"]["default"]["base_url"] == ("https://models.example/v1")
     assert mapping["tools"] == {"enabled": [], "blocked": ["browser"]}
 
     with pytest.raises(ValidationError, match="greater than 0"):
@@ -256,9 +648,7 @@ def test_instruction_content_must_be_non_empty(content: str):
         InstructionConfig(content=content)
 
     raw = _plan()["config"]
-    raw["instructions"] = {
-        "system": {"content": content, "mode": "replace"}
-    }
+    raw["instructions"] = {"system": {"content": content, "mode": "replace"}}
     with pytest.raises(FabricConfigError, match="non-empty string"):
         _FabricConfigSnapshot.from_mapping(raw)
 
@@ -286,13 +676,49 @@ def test_run_plan_config_block_tools_emits_canonical_shape():
     assert config.to_mapping()["tools"] == {"blocked": ["browser", "shell"]}
 
 
+def test_run_plan_config_add_mcp_server_emits_tool_filters():
+    config = _FabricConfigSnapshot.from_mapping(_plan()["config"])
+
+    config.add_mcp_server(
+        "docs",
+        transport="streamable-http",
+        url="https://mcp.example.test",
+        authentication={"type": "oauth2"},
+        allowed_tools=["search"],
+        blocked_tools=["delete"],
+    )
+
+    assert config.to_mapping()["mcp"]["servers"]["docs"] == {
+        "transport": "streamable-http",
+        "url": "https://mcp.example.test",
+        "exposure": "harness_native",
+        "authentication": {"type": "oauth2"},
+        "allowed_tools": ["search"],
+        "blocked_tools": ["delete"],
+    }
+
+
+@pytest.mark.parametrize(
+    "reserved_field",
+    ["transport", "url", "exposure", "allowed_tools", "blocked_tools"],
+)
+def test_run_plan_config_rejects_reserved_mcp_extra_field(reserved_field: str):
+    config = _FabricConfigSnapshot.from_mapping(_plan()["config"])
+
+    with pytest.raises(FabricConfigError, match="reserved field"):
+        config.add_mcp_server(
+            "docs",
+            transport="streamable-http",
+            url="https://mcp.example.test",
+            extra_fields={reserved_field: "override"},
+        )
+
+
 def test_run_plan_config_preserves_normalized_tools_and_execution_fields():
     raw = _plan()["config"]
     raw.update(
         {
-            "instructions": {
-                "system": {"content": "Be concise.", "mode": "replace"}
-            },
+            "instructions": {"system": {"content": "Be concise.", "mode": "replace"}},
             "runtime": {"timeout_seconds": 9, "max_turns": 5},
             "environment": {"provider": "local", "env": {"VISIBLE": "yes"}},
             "tools": {"enabled": [], "blocked": ["browser"]},
@@ -314,6 +740,104 @@ def test_run_plan_config_preserves_normalized_tools_and_execution_fields():
 def test_run_plan_tools_config_rejects_scalar_blocked_value():
     with pytest.raises(FabricConfigError, match="tools blocked"):
         _ToolsConfig(blocked="browser")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("definitions", [[], [{"kind": "function", "ref": "web"}]])
+def test_run_plan_tools_config_rejects_non_mapping_definitions(definitions: object):
+    with pytest.raises(
+        FabricConfigError, match="tool definitions must be a JSON object"
+    ):
+        _ToolsConfig(definitions=definitions)  # type: ignore[arg-type]
+
+
+def test_run_plan_tools_config_preserves_named_definitions():
+    config = _ToolsConfig().add_definition(
+        "web",
+        kind="function_group",
+        ref="web_tools",
+        settings={"include": ["search"]},
+    )
+
+    assert config.to_mapping() == {
+        "definitions": {
+            "web": {
+                "kind": "function_group",
+                "ref": "web_tools",
+                "settings": {"include": ["search"]},
+            }
+        }
+    }
+
+
+def test_typed_tool_definition_omits_empty_settings():
+    definition = ToolDefinitionConfig(kind="function_group", ref="web_tools")
+
+    assert definition.model_dump() == {
+        "kind": "function_group",
+        "ref": "web_tools",
+    }
+
+
+@pytest.mark.parametrize("field", ["kind", "ref", "settings"])
+def test_typed_tool_definition_rejects_known_extra_field_collisions(field: str):
+    tools = ToolsConfig()
+
+    with pytest.raises(ValueError, match="extra_fields duplicates known fields"):
+        tools.add_definition(
+            "web",
+            kind="function_group",
+            ref="web_tools",
+            extra_fields={field: "replacement"},
+        )
+
+
+def test_run_plan_snapshot_removes_named_definition():
+    config = _FabricConfigSnapshot.from_mapping(
+        {
+            "schema_version": "fabric.agent/v1alpha1",
+            "metadata": {"name": "demo"},
+            "harness": {"adapter_id": "test.fabric.shim"},
+            "tools": {
+                "definitions": {"web": {"kind": "function_group", "ref": "web_tools"}}
+            },
+        }
+    )
+
+    config.remove_tool_definition("web")
+
+    assert "definitions" not in config.to_mapping()["tools"]
+
+
+def test_run_plan_snapshot_remove_definition_preserves_absent_tools():
+    config = _FabricConfigSnapshot.from_mapping(
+        {
+            "schema_version": "fabric.agent/v1alpha1",
+            "metadata": {"name": "demo"},
+            "harness": {"adapter_id": "test.fabric.shim"},
+        }
+    )
+
+    config.remove_tool_definition("web")
+
+    assert "tools" not in config.to_mapping()
+
+
+def test_artifact_ref_omits_empty_metadata_and_preserves_values():
+    assert ArtifactRef.from_mapping(
+        {"name": "trace", "kind": "file", "path": "trace.jsonl"}
+    ).to_mapping() == {
+        "name": "trace",
+        "kind": "file",
+        "path": "trace.jsonl",
+    }
+    assert ArtifactRef.from_mapping(
+        {
+            "name": "trace",
+            "kind": "file",
+            "path": "trace.jsonl",
+            "metadata": {"rows": 10},
+        }
+    ).to_mapping()["metadata"] == {"rows": 10}
 
 
 def test_fabric_config_authors_first_class_relay_observability():
@@ -344,6 +868,16 @@ def test_fabric_config_authors_first_class_relay_observability():
                 filename_template="trajectory-{session_id}.atif.json",
                 agent_name="fabric-tests",
             ),
+            opentelemetry=RelayOpenTelemetryConfig(
+                enabled=True,
+                endpoints=[
+                    RelayOpenTelemetryEndpointConfig(
+                        type="openinference",
+                        endpoint="http://localhost:6006/v1/traces",
+                        header_env={"authorization": "OTEL_AUTHORIZATION"},
+                    )
+                ],
+            ),
         ),
         components=[
             RelayComponentConfig(kind="switchyard", config={"route": "canary"}),
@@ -357,7 +891,7 @@ def test_fabric_config_authors_first_class_relay_observability():
     assert config.to_mapping()["relay"] == {
         "output_dir": "./artifacts/relay",
         "observability": {
-            "version": 2,
+            "version": 3,
             "atof": {
                 "enabled": True,
                 "sinks": [
@@ -367,15 +901,15 @@ def test_fabric_config_authors_first_class_relay_observability():
                         "filename": "events.atof.jsonl",
                         "mode": "overwrite",
                     },
-                        {
-                            "type": "stream",
-                            "url": "http://localhost:4319/events",
-                            "transport": "ndjson",
-                            "header_env": {"authorization": "RELAY_AUTHORIZATION"},
-                            "timeout_millis": 3000,
-                            "field_name_policy": "preserve",
-                            "name": "live-events",
-                        },
+                    {
+                        "type": "stream",
+                        "url": "http://localhost:4319/events",
+                        "transport": "ndjson",
+                        "header_env": {"authorization": "RELAY_AUTHORIZATION"},
+                        "timeout_millis": 3000,
+                        "field_name_policy": "preserve",
+                        "name": "live-events",
+                    },
                 ],
             },
             "atif": {
@@ -385,6 +919,23 @@ def test_fabric_config_authors_first_class_relay_observability():
                 "output_directory": "./artifacts/relay",
                 "filename_template": "trajectory-{session_id}.atif.json",
             },
+            "opentelemetry": {
+                "enabled": True,
+                "endpoints": [
+                    {
+                        "type": "openinference",
+                        "endpoint": "http://localhost:6006/v1/traces",
+                        "mark_projection": "inherit",
+                        "mark_exclude_names": ["llm.chunk"],
+                        "transport": "http_binary",
+                        "header_env": {"authorization": "OTEL_AUTHORIZATION"},
+                        "service_name": "unknown_service",
+                        "instrumentation_scope": "opentelemetry",
+                        "timeout_millis": 3000,
+                    }
+                ],
+            },
+            "enable_full_payloads": False,
         },
         "components": [
             {
@@ -399,6 +950,316 @@ def test_fabric_config_authors_first_class_relay_observability():
             "unsupported_value": "error",
         },
     }
+
+
+@pytest.mark.parametrize("version", [1, 2, 4, True, 3.0, "3"])
+def test_typed_relay_observability_requires_exact_v3(version):
+    with pytest.raises(
+        ValidationError, match="requires observability config version 3"
+    ):
+        RelayObservabilityConfig(version=version)
+
+
+def test_relay_mapping_inputs_validate_typed_v3_observability():
+    with pytest.raises(
+        ValidationError, match="requires observability config version 3"
+    ):
+        RelayConfig(observability={"version": 2})
+
+    with pytest.raises(
+        ValidationError, match="requires observability config version 3"
+    ):
+        FabricConfig(
+            metadata=MetadataConfig(name="demo"),
+            harness=HarnessConfig(adapter_id="test.fabric.shim"),
+            relay={"observability": {"version": 2}},
+        )
+
+    config = _fabric_config()
+    with pytest.raises(
+        ValidationError, match="requires observability config version 3"
+    ):
+        config.enable_relay(observability={"version": 2})
+    assert config.relay is None
+    assert config.telemetry is None
+
+    valid = FabricConfig(
+        metadata=MetadataConfig(name="demo"),
+        harness=HarnessConfig(adapter_id="test.fabric.shim"),
+        relay={"observability": {"version": 3}},
+    )
+    assert isinstance(valid.relay, RelayConfig)
+    assert isinstance(valid.relay.observability, RelayObservabilityConfig)
+
+
+@pytest.mark.parametrize("version", [1, 2, 4, True, 3.0, "3"])
+def test_relay_generic_observability_component_requires_explicit_v3(version):
+    with pytest.raises(
+        ValidationError, match="requires observability config version 3"
+    ):
+        RelayConfig(
+            components=[
+                RelayComponentConfig(
+                    kind="observability",
+                    config={"version": version},
+                )
+            ]
+        )
+
+
+def test_relay_generic_observability_component_allows_implicit_or_v3_version():
+    for config in ({}, {"version": 3}):
+        relay = RelayConfig(
+            components=[
+                RelayComponentConfig(kind="observability", config=config),
+            ]
+        )
+        assert relay.components[0].config == config
+
+
+def test_relay_generic_observability_component_requires_mapping_config():
+    with pytest.raises(ValidationError, match="component config must be an object"):
+        RelayConfig(
+            components=[
+                {
+                    "kind": "observability",
+                    "config": 1,
+                }
+            ]
+        )
+
+
+def test_relay_generic_observability_component_reports_version_before_v3_shape():
+    with pytest.raises(
+        ValidationError,
+        match="requires observability config version 3",
+    ):
+        RelayConfig(
+            components=[
+                RelayComponentConfig(
+                    kind="observability",
+                    config={
+                        "version": 2,
+                        "opentelemetry": {
+                            "enabled": True,
+                            "endpoint": "http://localhost:4318/v1/traces",
+                        },
+                    },
+                )
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("opentelemetry", "valid"),
+    [
+        ({"enabled": True}, False),
+        ({"enabled": True, "endpoints": []}, False),
+        ({"enabled": False, "endpoints": []}, True),
+    ],
+)
+def test_relay_generic_observability_component_requires_enabled_endpoint(
+    opentelemetry: dict[str, object],
+    valid: bool,
+):
+    config = {
+        "version": 3,
+        "opentelemetry": opentelemetry,
+    }
+    if valid:
+        relay = RelayConfig(
+            components=[
+                RelayComponentConfig(kind="observability", config=config),
+            ]
+        )
+        assert relay.components[0].config == config
+    else:
+        with pytest.raises(ValidationError, match="requires at least one endpoint"):
+            RelayConfig(
+                components=[
+                    RelayComponentConfig(kind="observability", config=config),
+                ]
+            )
+
+
+@pytest.mark.parametrize(
+    ("opentelemetry", "message"),
+    [
+        (False, "opentelemetry config must be an object"),
+        ({"enabled": "true"}, r"opentelemetry\.enabled must be a boolean"),
+        ({"endpoints": None}, r"opentelemetry\.endpoints must be a list"),
+        ({"endpoints": "endpoint"}, r"opentelemetry\.endpoints must be a list"),
+        (
+            {"endpoints": [False]},
+            r"endpoint must be an object for relay\.components\[0\]",
+        ),
+        (
+            {"endpoints": [{"endpoint": "http://localhost:4318/v1/traces"}]},
+            r"endpoint type must be one of .*endpoints\[0\]\.type",
+        ),
+        (
+            {
+                "endpoints": [
+                    {
+                        "type": "zipkin",
+                        "endpoint": "http://localhost:4318/v1/traces",
+                    }
+                ]
+            },
+            r"endpoint type must be one of .*endpoints\[0\]\.type",
+        ),
+    ],
+)
+def test_relay_generic_observability_component_rejects_malformed_opentelemetry(
+    opentelemetry: object,
+    message: str,
+):
+    with pytest.raises(ValidationError, match=message):
+        RelayConfig(
+            components=[
+                {
+                    "kind": "observability",
+                    "config": {
+                        "version": 3,
+                        "opentelemetry": opentelemetry,
+                    },
+                }
+            ]
+        )
+
+
+@pytest.mark.parametrize("endpoint_type", ["full", "gen_ai", "openinference"])
+def test_relay_generic_observability_component_accepts_endpoint_types(
+    endpoint_type: str,
+):
+    RelayConfig(
+        components=[
+            {
+                "kind": "observability",
+                "config": {
+                    "version": 3,
+                    "opentelemetry": {
+                        "endpoints": [
+                            {
+                                "type": endpoint_type,
+                                "endpoint": "http://localhost:4318/v1/traces",
+                            }
+                        ]
+                    },
+                },
+            }
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        {"type": "full"},
+        {"type": "full", "endpoint": None},
+        {"type": "full", "endpoint": 42},
+        {"type": "full", "endpoint": ""},
+        {"type": "full", "endpoint": "   "},
+    ],
+)
+def test_relay_generic_observability_component_requires_nonblank_endpoint(endpoint):
+    with pytest.raises(ValidationError, match="endpoint must be a non-empty string"):
+        RelayConfig(
+            components=[
+                {
+                    "kind": "observability",
+                    "config": {
+                        "version": 3,
+                        "opentelemetry": {
+                            "enabled": True,
+                            "endpoints": [endpoint],
+                        },
+                    },
+                }
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {
+            "version": 3,
+            "openinference": {
+                "enabled": True,
+                "endpoint": "http://localhost:6006/v1/traces",
+            },
+        },
+        {
+            "version": 3,
+            "opentelemetry": {
+                "enabled": True,
+                "endpoint": "http://localhost:4318/v1/traces",
+            },
+        },
+    ],
+)
+def test_relay_generic_observability_component_rejects_legacy_exporters(config):
+    with pytest.raises(ValidationError, match="observability config version 3"):
+        RelayConfig(
+            components=[
+                RelayComponentConfig(kind="observability", config=config),
+            ]
+        )
+
+
+@pytest.mark.parametrize("endpoint", ["", "   "])
+def test_relay_opentelemetry_endpoint_must_be_nonblank(endpoint: str):
+    with pytest.raises(ValidationError):
+        RelayOpenTelemetryEndpointConfig(type="full", endpoint=endpoint)
+
+
+def test_relay_opentelemetry_requires_an_endpoint_when_enabled():
+    with pytest.raises(ValidationError, match="requires at least one endpoint"):
+        RelayOpenTelemetryConfig(enabled=True)
+
+    assert RelayOpenTelemetryConfig().endpoints == []
+
+
+def test_relay_observability_rejects_legacy_openinference_section():
+    with pytest.raises(ValidationError, match="as an opentelemetry endpoint"):
+        RelayObservabilityConfig(
+            openinference={
+                "enabled": True,
+                "endpoint": "http://localhost:6006/v1/traces",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("attribute_mappings", [{"key": "model", "alias": "llm.model"}]),
+        ("endpoint", "http://localhost:4318/v1/traces"),
+        ("transport", "http_binary"),
+        ("headers", {"authorization": "test"}),
+        ("header_env", {"authorization": "OTEL_AUTHORIZATION"}),
+        ("resource_attributes", {"deployment.environment": "test"}),
+        ("service_name", "fabric"),
+        ("service_namespace", "platform"),
+        ("service_version", "0.4.0"),
+        ("instrumentation_scope", "fabric.relay"),
+        ("timeout_millis", 1000),
+        ("mark_projection", "tool"),
+        ("mark_exclude_names", ["llm.chunk"]),
+        ("semantic_selector", "openinference"),
+        ("capture_content", True),
+    ],
+)
+def test_relay_opentelemetry_rejects_flat_v2_exporter_fields(field, value):
+    with pytest.raises(ValidationError, match=rf"endpoints: {field}"):
+        RelayOpenTelemetryConfig(**{field: value})
+
+
+def test_relay_opentelemetry_preserves_unknown_future_fields():
+    config = RelayOpenTelemetryConfig(future_option={"enabled": True})
+
+    assert config.extra_fields == {"future_option": {"enabled": True}}
 
 
 @pytest.mark.parametrize(
@@ -452,6 +1313,21 @@ def test_fabric_config_enable_relay_preserves_omitted_fields():
 
     config.enable_relay(components=[])
     assert config.to_mapping()["relay"]["components"] == []
+
+
+def test_fabric_config_enable_relay_preserves_path_and_extra_fields():
+    output_dir = Path("artifacts") / "relay"
+    config = _fabric_config()
+    config.relay = RelayConfig(
+        output_dir=output_dir,
+        future_relay_option={"enabled": True},
+    )
+
+    config.enable_relay(project="fabric-tests")
+
+    assert config.relay.output_dir == output_dir
+    assert isinstance(config.relay.output_dir, Path)
+    assert config.relay.model_extra == {"future_relay_option": {"enabled": True}}
 
 
 def test_telemetry_config_enable_native_preserves_existing_config():
@@ -519,12 +1395,14 @@ def test_config_emits_schema_shape_and_validates():
 
 
 def test_agent_model_tracks_rust_schema_top_level_fields():
-    schema = json.loads(Path("schemas/agent.schema.json").read_text(encoding="utf-8"))
+    schema = json.loads(
+        Path("schemas/sdk/agent.schema.json").read_text(encoding="utf-8")
+    )
     pydantic_schema = FabricConfig.model_json_schema()
 
     assert set(pydantic_schema["properties"]).issuperset(schema["properties"])
-    assert set(pydantic_schema["required"]) == {"metadata", "harness"}
-    assert set(schema["required"]) == {"schema_version", "metadata", "harness", "runtime"}
+    assert set(pydantic_schema["required"]) == {"metadata"}
+    assert set(schema["required"]) == {"schema_version", "metadata", "runtime"}
 
 
 def test_environment_model_defines_extension_field_ownership():
@@ -803,7 +1681,9 @@ class NativeRecorder:
         assert json.loads(plan_json)["agent_name"] == "demo"
         return json.dumps(_runtime())
 
-    def invoke_runtime(self, plan_json: str, runtime_json: str, request_json: str) -> str:
+    def invoke_runtime(
+        self, plan_json: str, runtime_json: str, request_json: str
+    ) -> str:
         if self.fail_invoke:
             raise RuntimeError("native invoke failed")
         request = json.loads(request_json)
@@ -869,7 +1749,9 @@ def test_run_request_is_validated_and_json_safe():
     overrides["limits"]["turns"] = 2
 
     assert request.request_id == "request-1"
-    assert request.to_mapping()["input"] == {"messages": [{"role": "user", "content": "hello"}]}
+    assert request.to_mapping()["input"] == {
+        "messages": [{"role": "user", "content": "hello"}]
+    }
     assert request.to_mapping()["context"] == {"run_id": "run-1", "labels": ["sdk"]}
     assert request.to_mapping()["overrides"] == {
         "temperature": 0,
@@ -931,7 +1813,9 @@ def test_run_request_preserves_extension_fields():
         future_request={"enabled": True},
     )
 
-    assert request.to_mapping()["input"] == {"messages": [{"role": "user", "content": "hello"}]}
+    assert request.to_mapping()["input"] == {
+        "messages": [{"role": "user", "content": "hello"}]
+    }
     assert request.context == {"job_id": "job-1"}
     assert request.extra_fields["future_request"] == {"enabled": True}
 
@@ -967,6 +1851,47 @@ def test_run_result_wraps_nested_error_and_keeps_mapping_access():
     assert result.artifacts.artifacts == ()
     assert result.events[0].kind == "log"
     assert result.to_dict()["error"]["code"] == "adapter_failed"
+
+
+def test_run_result_wraps_normalized_usage():
+    result = RunResult.from_mapping(
+        _run_result(
+            output="done",
+            usage={
+                "input_tokens": 3,
+                "output_tokens": 5,
+                "total_tokens": 8,
+                "cost_usd": 0.25,
+                "metadata": {"provider": "test"},
+            },
+        )
+    )
+
+    assert isinstance(result.usage, RunUsage)
+    assert result.usage.total_tokens == 8
+    assert result.usage.cost_usd == 0.25
+    assert isinstance(result.usage.cost_usd, float)
+    assert result.usage.metadata == {"provider": "test"}
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5])
+def test_run_usage_rejects_invalid_token_counts(value):
+    with pytest.raises(FabricConfigError, match="nonnegative integer"):
+        RunUsage.from_mapping({"input_tokens": value})
+
+
+@pytest.mark.parametrize("field", ["input_tokens", "output_tokens", "total_tokens"])
+def test_run_usage_rejects_token_counts_above_uint64(field):
+    with pytest.raises(FabricConfigError, match="no greater than"):
+        RunUsage.from_mapping({field: 1 << 64})
+
+
+@pytest.mark.parametrize(
+    "value", [-1, True, float("nan"), float("inf"), float("-inf")]
+)
+def test_run_usage_rejects_invalid_costs(value):
+    with pytest.raises(FabricConfigError, match="finite"):
+        RunUsage.from_mapping({"cost_usd": value})
 
 
 def test_run_result_exposes_detached_json_values():
@@ -1013,7 +1938,9 @@ def test_run_output_exposes_response_and_preserves_extensions():
 
 
 def test_run_result_wraps_object_output_as_run_output():
-    result = RunResult.from_mapping(_run_result(output={"response": "hello", "usage": {"tokens": 1}}))
+    result = RunResult.from_mapping(
+        _run_result(output={"response": "hello", "usage": {"tokens": 1}})
+    )
 
     assert isinstance(result.output, RunOutput)
     assert result.output.response == "hello"
@@ -1049,7 +1976,9 @@ def test_run_output_preserves_non_string_response_without_raising():
 
 
 def test_run_result_preserves_structured_response_from_core_valid_output():
-    result = RunResult.from_mapping(_run_result(output={"response": {"text": "hello"}, "usage": {"tokens": 1}}))
+    result = RunResult.from_mapping(
+        _run_result(output={"response": {"text": "hello"}, "usage": {"tokens": 1}})
+    )
 
     assert isinstance(result.output, RunOutput)
     assert result.output.response == {"text": "hello"}

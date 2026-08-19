@@ -26,16 +26,16 @@ def response(operation: str, *, output: Any = None) -> None:
 def invoke(payload: dict[str, Any]) -> dict[str, Any]:
     calculator = Path("/app/calculator.py")
     calculator.write_text(
-        "def add(a, b):\n"
-        "    return a + b\n\n\n"
-        "def multiply(a, b):\n"
-        "    return a * b\n",
+        "def add(a, b):\n    return a + b\n\n\ndef multiply(a, b):\n    return a * b\n",
         encoding="utf-8",
     )
     return {
-        "harness": "scripted",
-        "response": "Fixed multiply(a, b) in /app/calculator.py",
-        "request_id": payload["request"]["request_id"],
+        "status": "succeeded",
+        "output": {
+            "harness": "scripted",
+            "response": "Fixed multiply(a, b) in /app/calculator.py",
+            "request_id": payload["runtime_context"]["request_id"],
+        },
     }
 
 

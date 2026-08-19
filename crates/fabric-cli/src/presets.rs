@@ -6,26 +6,29 @@
 use std::collections::BTreeMap;
 
 use nemo_fabric_core::{
-    ControlLocation, EnvironmentConfig, EnvironmentOwnership, FabricConfig, HarnessConfig,
-    MetadataConfig, ModelConfig, ResolutionStrategy, RuntimeConfig,
+    ControlLocation, DiscoveryConfig, EnvironmentConfig, EnvironmentOwnership, FabricConfig,
+    HarnessConfig, MetadataConfig, ModelConfig, ResolutionStrategy, RuntimeConfig,
 };
 use serde_json::{Map, Value, json};
 
 use crate::assets::{EmbeddedFile, StagedAssets};
 
-const SCRIPTED_DESCRIPTOR: &str = include_str!("../assets/adapters/scripted/fabric-adapter.json");
+const SCRIPTED_DESCRIPTOR: &str =
+    include_str!("../assets/adapters/scripted/scripted.fabric-adapter.json");
 const SCRIPTED_RUNNER: &str = include_str!("../assets/adapters/scripted/run.py");
-const HERMES_DESCRIPTOR: &str = include_str!("../assets/adapters/hermes/fabric-adapter.json");
-const CLAUDE_DESCRIPTOR: &str = include_str!("../assets/adapters/claude/fabric-adapter.json");
-const CODEX_DESCRIPTOR: &str = include_str!("../assets/adapters/codex/fabric-adapter.json");
+const HERMES_DESCRIPTOR: &str =
+    include_str!("../assets/adapters/hermes/hermes.fabric-adapter.json");
+const CLAUDE_DESCRIPTOR: &str =
+    include_str!("../assets/adapters/claude/claude.fabric-adapter.json");
+const CODEX_DESCRIPTOR: &str = include_str!("../assets/adapters/codex/codex.fabric-adapter.json");
 const DEEPAGENTS_DESCRIPTOR: &str =
-    include_str!("../assets/adapters/deepagents/fabric-adapter.json");
+    include_str!("../assets/adapters/deepagents/deepagents.fabric-adapter.json");
 const NVIDIA_API_CATALOG_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 const NVIDIA_FRONTIER_BASE_URL_ENV: &str = "NVIDIA_FRONTIER_BASE_URL";
 
 const SCRIPTED_ASSETS: &[EmbeddedFile] = &[
     EmbeddedFile {
-        path: "adapters/scripted/fabric-adapter.json",
+        path: "adapters/scripted/scripted.fabric-adapter.json",
         contents: SCRIPTED_DESCRIPTOR,
     },
     EmbeddedFile {
@@ -34,19 +37,19 @@ const SCRIPTED_ASSETS: &[EmbeddedFile] = &[
     },
 ];
 const HERMES_ASSETS: &[EmbeddedFile] = &[EmbeddedFile {
-    path: "adapters/hermes/fabric-adapter.json",
+    path: "adapters/hermes/hermes.fabric-adapter.json",
     contents: HERMES_DESCRIPTOR,
 }];
 const CLAUDE_ASSETS: &[EmbeddedFile] = &[EmbeddedFile {
-    path: "adapters/claude/fabric-adapter.json",
+    path: "adapters/claude/claude.fabric-adapter.json",
     contents: CLAUDE_DESCRIPTOR,
 }];
 const CODEX_ASSETS: &[EmbeddedFile] = &[EmbeddedFile {
-    path: "adapters/codex/fabric-adapter.json",
+    path: "adapters/codex/codex.fabric-adapter.json",
     contents: CODEX_DESCRIPTOR,
 }];
 const DEEPAGENTS_ASSETS: &[EmbeddedFile] = &[EmbeddedFile {
-    path: "adapters/deepagents/fabric-adapter.json",
+    path: "adapters/deepagents/deepagents.fabric-adapter.json",
     contents: DEEPAGENTS_DESCRIPTOR,
 }];
 
@@ -74,9 +77,13 @@ impl Preset {
 
     /// Stage the adapter assets required to plan or run this preset.
     pub fn stage(self) -> std::io::Result<SelectedPreset> {
-        let config = self
+        let mut config = self
             .config()
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+        config.discovery = Some(DiscoveryConfig {
+            local_paths: vec!["adapters".into()],
+            extensions: BTreeMap::new(),
+        });
         Ok(SelectedPreset {
             preset: self,
             config,
@@ -184,7 +191,7 @@ fn hermes() -> FabricConfig {
         "nvidia.fabric.hermes",
         Some(model(
             "nvidia",
-            "nvidia/nemotron-3-nano-30b-a3b",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
             Some("NVIDIA_API_KEY"),
             Some(NVIDIA_API_CATALOG_BASE_URL),
         )),
@@ -240,7 +247,7 @@ fn deepagents() -> FabricConfig {
         "nvidia.fabric.langchain.deepagents",
         Some(model(
             "nvidia",
-            "nvidia/nemotron-3-nano-30b-a3b",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
             Some("NVIDIA_API_KEY"),
             Some(NVIDIA_API_CATALOG_BASE_URL),
         )),
@@ -262,12 +269,14 @@ fn config(
             description: Some(description.to_string()),
             extensions: BTreeMap::new(),
         },
-        harness: HarnessConfig {
+        harness: Some(HarnessConfig {
             adapter_id: adapter_id.to_string(),
             resolution: Some(ResolutionStrategy::Preinstalled),
             settings,
             extensions: BTreeMap::new(),
-        },
+        }),
+        workflow: None,
+        discovery: None,
         models: default_model
             .map(|model| BTreeMap::from_iter([("default".to_string(), model)]))
             .unwrap_or_default(),
@@ -331,7 +340,14 @@ mod tests {
             assert!(names.insert(preset.name));
             let config = (preset.build)();
             assert_eq!(config.metadata.name, format!("{}-agent", preset.name));
-            assert!(!config.harness.adapter_id.is_empty());
+            assert!(
+                !config
+                    .harness
+                    .as_ref()
+                    .expect("preset harness")
+                    .adapter_id
+                    .is_empty()
+            );
         }
     }
 
@@ -402,9 +418,12 @@ mod tests {
             ("codex", CODEX_DESCRIPTOR),
             ("deepagents", DEEPAGENTS_DESCRIPTOR),
         ] {
-            let canonical =
-                std::fs::read_to_string(repository_adapters.join(name).join("fabric-adapter.json"))
-                    .expect("read repository adapter descriptor");
+            let canonical = std::fs::read_to_string(
+                repository_adapters
+                    .join(name)
+                    .join(format!("{name}.fabric-adapter.json")),
+            )
+            .expect("read repository adapter descriptor");
             assert_eq!(embedded, canonical, "{name} descriptor drifted");
         }
     }

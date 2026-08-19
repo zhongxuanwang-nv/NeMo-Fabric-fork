@@ -10,16 +10,51 @@ Claude Code runtime. NeMo Fabric preserves Claude's native credential precedence
 forwards only supported operating-system, configuration, and authentication
 variables plus values explicitly configured in `environment.env`.
 
-The adapter pins `claude-agent-sdk==0.2.120`. The SDK owns and selects its
-compatible Claude Code runtime.
+The adapter package's `harness` and `full` extras pin
+`claude-agent-sdk==0.2.120`. Use the same version for an environment-managed
+SDK. The SDK owns and selects its compatible Claude Code runtime.
 
 ## Install the Adapter
 
-Install the adapter for Claude Code:
+To install the NeMo Fabric runtime, Claude adapter, and supported Claude Agent
+SDK in one environment:
 
 ```bash
 pip install "nemo-fabric[claude]"
 ```
+
+To install the adapter and supported Claude Agent SDK without the NeMo Fabric
+runtime, use the adapter package's `harness` extra:
+
+```bash
+pip install "nemo-fabric-adapters-claude[harness]"
+```
+
+The adapter package's `full` extra installs the same dependencies as `harness`;
+it does not install the NeMo Fabric runtime. Both extras install the supported
+`nemo-relay` CLI. Claude does not import the Relay Python API, so this adapter
+does not provide a separate `relay` extra.
+
+If the environment already manages a compatible Claude Agent SDK, install only
+the adapter:
+
+```bash
+pip install nemo-fabric-adapters-claude
+```
+
+The bare adapter package does not install the NeMo Fabric runtime or SDK.
+
+If the existing compatible Claude Agent SDK and NeMo Fabric runtime share an
+environment, install the runtime and bare adapter together:
+
+```bash
+pip install nemo-fabric nemo-fabric-adapters-claude
+```
+
+For separate environments, set `ADAPTER_PYTHON` in the runtime environment to
+the adapter environment's Python interpreter. Use
+matching NeMo Fabric release versions for the runtime and adapter package
+unless a different pairing has been explicitly validated.
 
 ## Configure the Adapter
 
@@ -32,9 +67,18 @@ harness = HarnessConfig(adapter_id="nvidia.fabric.claude")
 ```
 
 Use normalized `FabricConfig` fields to configure the model, workspace, skills,
-MCP servers, instructions, turn limit, tool policy, and telemetry. Use
-`harness.settings` for supported Claude-specific options such as
-`allowed_tools`, `permission_mode`, `max_budget_usd`, and `setting_sources`.
+MCP servers, instructions, turn limit, tool policy, and telemetry. The
+resolved Claude descriptor accepts only these Claude-specific
+`harness.settings` keys:
+
+- `permission_mode`: `default`, `acceptEdits`, `bypassPermissions`, `plan`,
+  `dontAsk`, or `auto`
+- `max_budget_usd`: a number greater than `0`
+- `setting_sources`: an array containing `user`, `project`, or `local`
+
+Planning rejects unknown keys, invalid types, and invalid values before the
+Claude runtime starts. When `permission_mode` is `dontAsk`, tools listed in
+`tools.enabled` are pre-approved so headless runs can invoke them.
 
 ## Choose an Authentication Mode
 
@@ -124,7 +168,8 @@ gateway is scoped to that single invocation. Claude still resolves its credentia
 through the selected mode, and NeMo Fabric does not write authentication values
 to Relay configuration or artifacts.
 
-NeMo Fabric supports the external NeMo Relay CLI from `0.6.0` up to, but not
-including, `0.7.0`. The Python package named `nemo-relay` does not install this
-CLI. NeMo Fabric owns sidecar supervision, Claude configuration, and upstream
-selection. Relay owns the gateway transport and semantic observability pipeline.
+NeMo Fabric supports the external NeMo Relay CLI in the `>=0.7.2,<0.8` range.
+NeMo Fabric's `relay` extra installs only the Relay Python library and does not
+install the CLI. NeMo Fabric owns sidecar supervision, Claude configuration,
+and upstream selection. Relay owns the gateway transport and semantic
+observability pipeline.

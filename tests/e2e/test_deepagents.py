@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 import uuid
 import warnings
 
 import pytest
+import requests
+from _utils.utils import assert_atof_model, assert_atof_skill_selection
 
 
 @pytest.mark.usefixtures("mock_nvidia_api_key")
@@ -101,6 +104,208 @@ async def test_deepagents_persistent_host_with_relay_and_mock_model(
             "atof",
             "atif",
         }, turn.to_mapping()
+
+
+@pytest.mark.usefixtures("mock_nvidia_api_key")
+async def test_env_secrets_in_headers(api_server, tmp_path):
+    pytest.importorskip("deepagents")
+    from examples.code_review_agent import deepagents_config
+    from nemo_fabric import EnvironmentConfig, Fabric, RuntimeConfig
+
+    os.environ["MY_KEY"] = "XYZ"
+    scenario_response = requests.post(
+        f"{api_server}/_scenario",
+        json={
+            "tool_call": {
+                "name": "get_authorization_header",
+                "arguments": {},
+            }
+        },
+        timeout=5,
+    )
+    scenario_response.raise_for_status()
+
+    config = deepagents_config()
+    config.models["default"].base_url = f"{api_server}/v1"
+    config.environment = EnvironmentConfig(
+        provider="local",
+        workspace=tmp_path,
+        artifacts=tmp_path / "artifacts",
+    )
+    config.runtime = RuntimeConfig(
+        input_schema="chat",
+        output_schema="message",
+        artifacts=tmp_path / "artifacts",
+    )
+    config.add_mcp_server(
+        "headers",
+        transport="streamable-http",
+        url=f"{api_server}/mcp",
+        authentication=None,
+        custom_headers={"Authorization": "Bearer ${MY_KEY}"},
+    )
+
+    result = await Fabric().run(
+        config,
+        base_dir=tmp_path,
+        input="Use the MCP tool to return its Authorization header.",
+    )
+
+    assert result["status"] == "succeeded", result.to_mapping()
+    response = requests.get(f"{api_server}/_mcp_authorization_headers", timeout=5)
+    response.raise_for_status()
+    assert set(response.json()) == {"Bearer XYZ"}
+
+
+@pytest.mark.usefixtures("mock_nvidia_api_key")
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_mcp_stdio_transport(api_server, tmp_path, enabled):
+    pytest.importorskip("deepagents")
+    from examples.code_review_agent import deepagents_config
+    from nemo_fabric import EnvironmentConfig, Fabric, RuntimeConfig
+
+    tool_name = "get_current_time"
+    scenario_response = requests.post(
+        f"{api_server}/_scenario",
+        json={
+            "tool_call": {
+                "name": tool_name,
+                "arguments": {"timezone": "America/Los_Angeles"},
+            }
+        },
+        timeout=5,
+    )
+    scenario_response.raise_for_status()
+
+    config = deepagents_config()
+    config.models["default"].base_url = f"{api_server}/v1"
+    config.environment = EnvironmentConfig(
+        provider="local",
+        workspace=tmp_path,
+        artifacts=tmp_path / "artifacts",
+    )
+    config.runtime = RuntimeConfig(
+        input_schema="chat",
+        output_schema="message",
+        artifacts=tmp_path / "artifacts",
+    )
+    config.add_mcp_server(
+        "mcp_server_time",
+        transport="stdio",
+        url=sys.executable,
+        args=["-m", "mcp_server_time"],
+        env={"MCP_TIME_TEST": "enabled"},
+    )
+
+    if not enabled:
+        config.remove_mcp_server("mcp_server_time")
+
+    result = await Fabric().run(
+        config,
+        base_dir=tmp_path,
+        input="Use the time MCP tool to get the current time in America/Los_Angeles.",
+    )
+
+    assert result["status"] == "succeeded", result.to_mapping()
+    tool_calls = [
+        call
+        for message in result["output"]["messages"]
+        for call in message.get("tool_calls", [])
+        if call["name"] == tool_name
+    ]
+    tool_results = [
+        message for message in result["output"]["messages"] if message["role"] == "tool"
+    ]
+
+    if not enabled:
+        assert not tool_calls
+        assert not tool_results
+    else:
+        assert tool_calls
+        assert tool_results
+        assert "America/Los_Angeles" in str(tool_results[0]["content"])
+
+
+@pytest.mark.usefixtures("mock_nvidia_api_key", "nemo_relay")
+@pytest.mark.parametrize("skill", ["default", "alternate", None])
+async def test_skill_selection(
+    api_server, tmp_path, skill, default_skill, alternate_skill
+):
+    pytest.importorskip("deepagents")
+    from examples.code_review_agent import deepagents_config, with_relay
+    from nemo_fabric import EnvironmentConfig, Fabric, RuntimeConfig
+
+    config = with_relay(deepagents_config())
+    config.models["default"].model = "fabric-echo"
+    config.models["default"].base_url = f"{api_server}/v1"
+    config.environment = EnvironmentConfig(
+        provider="local",
+        workspace=default_skill.parents[2],
+        artifacts=tmp_path / "artifacts",
+    )
+    config.runtime = RuntimeConfig(
+        input_schema="chat",
+        output_schema="message",
+        artifacts=tmp_path / "artifacts",
+    )
+    config.add_skill_path(default_skill)
+
+    if skill == "alternate" or skill is None:
+        config.remove_skill_path(default_skill)
+
+    if skill == "alternate":
+        config.add_skill_path(alternate_skill)
+
+    if skill is not None:
+        selected_skill = default_skill if skill == "default" else alternate_skill
+        skill_file = selected_skill.relative_to(default_skill.parents[2]) / "SKILL.md"
+        scenario_response = requests.post(
+            f"{api_server}/_scenario",
+            json={
+                "tool_call": {
+                    "name": "read_file",
+                    "arguments": {"file_path": f"/{skill_file}"},
+                }
+            },
+            timeout=5,
+        )
+        scenario_response.raise_for_status()
+
+    result = await Fabric().run(
+        config,
+        base_dir=tmp_path,
+        input=f"Use the {skill} skill." if skill else "Reply without using a skill.",
+    )
+
+    assert result["status"] == "succeeded", result.to_mapping()
+    assert_atof_skill_selection(result["output"], skill)
+
+
+@pytest.mark.usefixtures("mock_nvidia_api_key", "nemo_relay")
+@pytest.mark.parametrize("model", ["m1", "m2"])
+async def test_model_selection(api_server, tmp_path, model):
+    pytest.importorskip("deepagents")
+    from examples.code_review_agent import deepagents_config, with_relay
+    from nemo_fabric import EnvironmentConfig, Fabric, RuntimeConfig
+
+    config = with_relay(deepagents_config())
+    config.models["default"].model = model
+    config.models["default"].base_url = f"{api_server}/v1"
+    config.environment = EnvironmentConfig(
+        provider="local",
+        workspace=tmp_path,
+        artifacts=tmp_path / "artifacts",
+    )
+    config.runtime = RuntimeConfig(
+        input_schema="chat",
+        output_schema="message",
+        artifacts=tmp_path / "artifacts",
+    )
+
+    result = await Fabric().run(config, base_dir=tmp_path, input="Reply with hello.")
+
+    assert result["status"] == "succeeded", result.to_mapping()
+    assert_atof_model(result["output"], model)
 
 
 @pytest.fixture(name="_require_integration")
@@ -192,43 +397,40 @@ async def test_deepagents_multi_turn_with_relay():
 
 
 @pytest.mark.usefixtures("_require_integration")
-async def test_deepagents_subagent_delegation():
-    # Exercise the real delegated-subagent path end to end: a `task`-delegating run
-    # under the adapter's gating wiring. Subagents inherit the parent's model, tools,
-    # workspace, and the config.tools policy, so a subagent cannot broaden capabilities.
-    # Deterministic verification of the inherited tool-gating is covered by the mock
-    # tests in tests/adapters/test_deepagents.py; a fuller real-subagent contract
-    # (independently configured subagent tools/skills/models) is future work.
+async def test_deepagents_builtin_subagent_delegation():
+    # Exercise the built-in delegated-subagent path end to end. The built-in
+    # subagent inherits the parent model, tools, workspace, and tool policy, so
+    # delegation cannot broaden capabilities.
     from examples.code_review_agent import BASE_DIR, deepagents_config
     from nemo_fabric import Fabric
 
     config = deepagents_config()
-    config.harness.settings["deepagents"] = {
-        "subagents": [
-            {
-                "name": "echoer",
-                "description": (
-                    "Echoes a short phrase back verbatim. Use to delegate an echo task."
-                ),
-                "system_prompt": "You echo the exact phrase you are given and nothing else.",
-            }
-        ]
-    }
 
     client = Fabric()
     result = await client.run(
         config,
         base_dir=BASE_DIR,
         input=(
-            "Delegate to the `echoer` subagent via the task tool to echo the phrase "
-            "FABRIC_DEEPAGENTS_SUBAGENT_OK, then reply with its result."
+            "Delegate to the built-in general-purpose subagent via the task tool to "
+            "echo the phrase FABRIC_DEEPAGENTS_SUBAGENT_OK, then reply with its result."
         ),
     )
 
     assert result["status"] == "succeeded", result.to_mapping()
-    assert result["output"]["response"], result.to_mapping()
+    output = result["output"]
+    assert "FABRIC_DEEPAGENTS_SUBAGENT_OK" in output["response"], result.to_mapping()
+    task_calls = [
+        call
+        for message in output["messages"]
+        for call in message.get("tool_calls", [])
+        if call["name"] == "task"
+    ]
+    assert any(
+        call["args"]["subagent_type"] == "general-purpose" for call in task_calls
+    ), result.to_mapping()
+    assert any("subgraph" in event for event in output["events"]), result.to_mapping()
     # delegated steps are folded into this turn's usage aggregation
-    assert result["output"]["resumed"] is False, result.to_mapping()
+    assert output["resumed"] is False, result.to_mapping()
 
 
 @pytest.mark.usefixtures("_require_integration")

@@ -1,0 +1,85 @@
+{
+  "contract_version": "fabric.adapter/v1alpha2",
+  "adapter_id": "test.fabric.hermes_shim",
+  "adapter_kind": "python",
+  "capabilities": {
+    "streaming": true
+  },
+  "runner": {
+    "module": "nemo_fabric_test_adapters.hermes_shim.adapter",
+    "cwd": ".",
+    "env": {
+      "PYTHONPATH": "adapters/hermes-shim/src"
+    }
+  },
+  "settings_schema": {
+    "type": "object",
+    "properties": {
+      "python3_command": {
+        "type": "string"
+      },
+      "mode": {
+        "type": "string"
+      },
+      "target_file": {
+        "type": "string"
+      },
+      "expected_before": {
+        "type": "string"
+      },
+      "replacement": {
+        "type": "string"
+      },
+      "new_file": {
+        "type": "string"
+      },
+      "new_file_contents": {
+        "type": "string"
+      }
+    },
+    "additionalProperties": false
+  },
+  "extension_schemas": {
+    "agent_config": {
+      "type": "object",
+      "properties": {
+        "consumer_extension": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "consumer_extension"
+      ],
+      "additionalProperties": false
+    },
+    "run_request": {
+      "type": "object",
+      "properties": {
+        "max_iterations": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "requirements": {
+    "binaries": [
+      "python3"
+    ]
+  },
+  "config": {
+    "accepts": [
+      "models",
+      "models.temperature",
+      "mcp",
+      "mcp.auth.oauth2",
+      "skills"
+    ]
+  },
+  "telemetry": {
+    "providers": {
+      "relay": {}
+    }
+  }
+}

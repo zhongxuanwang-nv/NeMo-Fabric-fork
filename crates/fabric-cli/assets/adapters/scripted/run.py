@@ -37,8 +37,11 @@ def main() -> None:
             response(
                 "invoke",
                 output={
-                    "response": request.get("input"),
-                    "request_id": request["request_id"],
+                    "status": "succeeded",
+                    "output": {
+                        "response": request.get("input"),
+                        "request_id": payload["runtime_context"]["request_id"],
+                    },
                 },
             )
         elif operation == "stop":

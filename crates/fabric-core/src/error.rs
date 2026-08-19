@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use crate::config::AdapterKind;
+use crate::config::{AdapterKind, DescriptorSource};
 
 /// Core NeMo Fabric result type.
 pub type Result<T> = std::result::Result<T, FabricError>;
@@ -31,6 +31,24 @@ pub enum FabricError {
         adapter_id: String,
         /// Available adapter ids.
         available: Vec<String>,
+    },
+    /// A requested Adapter Target Descriptor id was not discovered.
+    #[error("unknown adapter target `{target_id}`; available targets: {available:?}")]
+    UnknownAdapterTarget {
+        /// Requested target id.
+        target_id: String,
+        /// Available target ids.
+        available: Vec<String>,
+    },
+    /// More than one distinct descriptor record was discovered for one id.
+    #[error("ambiguous {descriptor_kind} descriptor `{id}`; conflicting paths: {paths:?}")]
+    AmbiguousDescriptor {
+        /// Human-readable descriptor category.
+        descriptor_kind: &'static str,
+        /// Conflicting descriptor id.
+        id: String,
+        /// Every conflicting descriptor path.
+        paths: Vec<PathBuf>,
     },
     /// An adapter descriptor did not match the selected harness config.
     #[error(
@@ -63,6 +81,78 @@ pub enum FabricError {
         path: PathBuf,
         /// Validation message.
         message: String,
+    },
+    /// An Adapter Target Descriptor is malformed.
+    #[error("invalid adapter target descriptor in {path}: {message}")]
+    InvalidAdapterTargetDescriptor {
+        /// Adapter Target Descriptor path.
+        path: PathBuf,
+        /// Validation message.
+        message: String,
+    },
+    /// Adapter-owned harness settings do not satisfy the resolved descriptor schema.
+    #[error(
+        "invalid harness settings for adapter `{adapter_id}` from {descriptor_source:?} descriptor {descriptor_path} at `{settings_path}`: {reason}"
+    )]
+    InvalidHarnessSettings {
+        /// Selected adapter id.
+        adapter_id: String,
+        /// Registry source of the selected descriptor.
+        descriptor_source: DescriptorSource,
+        /// Path to the selected descriptor.
+        descriptor_path: PathBuf,
+        /// Canonical path to the invalid setting.
+        settings_path: String,
+        /// Schema validation failure.
+        reason: String,
+    },
+    /// Adapter-owned workflow configuration does not satisfy the resolved descriptor schema.
+    #[error(
+        "invalid workflow for adapter `{adapter_id}` from {descriptor_source:?} descriptor {descriptor_path} at `{workflow_path}`: {reason}"
+    )]
+    InvalidWorkflow {
+        /// Selected adapter id.
+        adapter_id: String,
+        /// Registry source of the selected descriptor.
+        descriptor_source: DescriptorSource,
+        /// Path to the selected descriptor.
+        descriptor_path: PathBuf,
+        /// Canonical path to the invalid workflow field.
+        workflow_path: String,
+        /// Schema validation failure.
+        reason: String,
+    },
+    /// A normalized tool definition does not satisfy the resolved descriptor schema.
+    #[error(
+        "invalid tool definition for adapter `{adapter_id}` from {descriptor_source:?} descriptor {descriptor_path} at `{definition_path}`: {reason}"
+    )]
+    InvalidToolDefinition {
+        /// Selected adapter id.
+        adapter_id: String,
+        /// Registry source of the selected descriptor.
+        descriptor_source: DescriptorSource,
+        /// Path to the selected descriptor.
+        descriptor_path: PathBuf,
+        /// Canonical path to the invalid definition field.
+        definition_path: String,
+        /// Schema validation failure.
+        reason: String,
+    },
+    /// Adapter-owned extensions do not satisfy a descriptor extension schema.
+    #[error(
+        "invalid adapter extension for adapter `{adapter_id}` from {descriptor_source:?} descriptor {descriptor_path} at `{extension_path}`: {reason}"
+    )]
+    InvalidAdapterExtension {
+        /// Selected adapter id.
+        adapter_id: String,
+        /// Registry source of the selected descriptor.
+        descriptor_source: DescriptorSource,
+        /// Path to the selected descriptor.
+        descriptor_path: PathBuf,
+        /// Canonical path to the invalid extension field.
+        extension_path: String,
+        /// Schema validation failure.
+        reason: String,
     },
     /// A normalized Fabric config field is invalid.
     #[error("invalid Fabric configuration at `{field}`: {reason}")]
@@ -99,6 +189,22 @@ pub enum FabricError {
         harness: String,
         /// Adapter kind.
         adapter_kind: AdapterKind,
+    },
+    /// A requested runtime capability is not implemented by the selected adapter.
+    #[error("adapter `{adapter_id}` does not support runtime capability `{capability}`")]
+    UnsupportedRuntimeCapability {
+        /// Selected adapter id or harness name.
+        adapter_id: String,
+        /// Requested capability.
+        capability: &'static str,
+    },
+    /// The SDK-provided native streaming transport is invalid.
+    #[error("invalid OpenAI stream transport at `{field}`: {reason}")]
+    InvalidOpenAiStreamTransport {
+        /// Invalid transport field.
+        field: &'static str,
+        /// Validation failure without credential material.
+        reason: &'static str,
     },
     /// A persistent local-host lifecycle operation failed.
     #[error(
@@ -162,8 +268,7 @@ pub enum FabricError {
     /// The resolved Python adapter interpreter could not be used.
     #[error(
         "python adapter interpreter {path} (from {origin}) is unusable: {reason}; \
-         set `harness.settings.python` or the `ADAPTER_PYTHON` environment variable \
-         to a valid interpreter"
+         set the `ADAPTER_PYTHON` environment variable to a valid interpreter"
     )]
     PythonInterpreterUnavailable {
         /// Resolved interpreter path.

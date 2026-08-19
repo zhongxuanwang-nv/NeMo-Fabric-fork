@@ -3,18 +3,25 @@
 
 //! NeMo Fabric config models and loading helpers.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+pub use crate::adapter_contract::{ADAPTER_CONTRACT_VERSION, AdapterExtensionPoint};
+use crate::agent_config::project_agent_config;
+pub use crate::agent_config::{
+    AgentConfig, AgentHarnessConfig, AgentInstructionConfig, AgentInstructionsConfig,
+    AgentMcpConfig, AgentMcpServerConfig, AgentModelConfig, AgentRuntimeConfig, AgentSkillConfig,
+    AgentToolDefinition, AgentToolsConfig, AgentWorkflowConfig, AgentWorkflowEntrypointConfig,
+};
+use crate::agent_execution::{AgentRunRequest, AgentRunResult};
 use crate::error::{FabricError, Result};
-
-/// Adapter descriptor contract version supported by this core.
-pub const ADAPTER_CONTRACT_VERSION: &str = "fabric.adapter/v1alpha1";
 
 /// Versioned NVIDIA NeMo Fabric agent config.
 ///
@@ -27,8 +34,15 @@ pub struct FabricConfig {
     pub schema_version: String,
     /// Human-readable metadata.
     pub metadata: MetadataConfig,
-    /// Harness selection and harness-specific settings.
-    pub harness: HarnessConfig,
+    /// Optional direct adapter selection and harness-specific settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<HarnessConfig>,
+    /// Optional registered workflow target and construction settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowConfig>,
+    /// Optional explicit descriptor discovery paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<DiscoveryConfig>,
     /// Named model roles.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub models: BTreeMap<String, ModelConfig>,
@@ -97,6 +111,9 @@ pub struct InstructionsConfig {
 /// Harness-neutral tool capability configuration.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolsConfig {
+    /// Named tool and tool-group definitions resolved by the selected adapter.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub definitions: BTreeMap<String, ToolDefinitionConfig>,
     /// Adapter-native tool names to expose. `None` preserves the harness default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<Vec<String>>,
@@ -104,6 +121,23 @@ pub struct ToolsConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked: Vec<String>,
     /// Additive tool configuration fields.
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+/// One named normalized tool or tool-group definition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ToolDefinitionConfig {
+    /// Portable definition category, such as `function` or `function_group`.
+    #[schemars(length(min = 1), regex(pattern = r"\S"))]
+    pub kind: String,
+    /// Adapter-resolved component or factory reference.
+    #[schemars(length(min = 1), regex(pattern = r"\S"))]
+    pub r#ref: String,
+    /// Definition-specific construction settings validated by the adapter descriptor.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub settings: serde_json::Map<String, Value>,
+    /// Additive definition fields.
     #[serde(default, flatten)]
     pub extensions: BTreeMap<String, Value>,
 }
@@ -137,23 +171,170 @@ pub struct HarnessConfig {
     pub extensions: BTreeMap<String, Value>,
 }
 
+/// Registered workflow target and immutable construction settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowConfig {
+    /// Registered Adapter Target Descriptor id.
+    #[schemars(length(min = 1), regex(pattern = r"\S"))]
+    pub target_id: String,
+    /// Workflow-specific construction settings.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub settings: serde_json::Map<String, Value>,
+    /// Additive workflow fields.
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+/// Explicit descriptor discovery inputs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DiscoveryConfig {
+    /// Descriptor files or directories, resolved relative to the config base directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(schema_with = "discovery_local_paths_schema")]
+    pub local_paths: Vec<PathBuf>,
+    /// Additive discovery fields.
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+fn discovery_local_paths_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Vec::<PathBuf>::json_schema(generator);
+    schema.insert(
+        "items".into(),
+        serde_json::json!({
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+        }),
+    );
+    schema
+}
+
+/// Adapter target categories understood by this Adapter Contract version.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterTargetType {
+    /// A separately registered custom-agent or workflow target.
+    Workflow,
+}
+
+impl AdapterTargetType {
+    /// Stable wire name for this target category.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+        }
+    }
+}
+
+/// Adapter-owned workflow entry point supplied by an Adapter Target Descriptor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowEntrypointConfig {
+    /// Adapter-defined entry-point resolution semantics.
+    #[schemars(length(min = 1), regex(pattern = r"\S"))]
+    pub kind: String,
+    /// Adapter-defined workflow reference.
+    #[schemars(length(min = 1), regex(pattern = r"\S"))]
+    pub r#ref: String,
+    /// Additive workflow entry-point fields.
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+/// Workflow-specific Adapter Target Descriptor fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowTargetSpec {
+    /// Entry point projected southbound to the adapter.
+    pub entrypoint: WorkflowEntrypointConfig,
+    /// JSON Schema for `FabricConfig.workflow.settings`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_schema: Option<serde_json::Map<String, Value>>,
+    /// Additive workflow target fields.
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+/// Type-specific Adapter Target Descriptor payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", content = "spec", rename_all = "snake_case")]
+pub enum AdapterTarget {
+    /// Registered workflow target.
+    Workflow(WorkflowTargetSpec),
+}
+
+impl AdapterTarget {
+    fn target_type(&self) -> AdapterTargetType {
+        match self {
+            Self::Workflow(_) => AdapterTargetType::Workflow,
+        }
+    }
+
+    pub(crate) fn workflow(&self) -> &WorkflowTargetSpec {
+        match self {
+            Self::Workflow(workflow) => workflow,
+        }
+    }
+}
+
+/// Independently registered target implemented by an adapter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AdapterTargetDescriptor {
+    /// Adapter Contract version shared with Adapter Descriptor.
+    #[schemars(schema_with = "adapter_contract_version_schema")]
+    pub contract_version: String,
+    /// Unique registered target id.
+    #[schemars(length(min = 1), regex(pattern = r"\S"))]
+    pub id: String,
+    /// Adapter implementation selected by this target.
+    #[schemars(length(min = 1), regex(pattern = r"\S"))]
+    pub adapter_id: String,
+    /// Type-specific target fields.
+    #[serde(flatten)]
+    pub target: AdapterTarget,
+    /// Additive target descriptor fields.
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+impl AdapterTargetDescriptor {
+    /// Return this target's category.
+    pub fn target_type(&self) -> AdapterTargetType {
+        self.target.target_type()
+    }
+}
+
 /// Language-neutral adapter descriptor for a harness integration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AdapterDescriptor {
     /// Adapter descriptor contract version.
-    #[schemars(length(min = 1))]
+    #[schemars(schema_with = "adapter_contract_version_schema")]
     pub contract_version: String,
     /// Unique id for this adapter implementation.
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1), regex(pattern = r"\S"))]
     pub adapter_id: String,
-    /// Stable machine-readable harness identifier implemented by this adapter.
-    #[schemars(length(min = 1))]
-    pub harness: String,
     /// Adapter implementation kind.
     pub adapter_kind: AdapterKind,
+    /// Registered target categories this adapter can execute.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_types: Vec<AdapterTargetType>,
     /// Generic runner defaults consumed by the selected runtime adapter.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub runner: serde_json::Map<String, Value>,
+    /// JSON Schema for adapter-owned `harness.settings`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_schema: Option<serde_json::Map<String, Value>>,
+    /// JSON Schema applied to every normalized `FabricConfig.models` entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_schema: Option<serde_json::Map<String, Value>>,
+    /// JSON Schema applied to every normalized `FabricConfig.tools.definitions` entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_definition_schema: Option<serde_json::Map<String, Value>>,
+    /// JSON Schemas for adapter-owned `extensions` at southbound block types.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(schema_with = "adapter_extension_schemas_schema")]
+    pub extension_schemas: BTreeMap<AdapterExtensionPoint, serde_json::Map<String, Value>>,
     /// Runtime requirements.
     #[serde(default)]
     pub requirements: AdapterRequirements,
@@ -171,133 +352,364 @@ pub struct AdapterDescriptor {
     pub extensions: BTreeMap<String, Value>,
 }
 
-/// Where NeMo Fabric resolved an adapter descriptor from.
+fn adapter_contract_version_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = String::json_schema(generator);
+    schema.insert("const".into(), ADAPTER_CONTRACT_VERSION.into());
+    schema.insert("minLength".into(), 1.into());
+    schema
+}
+
+fn adapter_extension_schemas_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema =
+        BTreeMap::<AdapterExtensionPoint, serde_json::Map<String, Value>>::json_schema(generator);
+    schema.insert(
+        "propertyNames".into(),
+        serde_json::json!({
+            "enum": AdapterExtensionPoint::ALL.map(AdapterExtensionPoint::as_str),
+        }),
+    );
+    schema
+}
+
+/// Where NeMo Fabric discovered descriptor metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum AdapterDescriptorSource {
-    /// Descriptor maintained in this NeMo Fabric repository.
-    Repository,
-    /// Descriptor registered by the agent package or local development config.
-    Local,
+pub enum DescriptorSource {
+    /// Descriptor bundled with this NeMo Fabric build.
+    Bundled,
+    /// Descriptor installed as package data in the selected environment.
+    InstalledPackage,
+    /// Descriptor supplied through `FabricConfig.discovery.local_paths`.
+    ExplicitLocal,
+}
+
+impl DescriptorSource {
+    /// Stable serialized name used in diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bundled => "bundled",
+            Self::InstalledPackage => "installed_package",
+            Self::ExplicitLocal => "explicit_local",
+        }
+    }
+}
+
+/// One physical source for a discovered descriptor record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DescriptorProvenance {
+    /// Discovery provider that found this record.
+    pub source: DescriptorSource,
+    /// Canonical descriptor path.
+    pub path: PathBuf,
+    /// Directory used to resolve descriptor-local paths.
+    pub root: PathBuf,
 }
 
 /// Adapter descriptor selected for a run plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ResolvedAdapterDescriptor {
-    /// Registry source for this descriptor.
-    pub source: AdapterDescriptorSource,
-    /// Path to the adapter descriptor.
-    pub path: PathBuf,
-    /// Directory used to resolve descriptor-local runner and requirement paths.
-    pub root: PathBuf,
+    /// Every semantically identical record discovered for this descriptor.
+    #[serde(deserialize_with = "deserialize_non_empty_provenance")]
+    #[schemars(length(min = 1))]
+    pub provenance: Vec<DescriptorProvenance>,
     /// Adapter-owned compatibility and capability metadata.
     pub descriptor: AdapterDescriptor,
 }
 
+impl ResolvedAdapterDescriptor {
+    pub(crate) fn primary(&self) -> &DescriptorProvenance {
+        self.provenance
+            .first()
+            .expect("resolved descriptors always retain provenance")
+    }
+}
+
+/// Adapter target descriptor selected for a run plan.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvedAdapterTargetDescriptor {
+    /// Every semantically identical record discovered for this descriptor.
+    #[serde(deserialize_with = "deserialize_non_empty_provenance")]
+    #[schemars(length(min = 1))]
+    pub provenance: Vec<DescriptorProvenance>,
+    /// Target-specific resolution and validation metadata.
+    pub descriptor: AdapterTargetDescriptor,
+}
+
+fn deserialize_non_empty_provenance<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<DescriptorProvenance>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let provenance = Vec::<DescriptorProvenance>::deserialize(deserializer)?;
+    if provenance.is_empty() {
+        return Err(D::Error::custom("descriptor provenance must not be empty"));
+    }
+    Ok(provenance)
+}
+
+impl ResolvedAdapterTargetDescriptor {
+    pub(crate) fn primary(&self) -> &DescriptorProvenance {
+        self.provenance
+            .first()
+            .expect("resolved descriptors always retain provenance")
+    }
+}
+
 #[derive(Debug, Clone)]
-struct AdapterRegistryEntry {
-    source: AdapterDescriptorSource,
+struct DescriptorRecord<T> {
+    provenance: Vec<DescriptorProvenance>,
+    descriptor: T,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DescriptorKind {
+    Adapter,
+    Target,
+}
+
+#[derive(Debug, Clone)]
+struct DescriptorDiagnostic {
+    kind: DescriptorKind,
+    id: Option<String>,
     path: PathBuf,
-    root: PathBuf,
-    descriptor: AdapterDescriptor,
+    message: String,
 }
 
 #[derive(Debug, Clone, Default)]
-struct AdapterRegistry {
-    entries: BTreeMap<String, AdapterRegistryEntry>,
+struct DescriptorRegistry {
+    adapters: BTreeMap<String, Vec<DescriptorRecord<AdapterDescriptor>>>,
+    targets: BTreeMap<String, Vec<DescriptorRecord<AdapterTargetDescriptor>>>,
+    diagnostics: Vec<DescriptorDiagnostic>,
 }
 
-impl AdapterRegistry {
+impl DescriptorRegistry {
     fn from_config(
-        _config: &FabricConfig,
+        config: &FabricConfig,
         base_dir: &Path,
-        additional_directories: &[PathBuf],
+        installed_roots: &[PathBuf],
     ) -> Result<Self> {
         let mut registry = Self::default();
-        registry.register_repository_directory(&repository_adapter_dir())?;
-        for directory in additional_directories {
-            registry.register_local_directory(directory)?;
+        registry.register_path(&repository_adapter_dir(), DescriptorSource::Bundled, false)?;
+        for root in installed_roots {
+            registry.register_path(root, DescriptorSource::InstalledPackage, false)?;
         }
-        registry.register_local_directory(&base_dir.join("adapters"))?;
+        for path in config
+            .discovery
+            .iter()
+            .flat_map(|discovery| &discovery.local_paths)
+        {
+            registry.register_path(
+                &resolve_path(base_dir, path),
+                DescriptorSource::ExplicitLocal,
+                true,
+            )?;
+        }
         Ok(registry)
     }
 
-    fn register_repository_directory(&mut self, directory: &Path) -> Result<()> {
-        self.register_directory_tree(directory, AdapterDescriptorSource::Repository)
-    }
-
-    fn register_local_directory(&mut self, directory: &Path) -> Result<()> {
-        self.register_directory_tree(directory, AdapterDescriptorSource::Local)
+    fn register_path(
+        &mut self,
+        path: &Path,
+        source: DescriptorSource,
+        required: bool,
+    ) -> Result<()> {
+        if !path.exists() {
+            if required {
+                return Err(FabricError::PathNotFound(path.to_path_buf()));
+            }
+            return Ok(());
+        }
+        if path.is_dir() {
+            return self.register_directory_tree(path, source);
+        }
+        let Some(kind) = descriptor_kind(path) else {
+            return if required {
+                invalid_config(
+                    "discovery.local_paths",
+                    format!(
+                        "descriptor file `{}` must end in .fabric-adapter.json or .fabric-target.json",
+                        path.display()
+                    ),
+                )
+            } else {
+                Ok(())
+            };
+        };
+        self.register_file(path, source, kind);
+        Ok(())
     }
 
     fn register_directory_tree(
         &mut self,
         directory: &Path,
-        source: AdapterDescriptorSource,
+        source: DescriptorSource,
     ) -> Result<()> {
-        if !directory.is_dir() {
-            return Ok(());
-        }
         let entries = fs::read_dir(directory).map_err(|source| FabricError::Read {
             path: directory.to_path_buf(),
             source,
         })?;
-        for entry in entries {
-            let entry = entry.map_err(|source| FabricError::Read {
-                path: directory.to_path_buf(),
-                source,
-            })?;
-            let path = entry.path();
-            if path.is_dir() {
+        let mut paths = entries
+            .map(|entry| {
+                let entry = entry.map_err(|source| FabricError::Read {
+                    path: directory.to_path_buf(),
+                    source,
+                })?;
+                let file_type = entry.file_type().map_err(|source| FabricError::Read {
+                    path: directory.to_path_buf(),
+                    source,
+                })?;
+                Ok((entry.path(), file_type))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        paths.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (path, file_type) in paths {
+            if file_type.is_dir() {
                 self.register_directory_tree(&path, source)?;
                 continue;
             }
-            if !is_adapter_descriptor_file(&path) {
+            if file_type.is_symlink() && path.is_dir() {
                 continue;
             }
-            let descriptor = load_adapter_descriptor(&path)?;
-            self.register_descriptor(path, source, descriptor)?;
+            if let Some(kind) = descriptor_kind(&path) {
+                self.register_file(&path, source, kind);
+            }
         }
         Ok(())
     }
 
-    fn register_descriptor(
-        &mut self,
-        path: PathBuf,
-        source: AdapterDescriptorSource,
-        descriptor: AdapterDescriptor,
-    ) -> Result<()> {
-        validate_adapter_descriptor_shape(&descriptor, &path)?;
-        let path = path.canonicalize().unwrap_or(path);
+    fn register_file(&mut self, path: &Path, source: DescriptorSource, kind: DescriptorKind) {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        self.entries.insert(
-            descriptor.adapter_id.clone(),
-            AdapterRegistryEntry {
-                source,
-                path,
-                root,
-                descriptor,
+        let provenance = DescriptorProvenance {
+            source,
+            path: path.clone(),
+            root,
+        };
+        match kind {
+            DescriptorKind::Adapter => match load_adapter_descriptor(&path) {
+                Ok(descriptor) => {
+                    let id = descriptor.adapter_id.clone();
+                    Self::insert_record(&mut self.adapters, id, descriptor, provenance);
+                }
+                Err(error) => self.diagnostics.push(DescriptorDiagnostic {
+                    kind,
+                    id: read_descriptor_id(&path, "adapter_id"),
+                    path,
+                    message: error.to_string(),
+                }),
             },
-        );
-        Ok(())
+            DescriptorKind::Target => match load_adapter_target_descriptor(&path) {
+                Ok(descriptor) => {
+                    let id = descriptor.id.clone();
+                    Self::insert_record(&mut self.targets, id, descriptor, provenance);
+                }
+                Err(error) => self.diagnostics.push(DescriptorDiagnostic {
+                    kind,
+                    id: read_descriptor_id(&path, "id"),
+                    path,
+                    message: error.to_string(),
+                }),
+            },
+        }
     }
 
-    fn get(&self, adapter_id: &str) -> Option<&AdapterRegistryEntry> {
-        self.entries.get(adapter_id)
+    fn insert_record<T: PartialEq>(
+        records: &mut BTreeMap<String, Vec<DescriptorRecord<T>>>,
+        id: String,
+        descriptor: T,
+        provenance: DescriptorProvenance,
+    ) {
+        let candidates = records.entry(id).or_default();
+        if let Some(candidate) = candidates
+            .iter_mut()
+            .find(|candidate| candidate.descriptor == descriptor)
+        {
+            candidate.provenance.push(provenance);
+        } else {
+            candidates.push(DescriptorRecord {
+                provenance: vec![provenance],
+                descriptor,
+            });
+        }
     }
 
-    fn ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.entries.keys().cloned().collect();
-        ids.sort();
-        ids
+    fn adapter(&self, adapter_id: &str) -> Result<&DescriptorRecord<AdapterDescriptor>> {
+        if let Some(diagnostic) = self.diagnostic(DescriptorKind::Adapter, adapter_id) {
+            return Err(FabricError::InvalidAdapterDescriptor {
+                path: diagnostic.path.clone(),
+                message: diagnostic.message.clone(),
+            });
+        }
+        let Some(candidates) = self.adapters.get(adapter_id) else {
+            return Err(FabricError::UnknownAdapter {
+                adapter_id: adapter_id.to_string(),
+                available: self.adapters.keys().cloned().collect(),
+            });
+        };
+        if candidates.len() != 1 {
+            return Err(FabricError::AmbiguousDescriptor {
+                descriptor_kind: "adapter",
+                id: adapter_id.to_string(),
+                paths: descriptor_paths(candidates),
+            });
+        }
+        Ok(&candidates[0])
+    }
+
+    fn target(&self, target_id: &str) -> Result<&DescriptorRecord<AdapterTargetDescriptor>> {
+        if let Some(diagnostic) = self.diagnostic(DescriptorKind::Target, target_id) {
+            return Err(FabricError::InvalidAdapterTargetDescriptor {
+                path: diagnostic.path.clone(),
+                message: diagnostic.message.clone(),
+            });
+        }
+        let Some(candidates) = self.targets.get(target_id) else {
+            return Err(FabricError::UnknownAdapterTarget {
+                target_id: target_id.to_string(),
+                available: self.targets.keys().cloned().collect(),
+            });
+        };
+        if candidates.len() != 1 {
+            return Err(FabricError::AmbiguousDescriptor {
+                descriptor_kind: "adapter target",
+                id: target_id.to_string(),
+                paths: descriptor_paths(candidates),
+            });
+        }
+        Ok(&candidates[0])
+    }
+
+    fn diagnostic(&self, kind: DescriptorKind, id: &str) -> Option<&DescriptorDiagnostic> {
+        self.diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.kind == kind && diagnostic.id.as_deref() == Some(id))
     }
 }
 
-fn is_adapter_descriptor_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    name == "fabric-adapter.json"
+fn descriptor_paths<T>(candidates: &[DescriptorRecord<T>]) -> Vec<PathBuf> {
+    candidates
+        .iter()
+        .flat_map(|candidate| candidate.provenance.iter())
+        .map(|provenance| provenance.path.clone())
+        .collect()
+}
+
+fn read_descriptor_id(path: &Path, field: &str) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    value.get(field)?.as_str().map(ToString::to_string)
+}
+
+fn descriptor_kind(path: &Path) -> Option<DescriptorKind> {
+    let name = path.file_name()?.to_str()?;
+    if name.ends_with(".fabric-adapter.json") {
+        Some(DescriptorKind::Adapter)
+    } else if name.ends_with(".fabric-target.json") {
+        Some(DescriptorKind::Target)
+    } else {
+        None
+    }
 }
 
 fn repository_adapter_dir() -> PathBuf {
@@ -406,12 +818,24 @@ pub enum AdapterConfigField {
     /// Adapter-native tool names to expose.
     #[serde(rename = "tools.enabled")]
     EnabledTools,
+    /// Named normalized tool and tool-group definitions.
+    #[serde(rename = "tools.definitions")]
+    ToolDefinitions,
     /// Adapter-native tool names to block.
     #[serde(rename = "tools.blocked")]
     BlockedTools,
     /// Harness-native MCP servers.
     #[serde(rename = "mcp")]
     Mcp,
+    /// OAuth 2.0 authentication for MCP servers.
+    #[serde(rename = "mcp.auth.oauth2")]
+    McpAuthOauth2,
+    /// OAuth 2.0 service-account authentication for MCP servers.
+    #[serde(rename = "mcp.auth.service_account")]
+    McpAuthServiceAccount,
+    /// Per-server MCP tool allowlists and blocklists.
+    #[serde(rename = "mcp.tool_filters")]
+    McpToolFilters,
     /// Harness-native skills.
     #[serde(rename = "skills")]
     Skills,
@@ -422,10 +846,23 @@ pub enum AdapterConfigField {
 pub struct AdapterTelemetrySupport {
     /// Provider-specific telemetry capabilities supported by this adapter.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(schema_with = "adapter_telemetry_providers_schema")]
     pub providers: BTreeMap<TelemetryProvider, AdapterTelemetryProviderSupport>,
     /// Additive adapter telemetry fields.
     #[serde(default, flatten)]
     pub extensions: BTreeMap<String, Value>,
+}
+
+fn adapter_telemetry_providers_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema =
+        BTreeMap::<TelemetryProvider, AdapterTelemetryProviderSupport>::json_schema(generator);
+    schema.insert(
+        "propertyNames".into(),
+        serde_json::json!({
+            "enum": TelemetryProvider::ALL.map(TelemetryProvider::as_str),
+        }),
+    );
+    schema
 }
 
 /// Telemetry capabilities for one adapter-supported provider.
@@ -607,18 +1044,154 @@ pub struct McpConfig {
     pub extensions: BTreeMap<String, Value>,
 }
 
+/// MCP server transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpTransport {
+    /// Standard input/output transport.
+    Stdio,
+    /// Server-Sent Events transport.
+    Sse,
+    /// Streamable HTTP transport.
+    StreamableHttp,
+}
+
+impl McpTransport {
+    /// Return the stable configuration value for this transport.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Sse => "sse",
+            Self::StreamableHttp => "streamable-http",
+        }
+    }
+}
+
+/// OAuth client authentication method used at the token endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthTokenEndpointAuthMethod {
+    /// Public client without a client secret.
+    None,
+    /// Send the client secret in the token request body.
+    ClientSecretPost,
+    /// Send the client credentials with HTTP Basic authentication.
+    ClientSecretBasic,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn default_mcp_oauth_timeout_seconds() -> u64 {
+    300
+}
+
+fn is_default_mcp_oauth_timeout_seconds(value: &u64) -> bool {
+    *value == default_mcp_oauth_timeout_seconds()
+}
+
+fn default_mcp_token_cache_buffer_seconds() -> u64 {
+    300
+}
+
+fn is_default_mcp_token_cache_buffer_seconds(value: &u64) -> bool {
+    *value == default_mcp_token_cache_buffer_seconds()
+}
+
+/// MCP server authentication configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum McpAuthenticationConfig {
+    /// OAuth 2.0 authorization-code authentication.
+    #[serde(rename = "oauth2")]
+    OAuth2 {
+        /// Pre-registered OAuth client identifier. Omit to allow dynamic registration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
+        /// Environment variable containing the OAuth client secret.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_secret_env: Option<String>,
+        /// OAuth scopes requested by the MCP client.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        scopes: Vec<String>,
+        /// OAuth callback URI for clients that require a pre-registered redirect URI.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redirect_uri: Option<String>,
+        /// Whether the client may register dynamically when `client_id` is omitted.
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        enable_dynamic_registration: bool,
+        /// Client name advertised during dynamic registration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_name: Option<String>,
+        /// Client authentication method used at the token endpoint.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_endpoint_auth_method: Option<OAuthTokenEndpointAuthMethod>,
+        /// Maximum time to wait for interactive authorization.
+        #[serde(
+            default = "default_mcp_oauth_timeout_seconds",
+            skip_serializing_if = "is_default_mcp_oauth_timeout_seconds"
+        )]
+        #[schemars(range(min = 1))]
+        authorization_timeout_seconds: u64,
+    },
+    /// OAuth 2.0 client-credentials authentication for headless workloads.
+    ServiceAccount {
+        /// OAuth client identifier.
+        client_id: String,
+        /// Environment variable containing the OAuth client secret.
+        client_secret_env: String,
+        /// OAuth token endpoint.
+        token_url: String,
+        /// OAuth scopes requested by the MCP client.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        scopes: Vec<String>,
+        /// Client authentication method used at the token endpoint.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_endpoint_auth_method: Option<OAuthTokenEndpointAuthMethod>,
+        /// Refresh the cached token this many seconds before expiry.
+        #[serde(
+            default = "default_mcp_token_cache_buffer_seconds",
+            skip_serializing_if = "is_default_mcp_token_cache_buffer_seconds"
+        )]
+        token_cache_buffer_seconds: u64,
+    },
+}
+
 /// MCP server configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct McpServerConfig {
     /// MCP transport.
-    pub transport: String,
-    /// MCP server URL or process command, depending on transport.
+    pub transport: McpTransport,
+    /// MCP server URL or process command (when transport=stdio), depending on transport.
     pub url: String,
+    /// Command-line arguments passed to an MCP stdio server process.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Environment variables passed to an MCP stdio server process.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Authentication used by an HTTP MCP server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication: Option<McpAuthenticationConfig>,
     /// How NeMo Fabric exposes the MCP capability to the harness.
     pub exposure: McpExposure,
+    /// MCP tool names to expose. `None` exposes every tool discovered from the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+    /// MCP tool names to block after applying the optional allowlist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_tools: Vec<String>,
     /// Additive MCP server fields.
     #[serde(default, flatten)]
     pub extensions: BTreeMap<String, Value>,
+    /// HTTP headers passed to an MCP server when transport is `sse` or `streamable-http`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom_headers: BTreeMap<String, String>,
 }
 
 /// MCP exposure strategy.
@@ -696,7 +1269,11 @@ pub struct RelayComponentConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RelayObservabilityConfig {
     /// Relay observability config version.
-    #[serde(default = "default_relay_config_version")]
+    #[serde(
+        default = "default_relay_observability_version",
+        deserialize_with = "deserialize_relay_observability_version"
+    )]
+    #[schemars(schema_with = "relay_observability_version_schema")]
     pub version: u32,
     /// ATOF export configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -704,15 +1281,15 @@ pub struct RelayObservabilityConfig {
     /// ATIF export configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub atif: Option<RelayAtifConfig>,
-    /// OpenTelemetry export configuration.
+    /// OpenTelemetry and OpenInference export configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub opentelemetry: Option<RelayOtlpConfig>,
-    /// OpenInference export configuration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub openinference: Option<RelayOtlpConfig>,
+    pub opentelemetry: Option<RelayOpenTelemetryConfig>,
     /// Relay config validation policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<RelayConfigPolicy>,
+    /// Retain complete sanitized request data on LLM start events.
+    #[serde(default)]
+    pub enable_full_payloads: bool,
     /// Additive observability fields.
     #[serde(default, flatten)]
     pub extensions: BTreeMap<String, Value>,
@@ -721,12 +1298,12 @@ pub struct RelayObservabilityConfig {
 impl Default for RelayObservabilityConfig {
     fn default() -> Self {
         Self {
-            version: default_relay_config_version(),
+            version: default_relay_observability_version(),
             atof: None,
             atif: None,
             opentelemetry: None,
-            openinference: None,
             policy: None,
+            enable_full_payloads: false,
             extensions: BTreeMap::new(),
         }
     }
@@ -780,6 +1357,7 @@ pub enum RelayAtofSinkConfig {
         header_env: BTreeMap<String, String>,
         /// Request timeout in milliseconds.
         #[serde(default = "default_relay_timeout_millis")]
+        #[schemars(range(max = u64::MAX))]
         timeout_millis: u64,
         /// Field-name handling policy.
         #[serde(default)]
@@ -862,6 +1440,7 @@ pub enum RelayAtifStorageConfig {
         header_env: BTreeMap<String, String>,
         /// Request timeout in milliseconds.
         #[serde(default = "default_relay_timeout_millis")]
+        #[schemars(range(max = u64::MAX))]
         timeout_millis: u64,
         /// Additive HTTP storage fields.
         #[serde(default, flatten)]
@@ -899,26 +1478,42 @@ pub enum RelayAtifStorageConfig {
     },
 }
 
-/// Relay OpenTelemetry/OpenInference export configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct RelayOtlpConfig {
-    /// Whether OTLP export is enabled.
+/// Relay OpenTelemetry export section.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RelayOpenTelemetryConfig {
+    /// Whether OpenTelemetry export is enabled.
     #[serde(default)]
     pub enabled: bool,
+    /// Typed OTLP destinations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<RelayOpenTelemetryEndpointConfig>,
+    /// Additive OpenTelemetry section fields.
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+/// One typed Relay OpenTelemetry OTLP destination.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RelayOpenTelemetryEndpointConfig {
+    /// Span projection emitted to this destination.
+    pub r#type: RelayOpenTelemetryEndpointType,
+    /// OTLP endpoint.
+    #[schemars(length(min = 1), regex(pattern = r"\S"))]
+    pub endpoint: String,
+    /// Mark projection policy.
+    #[serde(default)]
+    pub mark_projection: RelayOpenTelemetryMarkProjection,
+    /// Event names excluded from mark projection.
+    #[serde(default = "default_relay_mark_exclude_names")]
+    pub mark_exclude_names: Vec<String>,
+    /// Attribute mapping rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attribute_mappings: Vec<BTreeMap<String, String>>,
     /// OTLP transport.
     #[serde(default)]
     pub transport: RelayOtlpTransport,
-    /// OTLP endpoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    /// OTLP headers.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub headers: BTreeMap<String, String>,
-    /// OTLP resource attributes.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub resource_attributes: BTreeMap<String, String>,
     /// OTLP service name.
-    #[serde(default = "default_relay_service_name")]
+    #[serde(default = "default_relay_otel_service_name")]
     pub service_name: String,
     /// OTLP service namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -927,32 +1522,24 @@ pub struct RelayOtlpConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_version: Option<String>,
     /// OTLP instrumentation scope.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instrumentation_scope: Option<String>,
+    #[serde(default = "default_relay_instrumentation_scope")]
+    pub instrumentation_scope: String,
     /// Request timeout in milliseconds.
     #[serde(default = "default_relay_timeout_millis")]
+    #[schemars(range(max = u64::MAX))]
     pub timeout_millis: u64,
-    /// Additive OTLP fields.
+    /// Static OTLP headers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// Environment-variable-backed OTLP headers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub header_env: BTreeMap<String, String>,
+    /// OTLP resource attributes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resource_attributes: BTreeMap<String, String>,
+    /// Additive endpoint fields.
     #[serde(default, flatten)]
     pub extensions: BTreeMap<String, Value>,
-}
-
-impl Default for RelayOtlpConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            transport: RelayOtlpTransport::default(),
-            endpoint: None,
-            headers: BTreeMap::new(),
-            resource_attributes: BTreeMap::new(),
-            service_name: default_relay_service_name(),
-            service_namespace: None,
-            service_version: None,
-            instrumentation_scope: None,
-            timeout_millis: default_relay_timeout_millis(),
-            extensions: BTreeMap::new(),
-        }
-    }
 }
 
 /// Relay validation policy.
@@ -1038,6 +1625,31 @@ pub enum RelayOtlpTransport {
     Grpc,
 }
 
+/// Relay OpenTelemetry span projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayOpenTelemetryEndpointType {
+    /// Emit full Relay spans.
+    Full,
+    /// Emit GenAI semantic-convention spans.
+    GenAi,
+    /// Emit OpenInference semantic-convention spans.
+    Openinference,
+}
+
+/// Relay OpenTelemetry mark projection policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayOpenTelemetryMarkProjection {
+    /// Inherit the endpoint type's projection behavior.
+    #[default]
+    Inherit,
+    /// Project marks as events.
+    Event,
+    /// Project marks as tool spans.
+    Tool,
+}
+
 /// Telemetry runtime provider.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
@@ -1052,6 +1664,8 @@ pub enum TelemetryProvider {
 }
 
 impl TelemetryProvider {
+    const ALL: [Self; 2] = [Self::Relay, Self::Native];
+
     /// Return the stable configuration value for this provider.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1061,8 +1675,32 @@ impl TelemetryProvider {
     }
 }
 
-fn default_relay_config_version() -> u32 {
-    2
+const RELAY_OBSERVABILITY_VERSION: u32 = 3;
+
+fn relay_observability_version_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = u32::json_schema(generator);
+    schema.insert("const".into(), RELAY_OBSERVABILITY_VERSION.into());
+    schema
+}
+
+fn default_relay_observability_version() -> u32 {
+    RELAY_OBSERVABILITY_VERSION
+}
+
+fn deserialize_relay_observability_version<'de, D>(
+    deserializer: D,
+) -> std::result::Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let version = u32::deserialize(deserializer)?;
+    if version == RELAY_OBSERVABILITY_VERSION {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "NeMo Relay 0.7 requires observability config version {RELAY_OBSERVABILITY_VERSION}; found {version}"
+        )))
+    }
 }
 
 fn default_enabled() -> bool {
@@ -1085,8 +1723,16 @@ fn default_relay_timeout_millis() -> u64 {
     3000
 }
 
-fn default_relay_service_name() -> String {
-    "nemo-relay".to_string()
+fn default_relay_otel_service_name() -> String {
+    "unknown_service".to_string()
+}
+
+fn default_relay_instrumentation_scope() -> String {
+    "opentelemetry".to_string()
+}
+
+fn default_relay_mark_exclude_names() -> Vec<String> {
+    vec!["llm.chunk".to_string()]
 }
 
 fn default_relay_unsupported_value_behavior() -> RelayUnsupportedBehavior {
@@ -1101,12 +1747,40 @@ pub fn load_adapter_descriptor(path: impl AsRef<Path>) -> Result<AdapterDescript
     Ok(descriptor)
 }
 
-fn validate_config(config: &FabricConfig) -> Result<()> {
-    if config.harness.adapter_id.trim().is_empty() {
-        return Err(FabricError::UnknownAdapter {
-            adapter_id: config.harness.adapter_id.clone(),
-            available: Vec::new(),
-        });
+/// Load an Adapter Target Descriptor from declarative JSON metadata.
+pub fn load_adapter_target_descriptor(path: impl AsRef<Path>) -> Result<AdapterTargetDescriptor> {
+    let path = path.as_ref();
+    let descriptor = read_json(path)?;
+    validate_adapter_target_descriptor_shape(&descriptor, path)?;
+    Ok(descriptor)
+}
+
+pub(crate) fn validate_config(config: &FabricConfig) -> Result<()> {
+    if config.harness.is_none() && config.workflow.is_none() {
+        return invalid_config(
+            "harness",
+            "at least one of harness.adapter_id or workflow.target_id is required",
+        );
+    }
+    if let Some(harness) = &config.harness
+        && harness.adapter_id.trim().is_empty()
+    {
+        return invalid_config("harness.adapter_id", "must be a non-empty string");
+    }
+    if let Some(workflow) = &config.workflow
+        && workflow.target_id.trim().is_empty()
+    {
+        return invalid_config("workflow.target_id", "must be a non-empty string");
+    }
+    if let Some(discovery) = &config.discovery {
+        for (index, path) in discovery.local_paths.iter().enumerate() {
+            if path.to_string_lossy().trim().is_empty() {
+                return invalid_config(
+                    format!("discovery.local_paths.{index}"),
+                    "must contain at least one non-whitespace character",
+                );
+            }
+        }
     }
     if config.runtime.max_turns == Some(0) {
         return invalid_config("runtime.max_turns", "must be greater than zero");
@@ -1168,7 +1842,168 @@ fn validate_config(config: &FabricConfig) -> Result<()> {
             }
         }
     }
+    if let Some(relay) = &config.relay {
+        if let Some(observability) = relay.observability.as_ref() {
+            if observability.version != RELAY_OBSERVABILITY_VERSION {
+                return invalid_config(
+                    "relay.observability.version",
+                    format!(
+                        "NeMo Relay 0.7 requires observability config version {RELAY_OBSERVABILITY_VERSION}"
+                    ),
+                );
+            }
+            if observability.extensions.contains_key("openinference") {
+                return invalid_config(
+                    "relay.observability.openinference",
+                    "was removed in observability config version 3; use an OpenTelemetry endpoint with type `openinference`",
+                );
+            }
+            if let Some(opentelemetry) = observability.opentelemetry.as_ref() {
+                if let Some(field) = relay_legacy_flat_otel_field(|field| {
+                    opentelemetry.extensions.contains_key(field)
+                }) {
+                    return invalid_config(
+                        format!("relay.observability.opentelemetry.{field}"),
+                        "moved into each typed endpoint in observability config version 3",
+                    );
+                }
+                if opentelemetry.enabled && opentelemetry.endpoints.is_empty() {
+                    return invalid_config(
+                        "relay.observability.opentelemetry.endpoints",
+                        "must contain at least one endpoint when OpenTelemetry export is enabled",
+                    );
+                }
+                for (index, endpoint) in opentelemetry.endpoints.iter().enumerate() {
+                    if endpoint.endpoint.trim().is_empty() {
+                        return invalid_config(
+                            format!("relay.observability.opentelemetry.endpoints.{index}.endpoint"),
+                            "must be a non-empty string",
+                        );
+                    }
+                }
+            }
+        }
+        for (index, component) in relay.components.iter().enumerate() {
+            if component.kind != "observability" {
+                continue;
+            }
+            if let Some(version) = component.config.get("version")
+                && version.as_u64() != Some(u64::from(RELAY_OBSERVABILITY_VERSION))
+            {
+                return invalid_config(
+                    format!("relay.components.{index}.config.version"),
+                    format!(
+                        "NeMo Relay 0.7 requires observability config version {RELAY_OBSERVABILITY_VERSION}"
+                    ),
+                );
+            }
+            if component.config.contains_key("openinference") {
+                return invalid_config(
+                    format!("relay.components.{index}.config.openinference"),
+                    "was removed in observability config version 3; use an OpenTelemetry endpoint with type `openinference`",
+                );
+            }
+            if let Some(opentelemetry_value) = component.config.get("opentelemetry") {
+                let Some(opentelemetry) = opentelemetry_value.as_object() else {
+                    return invalid_config(
+                        format!("relay.components.{index}.config.opentelemetry"),
+                        "must be an object",
+                    );
+                };
+                if let Some(field) =
+                    relay_legacy_flat_otel_field(|field| opentelemetry.contains_key(field))
+                {
+                    return invalid_config(
+                        format!("relay.components.{index}.config.opentelemetry.{field}"),
+                        "moved into each typed endpoint in observability config version 3",
+                    );
+                }
+                let enabled = match opentelemetry.get("enabled") {
+                    Some(value) => {
+                        let Some(enabled) = value.as_bool() else {
+                            return invalid_config(
+                                format!("relay.components.{index}.config.opentelemetry.enabled"),
+                                "must be a boolean",
+                            );
+                        };
+                        enabled
+                    }
+                    None => false,
+                };
+                let endpoints = match opentelemetry.get("endpoints") {
+                    Some(value) => {
+                        let Some(endpoints) = value.as_array() else {
+                            return invalid_config(
+                                format!("relay.components.{index}.config.opentelemetry.endpoints"),
+                                "must be an array",
+                            );
+                        };
+                        Some(endpoints)
+                    }
+                    None => None,
+                };
+                if enabled && endpoints.is_none_or(Vec::is_empty) {
+                    return invalid_config(
+                        format!("relay.components.{index}.config.opentelemetry.endpoints"),
+                        "must contain at least one endpoint when OpenTelemetry export is enabled",
+                    );
+                }
+                if let Some(endpoints) = endpoints {
+                    for (endpoint_index, endpoint) in endpoints.iter().enumerate() {
+                        let Some(endpoint) = endpoint.as_object() else {
+                            return invalid_config(
+                                format!(
+                                    "relay.components.{index}.config.opentelemetry.endpoints.{endpoint_index}"
+                                ),
+                                "must be an object",
+                            );
+                        };
+                        if !matches!(
+                            endpoint.get("type").and_then(Value::as_str),
+                            Some("full" | "gen_ai" | "openinference")
+                        ) {
+                            return invalid_config(
+                                format!(
+                                    "relay.components.{index}.config.opentelemetry.endpoints.{endpoint_index}.type"
+                                ),
+                                "must be one of `full`, `gen_ai`, or `openinference`",
+                            );
+                        }
+                        if endpoint
+                            .get("endpoint")
+                            .and_then(Value::as_str)
+                            .is_none_or(|value| value.trim().is_empty())
+                        {
+                            return invalid_config(
+                                format!(
+                                    "relay.components.{index}.config.opentelemetry.endpoints.{endpoint_index}.endpoint"
+                                ),
+                                "must be a non-empty string",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
     if let Some(tools) = &config.tools {
+        for (name, definition) in &tools.definitions {
+            if name.trim().is_empty() {
+                return invalid_config("tools.definitions", "definition names must not be empty");
+            }
+            if definition.kind.trim().is_empty() {
+                return invalid_config(
+                    format!("tools.definitions.{name}.kind"),
+                    "must be a non-empty string",
+                );
+            }
+            if definition.r#ref.trim().is_empty() {
+                return invalid_config(
+                    format!("tools.definitions.{name}.ref"),
+                    "must be a non-empty string",
+                );
+            }
+        }
         if let Some(enabled) = &tools.enabled {
             validate_names("tools.enabled", enabled)?;
             if let Some(name) = enabled.iter().find(|name| tools.blocked.contains(name)) {
@@ -1180,7 +2015,179 @@ fn validate_config(config: &FabricConfig) -> Result<()> {
         }
         validate_names("tools.blocked", &tools.blocked)?;
     }
+    if let Some(mcp) = &config.mcp {
+        for (server_name, server) in &mcp.servers {
+            let field = format!("mcp.servers.{server_name}");
+            if server.transport != McpTransport::Stdio && !server.env.is_empty() {
+                return invalid_config(format!("{field}.env"), "is only valid for stdio transport");
+            }
+            if server.transport == McpTransport::Stdio
+                && (server.authentication.is_some() || !server.custom_headers.is_empty())
+            {
+                return invalid_config(
+                    &field,
+                    "authentication and custom_headers require an HTTP transport",
+                );
+            }
+            if let Some(authentication) = &server.authentication {
+                match authentication {
+                    McpAuthenticationConfig::OAuth2 {
+                        client_id,
+                        client_secret_env,
+                        scopes,
+                        redirect_uri,
+                        enable_dynamic_registration,
+                        client_name,
+                        token_endpoint_auth_method,
+                        authorization_timeout_seconds,
+                    } => {
+                        validate_names(&format!("{field}.authentication.scopes"), scopes)?;
+                        if client_id
+                            .as_ref()
+                            .is_some_and(|value| value.trim().is_empty())
+                        {
+                            return invalid_config(
+                                format!("{field}.authentication.client_id"),
+                                "must be a non-empty string",
+                            );
+                        }
+                        if client_secret_env
+                            .as_ref()
+                            .is_some_and(|value| value.trim().is_empty())
+                        {
+                            return invalid_config(
+                                format!("{field}.authentication.client_secret_env"),
+                                "must be a non-empty string",
+                            );
+                        }
+                        if client_secret_env.is_some() && client_id.is_none() {
+                            return invalid_config(
+                                format!("{field}.authentication.client_secret_env"),
+                                "requires client_id",
+                            );
+                        }
+                        if !enable_dynamic_registration && client_id.is_none() {
+                            return invalid_config(
+                                format!("{field}.authentication.client_id"),
+                                "is required when dynamic registration is disabled",
+                            );
+                        }
+                        if matches!(
+                            token_endpoint_auth_method,
+                            Some(
+                                OAuthTokenEndpointAuthMethod::ClientSecretBasic
+                                    | OAuthTokenEndpointAuthMethod::ClientSecretPost
+                            )
+                        ) && client_secret_env.is_none()
+                            && client_id.is_some()
+                        {
+                            return invalid_config(
+                                format!("{field}.authentication.token_endpoint_auth_method"),
+                                "requires client_secret_env for a pre-registered client",
+                            );
+                        }
+                        if *token_endpoint_auth_method == Some(OAuthTokenEndpointAuthMethod::None)
+                            && client_secret_env.is_some()
+                        {
+                            return invalid_config(
+                                format!("{field}.authentication.token_endpoint_auth_method"),
+                                "`none` cannot be combined with client_secret_env",
+                            );
+                        }
+                        if redirect_uri
+                            .as_ref()
+                            .is_some_and(|value| value.trim().is_empty())
+                        {
+                            return invalid_config(
+                                format!("{field}.authentication.redirect_uri"),
+                                "must be a non-empty string",
+                            );
+                        }
+                        if client_name
+                            .as_ref()
+                            .is_some_and(|value| value.trim().is_empty())
+                        {
+                            return invalid_config(
+                                format!("{field}.authentication.client_name"),
+                                "must be a non-empty string",
+                            );
+                        }
+                        if *authorization_timeout_seconds == 0 {
+                            return invalid_config(
+                                format!("{field}.authentication.authorization_timeout_seconds"),
+                                "must be greater than zero",
+                            );
+                        }
+                    }
+                    McpAuthenticationConfig::ServiceAccount {
+                        client_id,
+                        client_secret_env,
+                        token_url,
+                        scopes,
+                        token_endpoint_auth_method,
+                        ..
+                    } => {
+                        for (name, value) in [
+                            ("client_id", client_id),
+                            ("client_secret_env", client_secret_env),
+                            ("token_url", token_url),
+                        ] {
+                            if value.trim().is_empty() {
+                                return invalid_config(
+                                    format!("{field}.authentication.{name}"),
+                                    "must be a non-empty string",
+                                );
+                            }
+                        }
+                        validate_names(&format!("{field}.authentication.scopes"), scopes)?;
+                        if *token_endpoint_auth_method == Some(OAuthTokenEndpointAuthMethod::None) {
+                            return invalid_config(
+                                format!("{field}.authentication.token_endpoint_auth_method"),
+                                "service_account requires client_secret_basic or client_secret_post",
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(allowed_tools) = &server.allowed_tools {
+                validate_names(&format!("{field}.allowed_tools"), allowed_tools)?;
+                if let Some(name) = allowed_tools
+                    .iter()
+                    .find(|name| server.blocked_tools.contains(name))
+                {
+                    return invalid_config(
+                        field,
+                        format!("`{name}` cannot be both allowed and blocked"),
+                    );
+                }
+            }
+            validate_names(&format!("{field}.blocked_tools"), &server.blocked_tools)?;
+        }
+    }
     Ok(())
+}
+
+fn relay_legacy_flat_otel_field(contains_field: impl Fn(&str) -> bool) -> Option<&'static str> {
+    const LEGACY_FLAT_OTEL_FIELDS: [&str; 15] = [
+        "attribute_mappings",
+        "capture_content",
+        "endpoint",
+        "header_env",
+        "headers",
+        "instrumentation_scope",
+        "mark_exclude_names",
+        "mark_projection",
+        "resource_attributes",
+        "semantic_selector",
+        "service_name",
+        "service_namespace",
+        "service_version",
+        "timeout_millis",
+        "transport",
+    ];
+    LEGACY_FLAT_OTEL_FIELDS
+        .into_iter()
+        .find(|field| contains_field(field))
 }
 
 fn validate_names(field: &str, names: &[String]) -> Result<()> {
@@ -1285,16 +2292,25 @@ where
 fn resolve_run_plan(
     config: FabricConfig,
     base_dir: PathBuf,
-    adapter_directories: &[PathBuf],
+    installed_roots: &[PathBuf],
     enforce_compatibility: bool,
 ) -> Result<RunPlan> {
-    let adapter_descriptor = resolve_adapter_descriptor(&config, &base_dir, adapter_directories)?;
+    let registry = DescriptorRegistry::from_config(&config, &base_dir, installed_roots)?;
+    let (adapter_descriptor, adapter_target_descriptor) = resolve_descriptors(&config, &registry)?;
+    validate_harness_settings(&config, adapter_descriptor.as_ref())?;
+    validate_workflow(&config, adapter_target_descriptor.as_ref())?;
     let descriptor = adapter_descriptor
         .as_ref()
         .map(|adapter| &adapter.descriptor);
     if enforce_compatibility {
         validate_adapter_config_compatibility(&config, descriptor)?;
     }
+    validate_tool_definitions(&config, adapter_descriptor.as_ref())?;
+    validate_agent_config_extensions(
+        &config,
+        adapter_descriptor.as_ref(),
+        adapter_target_descriptor.as_ref(),
+    )?;
     let resolution = resolve_resolution(&config, descriptor)?;
     let environment_plan = resolve_environment_plan(&config, &base_dir);
     validate_control_location(descriptor, environment_plan.as_ref())?;
@@ -1304,11 +2320,19 @@ fn resolve_run_plan(
     }
     let capabilities = resolve_runtime_capabilities(&config, descriptor);
     let telemetry_plan = resolve_telemetry_plan(&config, descriptor)?;
+    let agent_config = project_agent_config(
+        &config,
+        &capability_plan,
+        descriptor,
+        adapter_target_descriptor.as_ref(),
+    );
     Ok(RunPlan {
         agent_name: config.metadata.name.clone(),
         base_dir,
         config,
+        agent_config,
         adapter_descriptor,
+        adapter_target_descriptor,
         resolution,
         environment_plan,
         capability_plan,
@@ -1394,6 +2418,17 @@ pub(crate) fn adapter_config_compatibility_issues(
             "the adapter does not declare an equivalent native mapping".to_string(),
         ));
     }
+    if config
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.definitions.is_empty())
+        && !accepts(AdapterConfigField::ToolDefinitions)
+    {
+        issues.push(incompatible(
+            "tools.definitions".to_string(),
+            "the adapter does not consume normalized tool definitions".to_string(),
+        ));
+    }
     if !config.models.is_empty() && !accepts(AdapterConfigField::Models) {
         issues.push(incompatible(
             "models".to_string(),
@@ -1402,19 +2437,38 @@ pub(crate) fn adapter_config_compatibility_issues(
         return issues;
     };
 
-    let selected_model = match (config.models.get_key_value("default"), config.models.len()) {
-        (Some(model), _) => Some(model),
-        (None, 0) => None,
-        (None, 1) => config.models.first_key_value(),
-        (None, _) => {
+    match (config.models.contains_key("default"), config.models.len()) {
+        (true, _) | (false, 0 | 1) => {}
+        (false, _) => {
             issues.push(incompatible(
                 "models".to_string(),
                 "multiple model roles are configured and no default role selects one".to_string(),
             ));
-            None
         }
-    };
-    if let Some((role, model)) = selected_model {
+    }
+
+    if let Some(schema) = &descriptor.model_schema {
+        let schema = Value::Object(schema.clone());
+        let validator = jsonschema::validator_for(&schema)
+            .expect("adapter model schema was validated during descriptor resolution");
+        for (role, model) in &config.models {
+            let mut value = serde_json::to_value(model)
+                .expect("typed model configuration is always JSON serializable");
+            if let Some(object) = value.as_object_mut() {
+                for extension in model.extensions.keys() {
+                    object.remove(extension);
+                }
+            }
+            for error in validator.iter_errors(&value) {
+                issues.push(incompatible(
+                    schema_error_path(&error, &format!("models.{role}")),
+                    schema_error_reason(&error, "adapter model schema"),
+                ));
+            }
+        }
+    }
+
+    for (role, model) in &config.models {
         if model.base_url.is_some() && !accepts(AdapterConfigField::ModelBaseUrl) {
             issues.push(incompatible(
                 format!("models.{role}.base_url"),
@@ -1428,46 +2482,102 @@ pub(crate) fn adapter_config_compatibility_issues(
             ));
         }
     }
+    for (name, server) in config.mcp.iter().flat_map(|mcp| mcp.servers.iter()) {
+        let required = match server.authentication.as_ref() {
+            Some(McpAuthenticationConfig::OAuth2 { .. }) => {
+                Some((AdapterConfigField::McpAuthOauth2, "mcp.auth.oauth2"))
+            }
+            Some(McpAuthenticationConfig::ServiceAccount { .. }) => Some((
+                AdapterConfigField::McpAuthServiceAccount,
+                "mcp.auth.service_account",
+            )),
+            None => None,
+        };
+        if let Some((field, capability)) = required
+            && !accepts(field)
+        {
+            issues.push(incompatible(
+                format!("mcp.servers.{name}.authentication"),
+                format!("the adapter does not declare `{capability}` support"),
+            ));
+        }
+    }
+    if accepts(AdapterConfigField::Mcp) && !accepts(AdapterConfigField::McpToolFilters) {
+        for (name, server) in config.mcp.iter().flat_map(|mcp| mcp.servers.iter()) {
+            let field = if server.allowed_tools.is_some() {
+                Some("allowed_tools")
+            } else if !server.blocked_tools.is_empty() {
+                Some("blocked_tools")
+            } else {
+                None
+            };
+            if let Some(field) = field {
+                issues.push(incompatible(
+                    format!("mcp.servers.{name}.{field}"),
+                    "the adapter does not declare per-server MCP tool-filter support".to_string(),
+                ));
+            }
+        }
+    }
     issues
 }
 
-fn resolve_adapter_descriptor(
+fn resolve_descriptors(
     config: &FabricConfig,
-    base_dir: &Path,
-    adapter_directories: &[PathBuf],
-) -> Result<Option<ResolvedAdapterDescriptor>> {
-    let adapter_id = &config.harness.adapter_id;
-    let registry = AdapterRegistry::from_config(config, base_dir, adapter_directories)?;
-    let Some(entry) = registry.get(adapter_id) else {
-        return Err(FabricError::UnknownAdapter {
-            adapter_id: adapter_id.clone(),
-            available: registry.ids(),
-        });
-    };
-    validate_adapter_descriptor(config, adapter_id, &entry.descriptor, entry.path.clone())?;
-    Ok(Some(ResolvedAdapterDescriptor {
-        source: entry.source,
-        path: entry.path.clone(),
-        root: entry.root.clone(),
-        descriptor: entry.descriptor.clone(),
-    }))
-}
-
-fn validate_adapter_descriptor(
-    _config: &FabricConfig,
-    expected_adapter_id: &str,
-    descriptor: &AdapterDescriptor,
-    path: PathBuf,
-) -> Result<()> {
-    if descriptor.adapter_id != expected_adapter_id {
-        return Err(FabricError::AdapterDescriptorMismatch {
-            path,
-            field: "adapter_id",
-            expected: expected_adapter_id.to_string(),
-            actual: descriptor.adapter_id.clone(),
-        });
+    registry: &DescriptorRegistry,
+) -> Result<(
+    Option<ResolvedAdapterDescriptor>,
+    Option<ResolvedAdapterTargetDescriptor>,
+)> {
+    let target_record = config
+        .workflow
+        .as_ref()
+        .map(|workflow| registry.target(&workflow.target_id))
+        .transpose()?;
+    let target_adapter_id = target_record.map(|record| record.descriptor.adapter_id.as_str());
+    let harness_adapter_id = config
+        .harness
+        .as_ref()
+        .map(|harness| harness.adapter_id.as_str());
+    if let (Some(harness_adapter_id), Some(target_adapter_id)) =
+        (harness_adapter_id, target_adapter_id)
+        && harness_adapter_id != target_adapter_id
+    {
+        return invalid_config(
+            "harness.adapter_id",
+            format!(
+                "selects `{harness_adapter_id}` but workflow target selects `{target_adapter_id}`"
+            ),
+        );
     }
-    Ok(())
+    let adapter_id = target_adapter_id
+        .or(harness_adapter_id)
+        .expect("config validation requires an adapter selector");
+    let adapter_record = registry.adapter(adapter_id)?;
+    if let Some(target_record) = target_record {
+        let target_type = target_record.descriptor.target_type();
+        if !adapter_record
+            .descriptor
+            .target_types
+            .contains(&target_type)
+        {
+            return Err(FabricError::AdapterDescriptorUnsupported {
+                adapter_id: adapter_id.to_string(),
+                field: "target_types",
+                value: target_type.as_str().to_string(),
+            });
+        }
+    }
+    Ok((
+        Some(ResolvedAdapterDescriptor {
+            provenance: adapter_record.provenance.clone(),
+            descriptor: adapter_record.descriptor.clone(),
+        }),
+        target_record.map(|record| ResolvedAdapterTargetDescriptor {
+            provenance: record.provenance.clone(),
+            descriptor: record.descriptor.clone(),
+        }),
+    ))
 }
 
 fn validate_adapter_descriptor_shape(descriptor: &AdapterDescriptor, path: &Path) -> Result<()> {
@@ -1484,10 +2594,76 @@ fn validate_adapter_descriptor_shape(descriptor: &AdapterDescriptor, path: &Path
     if descriptor.adapter_id.trim().is_empty() {
         return invalid_adapter_descriptor(path, "adapter_id must not be empty");
     }
-    if descriptor.harness.trim().is_empty() {
-        return invalid_adapter_descriptor(path, "harness must not be empty");
+    for legacy_field in ["harness", "workflow_schema"] {
+        if descriptor.extensions.contains_key(legacy_field) {
+            return invalid_adapter_descriptor(
+                path,
+                format!("legacy field `{legacy_field}` is not part of the adapter contract"),
+            );
+        }
+    }
+    for (field, schema) in [
+        ("settings_schema", descriptor.settings_schema.as_ref()),
+        ("model_schema", descriptor.model_schema.as_ref()),
+        (
+            "tool_definition_schema",
+            descriptor.tool_definition_schema.as_ref(),
+        ),
+    ] {
+        if let Some(schema) = schema {
+            validate_adapter_object_schema(path, field, schema)?;
+        }
+    }
+    for (point, schema) in &descriptor.extension_schemas {
+        let field = format!("extension_schemas.{}", point.as_str());
+        validate_adapter_object_schema(path, &field, schema)?;
     }
     Ok(())
+}
+
+fn validate_adapter_target_descriptor_shape(
+    descriptor: &AdapterTargetDescriptor,
+    path: &Path,
+) -> Result<()> {
+    if descriptor.contract_version != ADAPTER_CONTRACT_VERSION {
+        return invalid_adapter_target_descriptor(
+            path,
+            format!(
+                "contract_version must be `{ADAPTER_CONTRACT_VERSION}`, found `{}`",
+                descriptor.contract_version
+            ),
+        );
+    }
+    if descriptor.id.trim().is_empty() {
+        return invalid_adapter_target_descriptor(path, "id must not be empty");
+    }
+    if descriptor.adapter_id.trim().is_empty() {
+        return invalid_adapter_target_descriptor(path, "adapter_id must not be empty");
+    }
+    let workflow = descriptor.target.workflow();
+    if workflow.entrypoint.kind.trim().is_empty() {
+        return invalid_adapter_target_descriptor(path, "spec.entrypoint.kind must not be empty");
+    }
+    if workflow.entrypoint.r#ref.trim().is_empty() {
+        return invalid_adapter_target_descriptor(path, "spec.entrypoint.ref must not be empty");
+    }
+    if let Some(schema) = &workflow.settings_schema {
+        validate_adapter_target_object_schema(path, "spec.settings_schema", schema)?;
+    }
+    Ok(())
+}
+
+fn validate_adapter_object_schema(
+    path: &Path,
+    field: &str,
+    schema: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    validate_descriptor_object_schema(field, schema, |message| {
+        FabricError::InvalidAdapterDescriptor {
+            path: path.to_path_buf(),
+            message,
+        }
+    })
 }
 
 fn invalid_adapter_descriptor<T>(path: &Path, message: impl Into<String>) -> Result<T> {
@@ -1495,6 +2671,545 @@ fn invalid_adapter_descriptor<T>(path: &Path, message: impl Into<String>) -> Res
         path: path.to_path_buf(),
         message: message.into(),
     })
+}
+
+fn validate_adapter_target_object_schema(
+    path: &Path,
+    field: &str,
+    schema: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    validate_descriptor_object_schema(field, schema, |message| {
+        FabricError::InvalidAdapterTargetDescriptor {
+            path: path.to_path_buf(),
+            message,
+        }
+    })
+}
+
+fn validate_descriptor_object_schema(
+    field: &str,
+    schema: &serde_json::Map<String, Value>,
+    invalid: impl Fn(String) -> FabricError,
+) -> Result<()> {
+    let schema = Value::Object(schema.clone());
+    jsonschema::meta::options()
+        .validate(&schema)
+        .map_err(|error| invalid(format!("{field} is not valid JSON Schema: {error}")))?;
+    let allows_object_instances = match schema.get("type") {
+        Some(Value::String(root_type)) => root_type == "object",
+        Some(Value::Array(root_types)) => root_types
+            .iter()
+            .any(|root_type| root_type.as_str() == Some("object")),
+        _ => true,
+    };
+    if !allows_object_instances {
+        return Err(invalid(format!(
+            "{field} root type must allow object instances"
+        )));
+    }
+    jsonschema::validator_for(&schema)
+        .map_err(|error| invalid(format!("{field} could not be compiled: {error}")))?;
+    Ok(())
+}
+
+fn invalid_adapter_target_descriptor<T>(path: &Path, message: impl Into<String>) -> Result<T> {
+    Err(FabricError::InvalidAdapterTargetDescriptor {
+        path: path.to_path_buf(),
+        message: message.into(),
+    })
+}
+
+pub(crate) fn validate_harness_settings(
+    config: &FabricConfig,
+    resolved: Option<&ResolvedAdapterDescriptor>,
+) -> Result<()> {
+    let Some(resolved) = resolved else {
+        return Ok(());
+    };
+    let Some(harness) = &config.harness else {
+        return Ok(());
+    };
+    let Some(schema) = &resolved.descriptor.settings_schema else {
+        if harness.settings.is_empty() {
+            return Ok(());
+        }
+        let name = harness
+            .settings
+            .keys()
+            .min()
+            .expect("non-empty settings have a key");
+        return invalid_harness_settings(
+            resolved,
+            format!("harness.settings.{name}"),
+            "the resolved descriptor does not declare a settings_schema",
+        );
+    };
+
+    let schema = Value::Object(schema.clone());
+    let settings = Value::Object(harness.settings.clone());
+    let validator = jsonschema::validator_for(&schema).map_err(|error| {
+        FabricError::InvalidAdapterDescriptor {
+            path: resolved.primary().path.clone(),
+            message: format!("settings_schema could not be compiled: {error}"),
+        }
+    })?;
+    if let Some(error) = validator.iter_errors(&settings).next() {
+        let settings_path = schema_error_path(&error, "harness.settings");
+        let reason = schema_error_reason(&error, "adapter settings schema");
+        return invalid_harness_settings(resolved, settings_path, reason);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_workflow(
+    config: &FabricConfig,
+    resolved: Option<&ResolvedAdapterTargetDescriptor>,
+) -> Result<()> {
+    let (Some(workflow), Some(resolved)) = (&config.workflow, resolved) else {
+        return Ok(());
+    };
+    let target = resolved.descriptor.target.workflow();
+    let Some(schema) = &target.settings_schema else {
+        if workflow.settings.is_empty() {
+            return Ok(());
+        }
+        let name = workflow
+            .settings
+            .keys()
+            .min()
+            .expect("non-empty settings have a key");
+        return invalid_workflow(
+            resolved,
+            format!("workflow.settings.{name}"),
+            "the resolved target descriptor does not declare a settings_schema",
+        );
+    };
+
+    let schema = Value::Object(schema.clone());
+    let settings = Value::Object(workflow.settings.clone());
+    let validator = jsonschema::validator_for(&schema).map_err(|error| {
+        FabricError::InvalidAdapterTargetDescriptor {
+            path: resolved.primary().path.clone(),
+            message: format!("spec.settings_schema could not be compiled: {error}"),
+        }
+    })?;
+    if let Some(error) = validator.iter_errors(&settings).next() {
+        let workflow_path = schema_error_path(&error, "workflow.settings");
+        let reason = schema_error_reason(&error, "adapter target settings schema");
+        return invalid_workflow(resolved, workflow_path, reason);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_tool_definitions(
+    config: &FabricConfig,
+    resolved: Option<&ResolvedAdapterDescriptor>,
+) -> Result<()> {
+    let Some(definitions) = config
+        .tools
+        .as_ref()
+        .map(|tools| &tools.definitions)
+        .filter(|definitions| !definitions.is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(resolved) = resolved else {
+        return Ok(());
+    };
+    let Some(schema) = &resolved.descriptor.tool_definition_schema else {
+        let name = definitions
+            .keys()
+            .next()
+            .expect("non-empty definitions have a key");
+        return invalid_tool_definition(
+            resolved,
+            format!("tools.definitions.{name}"),
+            "the resolved descriptor does not declare a tool_definition_schema",
+        );
+    };
+
+    let schema = Value::Object(schema.clone());
+    let validator = jsonschema::validator_for(&schema).map_err(|error| {
+        FabricError::InvalidAdapterDescriptor {
+            path: resolved.primary().path.clone(),
+            message: format!("tool_definition_schema could not be compiled: {error}"),
+        }
+    })?;
+    for (name, definition) in definitions {
+        let mut value = serde_json::to_value(definition).map_err(FabricError::SerializeJson)?;
+        if let Some(object) = value.as_object_mut() {
+            for extension in definition.extensions.keys() {
+                object.remove(extension);
+            }
+        }
+        if let Some(error) = validator.iter_errors(&value).next() {
+            let prefix = format!("tools.definitions.{name}");
+            let definition_path = schema_error_path(&error, &prefix);
+            let reason = schema_error_reason(&error, "adapter tool definition schema");
+            return invalid_tool_definition(resolved, definition_path, reason);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_agent_config_extensions(
+    config: &FabricConfig,
+    resolved: Option<&ResolvedAdapterDescriptor>,
+    target: Option<&ResolvedAdapterTargetDescriptor>,
+) -> Result<()> {
+    let Some(resolved) = resolved else {
+        return Ok(());
+    };
+    let mut validators = BTreeMap::new();
+
+    validate_extension_block(
+        resolved,
+        AdapterExtensionPoint::AgentConfig,
+        "extensions",
+        &config.extensions,
+        &mut validators,
+    )?;
+    if let Some(harness) = &config.harness {
+        validate_extension_block(
+            resolved,
+            AdapterExtensionPoint::Harness,
+            "harness",
+            &harness.extensions,
+            &mut validators,
+        )?;
+    }
+    for (name, model) in &config.models {
+        validate_extension_block(
+            resolved,
+            AdapterExtensionPoint::Model,
+            &format!("models.{name}"),
+            &model.extensions,
+            &mut validators,
+        )?;
+    }
+    if let Some(instructions) = &config.instructions {
+        validate_extension_block(
+            resolved,
+            AdapterExtensionPoint::Instructions,
+            "instructions",
+            &instructions.extensions,
+            &mut validators,
+        )?;
+        if let Some(system) = &instructions.system {
+            validate_extension_block(
+                resolved,
+                AdapterExtensionPoint::Instruction,
+                "instructions.system",
+                &system.extensions,
+                &mut validators,
+            )?;
+        }
+    }
+    validate_extension_block(
+        resolved,
+        AdapterExtensionPoint::Runtime,
+        "runtime",
+        &config.runtime.extensions,
+        &mut validators,
+    )?;
+    if let Some(skills) = &config.skills {
+        validate_extension_block(
+            resolved,
+            AdapterExtensionPoint::Skills,
+            "skills",
+            &skills.extensions,
+            &mut validators,
+        )?;
+    }
+    if let Some(mcp) = &config.mcp {
+        validate_extension_block(
+            resolved,
+            AdapterExtensionPoint::Mcp,
+            "mcp",
+            &mcp.extensions,
+            &mut validators,
+        )?;
+        for (name, server) in &mcp.servers {
+            validate_extension_block(
+                resolved,
+                AdapterExtensionPoint::McpServer,
+                &format!("mcp.servers.{name}"),
+                &server.extensions,
+                &mut validators,
+            )?;
+        }
+    }
+    if let Some(tools) = &config.tools {
+        validate_extension_block(
+            resolved,
+            AdapterExtensionPoint::Tools,
+            "tools",
+            &tools.extensions,
+            &mut validators,
+        )?;
+        for (name, definition) in &tools.definitions {
+            validate_extension_block(
+                resolved,
+                AdapterExtensionPoint::ToolDefinition,
+                &format!("tools.definitions.{name}"),
+                &definition.extensions,
+                &mut validators,
+            )?;
+        }
+    }
+    if let Some(workflow) = &config.workflow {
+        validate_extension_block(
+            resolved,
+            AdapterExtensionPoint::Workflow,
+            "workflow",
+            &workflow.extensions,
+            &mut validators,
+        )?;
+    }
+    if let Some(target) = target {
+        validate_extension_block(
+            resolved,
+            AdapterExtensionPoint::WorkflowEntrypoint,
+            "workflow.entrypoint",
+            &target.descriptor.target.workflow().entrypoint.extensions,
+            &mut validators,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_agent_run_request_extensions(
+    request: &AgentRunRequest,
+    resolved: Option<&ResolvedAdapterDescriptor>,
+) -> Result<()> {
+    let Some(resolved) = resolved else {
+        if request.extensions.is_empty() {
+            return Ok(());
+        }
+        return Err(FabricError::AdapterCompatibility {
+            adapter_id: "unresolved".to_string(),
+            field: "request.extensions".to_string(),
+            reason: "request extensions require a resolved adapter descriptor".to_string(),
+        });
+    };
+    validate_extension_block(
+        resolved,
+        AdapterExtensionPoint::RunRequest,
+        "request.extensions",
+        &request.extensions,
+        &mut BTreeMap::new(),
+    )
+}
+
+pub(crate) fn validate_agent_run_result_extensions(
+    result: &AgentRunResult,
+    resolved: Option<&ResolvedAdapterDescriptor>,
+) -> Result<()> {
+    let Some(resolved) = resolved else {
+        let has_extensions = !result.extensions.is_empty()
+            || result
+                .error
+                .as_ref()
+                .is_some_and(|error| !error.extensions.is_empty())
+            || result
+                .usage
+                .as_ref()
+                .is_some_and(|usage| !usage.extensions.is_empty())
+            || result
+                .artifacts
+                .iter()
+                .any(|artifact| !artifact.extensions.is_empty());
+        if !has_extensions {
+            return Ok(());
+        }
+        return Err(FabricError::AdapterCompatibility {
+            adapter_id: "unresolved".to_string(),
+            field: "result.extensions".to_string(),
+            reason: "result extensions require a resolved adapter descriptor".to_string(),
+        });
+    };
+    let mut validators = BTreeMap::new();
+    validate_extension_block(
+        resolved,
+        AdapterExtensionPoint::RunResult,
+        "result.extensions",
+        &result.extensions,
+        &mut validators,
+    )?;
+    if let Some(error) = &result.error {
+        validate_extension_block(
+            resolved,
+            AdapterExtensionPoint::RunError,
+            "result.error.extensions",
+            &error.extensions,
+            &mut validators,
+        )?;
+    }
+    if let Some(usage) = &result.usage {
+        validate_extension_block(
+            resolved,
+            AdapterExtensionPoint::Usage,
+            "result.usage.extensions",
+            &usage.extensions,
+            &mut validators,
+        )?;
+    }
+    for (index, artifact) in result.artifacts.iter().enumerate() {
+        validate_extension_block(
+            resolved,
+            AdapterExtensionPoint::Artifact,
+            &format!("result.artifacts.{index}.extensions"),
+            &artifact.extensions,
+            &mut validators,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_extension_block(
+    resolved: &ResolvedAdapterDescriptor,
+    point: AdapterExtensionPoint,
+    path: &str,
+    extensions: &BTreeMap<String, Value>,
+    validators: &mut BTreeMap<AdapterExtensionPoint, jsonschema::Validator>,
+) -> Result<()> {
+    if extensions.is_empty() {
+        return Ok(());
+    }
+    let validator = match validators.entry(point) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let Some(schema) = resolved.descriptor.extension_schemas.get(&point) else {
+                return Err(FabricError::AdapterCompatibility {
+                    adapter_id: resolved.descriptor.adapter_id.clone(),
+                    field: path.to_string(),
+                    reason: format!(
+                        "the adapter descriptor does not declare an extension schema for {}",
+                        point.as_str()
+                    ),
+                });
+            };
+            let schema = Value::Object(schema.clone());
+            let validator = jsonschema::validator_for(&schema).map_err(|error| {
+                FabricError::InvalidAdapterDescriptor {
+                    path: resolved.primary().path.clone(),
+                    message: format!(
+                        "extension_schemas.{} could not be compiled: {error}",
+                        point.as_str()
+                    ),
+                }
+            })?;
+            entry.insert(validator)
+        }
+    };
+    let value = serde_json::to_value(extensions).map_err(FabricError::SerializeJson)?;
+    if let Some(error) = validator.iter_errors(&value).next() {
+        return Err(FabricError::InvalidAdapterExtension {
+            adapter_id: resolved.descriptor.adapter_id.clone(),
+            descriptor_source: resolved.primary().source,
+            descriptor_path: resolved.primary().path.clone(),
+            extension_path: schema_error_path(&error, path),
+            reason: schema_error_reason(&error, "adapter extension schema"),
+        });
+    }
+    Ok(())
+}
+
+fn invalid_harness_settings<T>(
+    resolved: &ResolvedAdapterDescriptor,
+    settings_path: String,
+    reason: impl Into<String>,
+) -> Result<T> {
+    Err(FabricError::InvalidHarnessSettings {
+        adapter_id: resolved.descriptor.adapter_id.clone(),
+        descriptor_source: resolved.primary().source,
+        descriptor_path: resolved.primary().path.clone(),
+        settings_path,
+        reason: reason.into(),
+    })
+}
+
+fn invalid_workflow<T>(
+    resolved: &ResolvedAdapterTargetDescriptor,
+    workflow_path: String,
+    reason: impl Into<String>,
+) -> Result<T> {
+    Err(FabricError::InvalidWorkflow {
+        adapter_id: resolved.descriptor.adapter_id.clone(),
+        descriptor_source: resolved.primary().source,
+        descriptor_path: resolved.primary().path.clone(),
+        workflow_path,
+        reason: reason.into(),
+    })
+}
+
+fn invalid_tool_definition<T>(
+    resolved: &ResolvedAdapterDescriptor,
+    definition_path: String,
+    reason: impl Into<String>,
+) -> Result<T> {
+    Err(FabricError::InvalidToolDefinition {
+        adapter_id: resolved.descriptor.adapter_id.clone(),
+        descriptor_source: resolved.primary().source,
+        descriptor_path: resolved.primary().path.clone(),
+        definition_path,
+        reason: reason.into(),
+    })
+}
+
+fn schema_error_path(error: &jsonschema::ValidationError<'_>, prefix: &str) -> String {
+    let mut segments = error
+        .instance_path()
+        .as_str()
+        .split('/')
+        .skip(1)
+        .map(decode_json_pointer_segment)
+        .collect::<Vec<_>>();
+    match error.kind() {
+        jsonschema::error::ValidationErrorKind::AdditionalProperties { unexpected }
+        | jsonschema::error::ValidationErrorKind::UnevaluatedProperties { unexpected } => {
+            if let Some(name) = unexpected.iter().min() {
+                segments.push(name.clone());
+            }
+        }
+        jsonschema::error::ValidationErrorKind::Required { property } => {
+            if let Some(name) = property.as_str() {
+                segments.push(name.to_string());
+            }
+        }
+        _ => {}
+    }
+    if segments.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}.{}", segments.join("."))
+    }
+}
+
+fn decode_json_pointer_segment(segment: &str) -> String {
+    segment.replace("~1", "/").replace("~0", "~")
+}
+
+fn schema_error_reason(error: &jsonschema::ValidationError<'_>, schema_name: &str) -> String {
+    match error.kind() {
+        jsonschema::error::ValidationErrorKind::AdditionalProperties { .. }
+        | jsonschema::error::ValidationErrorKind::UnevaluatedProperties { .. } => {
+            format!("is not declared by the {schema_name}")
+        }
+        jsonschema::error::ValidationErrorKind::Required { .. } => {
+            format!("is required by the {schema_name}")
+        }
+        jsonschema::error::ValidationErrorKind::Type { .. } => {
+            format!("has a type that is not accepted by the {schema_name}")
+        }
+        jsonschema::error::ValidationErrorKind::Enum { .. } => {
+            format!("is not one of the values accepted by the {schema_name}")
+        }
+        jsonschema::error::ValidationErrorKind::ExclusiveMinimum { .. } => {
+            format!("must be greater than the minimum declared by the {schema_name}")
+        }
+        _ => format!("does not satisfy the {schema_name} ({error})"),
+    }
 }
 
 fn validate_control_location(
@@ -1530,7 +3245,10 @@ fn resolve_resolution(
     config: &FabricConfig,
     _adapter_descriptor: Option<&AdapterDescriptor>,
 ) -> Result<Option<ResolutionStrategy>> {
-    Ok(config.harness.resolution)
+    Ok(config
+        .harness
+        .as_ref()
+        .and_then(|harness| harness.resolution))
 }
 
 fn resolve_environment_plan(config: &FabricConfig, base_dir: &Path) -> Option<EnvironmentPlan> {
@@ -1587,9 +3305,16 @@ fn resolve_capability_plan(
                     (
                         name.clone(),
                         McpServerPlan {
-                            transport: server.transport.clone(),
+                            transport: server.transport,
                             url: server.url.clone(),
+                            args: server.args.clone(),
+                            env: server.env.clone(),
+                            authentication: server.authentication.clone(),
+                            custom_headers: server.custom_headers.clone(),
                             exposure: server.exposure,
+                            extensions: server.extensions.clone(),
+                            allowed_tools: server.allowed_tools.clone(),
+                            blocked_tools: server.blocked_tools.clone(),
                         },
                     )
                 })
@@ -1605,15 +3330,28 @@ fn resolve_capability_plan(
         .as_ref()
         .map(|tools| tools.blocked.clone())
         .unwrap_or_default();
+    let tool_definitions = config
+        .tools
+        .as_ref()
+        .map(|tools| tools.definitions.clone())
+        .unwrap_or_default();
+    let tool_definitions_configured = !tool_definitions.is_empty();
     let enabled_tools_configured = enabled_tools.is_some();
     let blocked_tools_configured = !blocked_tools.is_empty();
-    let tools_configured = enabled_tools_configured || blocked_tools_configured;
+    let tools_configured =
+        tool_definitions_configured || enabled_tools_configured || blocked_tools_configured;
     let mut native = CapabilityTargetPlan::default();
     let managed = CapabilityTargetPlan::default();
     let mut unsupported = CapabilityTargetPlan::default();
     let mut routes = Vec::new();
 
     for (configured, support, field, description) in [
+        (
+            tool_definitions_configured,
+            AdapterConfigField::ToolDefinitions,
+            "tools.definitions",
+            "named tool definitions",
+        ),
         (
             enabled_tools_configured,
             AdapterConfigField::EnabledTools,
@@ -1674,7 +3412,9 @@ fn resolve_capability_plan(
     }
 
     for (name, server) in &mcp_servers {
+        let filters_configured = server.allowed_tools.is_some() || !server.blocked_tools.is_empty();
         let can_map_native = accepts(AdapterConfigField::Mcp)
+            && (!filters_configured || accepts(AdapterConfigField::McpToolFilters))
             && matches!(server.exposure, McpExposure::HarnessNative);
         if can_map_native {
             native.mcp_servers.insert(name.clone(), server.clone());
@@ -1697,6 +3437,12 @@ fn resolve_capability_plan(
                     McpExposure::FabricManaged => {
                         "MCP server explicitly requests NeMo Fabric-managed exposure but NeMo Fabric-managed MCP is not implemented".to_string()
                     }
+                    _ if accepts(AdapterConfigField::Mcp)
+                        && filters_configured
+                        && !accepts(AdapterConfigField::McpToolFilters) =>
+                    {
+                        "MCP server configures tool filters but the selected adapter does not declare native MCP tool-filter support".to_string()
+                    }
                     _ => "selected adapter does not declare native MCP support and NeMo Fabric-managed MCP is not implemented".to_string(),
                 },
             });
@@ -1705,6 +3451,7 @@ fn resolve_capability_plan(
 
     CapabilityPlan {
         tools: ToolsPlan {
+            definitions: tool_definitions,
             enabled: enabled_tools,
             blocked: blocked_tools,
         },
@@ -1739,7 +3486,7 @@ fn resolve_telemetry_plan(
     let native_provider = telemetry.providers.get(&TelemetryProvider::Native);
     let relay = config.relay.as_ref();
     let relay_enabled = relay_provider.is_some();
-    let providers = [TelemetryProvider::Relay, TelemetryProvider::Native]
+    let providers = TelemetryProvider::ALL
         .into_iter()
         .filter(|provider| telemetry.providers.contains_key(provider))
         .collect::<Vec<_>>();
@@ -1841,9 +3588,14 @@ pub struct RunPlan {
     pub base_dir: PathBuf,
     /// Complete typed NeMo Fabric config.
     pub config: FabricConfig,
+    /// Configuration projected southbound to the selected adapter target.
+    pub agent_config: AgentConfig,
     /// Adapter descriptor resolved for this plan, when configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter_descriptor: Option<ResolvedAdapterDescriptor>,
+    /// Adapter Target Descriptor resolved for this plan, when selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_target_descriptor: Option<ResolvedAdapterTargetDescriptor>,
     /// Selected install or availability strategy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<ResolutionStrategy>,
@@ -1941,6 +3693,9 @@ pub struct CapabilityPlan {
 /// Normalized tool policy for a run.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolsPlan {
+    /// Named normalized tool and tool-group definitions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub definitions: BTreeMap<String, ToolDefinitionConfig>,
     /// Adapter-native tool names to expose. `None` preserves the harness default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<Vec<String>>,
@@ -2019,11 +3774,32 @@ pub enum CapabilityTarget {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct McpServerPlan {
     /// MCP transport.
-    pub transport: String,
-    /// MCP URL or command.
+    pub transport: McpTransport,
+    /// MCP server URL for network transports or executable for stdio.
     pub url: String,
+    /// Command-line arguments passed to an MCP stdio server process.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Environment variables passed to an MCP stdio server process.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Authentication used by an HTTP MCP server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication: Option<McpAuthenticationConfig>,
+    /// HTTP headers passed to an MCP server.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom_headers: BTreeMap<String, String>,
     /// Exposure strategy.
     pub exposure: McpExposure,
+    /// Additive MCP server fields from author config.
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, Value>,
+    /// MCP tool names to expose. `None` exposes every discovered tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+    /// MCP tool names to block after applying the optional allowlist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_tools: Vec<String>,
 }
 
 /// Resolved telemetry plan.
@@ -2054,6 +3830,44 @@ pub struct TelemetryPlan {
 mod tests {
     use super::*;
 
+    #[test]
+    fn agent_config_round_trips_explicit_extensions() {
+        let config: AgentConfig = serde_json::from_value(serde_json::json!({
+            "extensions": {
+                "profile": {
+                    "enabled": true
+                }
+            }
+        }))
+        .expect("typed agent config");
+
+        assert_eq!(config.extensions["profile"]["enabled"], true);
+        assert_eq!(
+            serde_json::to_value(config).expect("serialize agent config"),
+            serde_json::json!({
+                "extensions": {
+                    "profile": {
+                        "enabled": true
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn agent_config_rejects_implicit_extensions() {
+        let error = serde_json::from_value::<AgentConfig>(serde_json::json!({
+            "implicit_extension": true
+        }))
+        .expect_err("implicit extension must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `implicit_extension`")
+        );
+    }
+
     fn typed_config(adapter_id: &str) -> FabricConfig {
         serde_json::from_value(serde_json::json!({
             "schema_version": "fabric.agent/v1alpha1",
@@ -2072,12 +3886,113 @@ mod tests {
         .expect("typed config")
     }
 
+    fn config_with_model(adapter_id: &str, provider: &str) -> FabricConfig {
+        let mut config = typed_config(adapter_id);
+        config.models.insert(
+            "default".to_string(),
+            ModelConfig {
+                provider: provider.to_string(),
+                model: "test-model".to_string(),
+                temperature: None,
+                api_key_env: None,
+                base_url: None,
+                settings: serde_json::Map::new(),
+                extensions: BTreeMap::new(),
+            },
+        );
+        config
+    }
+
+    fn typed_workflow() -> WorkflowConfig {
+        serde_json::from_value(serde_json::json!({
+            "target_id": "test.fabric.workflow",
+            "settings": {
+                "llm_name": "default"
+            }
+        }))
+        .expect("typed workflow")
+    }
+
+    fn workflow_settings_schema() -> serde_json::Map<String, Value> {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "llm_name": {"type": "string"}
+            },
+            "additionalProperties": false
+        })
+        .as_object()
+        .expect("object workflow settings schema")
+        .clone()
+    }
+
+    fn resolved_adapter(path: PathBuf, descriptor: AdapterDescriptor) -> ResolvedAdapterDescriptor {
+        ResolvedAdapterDescriptor {
+            provenance: vec![DescriptorProvenance {
+                source: DescriptorSource::Bundled,
+                root: path.parent().expect("descriptor directory").to_path_buf(),
+                path,
+            }],
+            descriptor,
+        }
+    }
+
+    fn resolved_workflow_target(
+        path: PathBuf,
+        settings_schema: Option<serde_json::Map<String, Value>>,
+    ) -> ResolvedAdapterTargetDescriptor {
+        ResolvedAdapterTargetDescriptor {
+            provenance: vec![DescriptorProvenance {
+                source: DescriptorSource::Bundled,
+                root: path.parent().expect("descriptor directory").to_path_buf(),
+                path,
+            }],
+            descriptor: AdapterTargetDescriptor {
+                contract_version: ADAPTER_CONTRACT_VERSION.to_string(),
+                id: "test.fabric.workflow".to_string(),
+                adapter_id: "test.fabric.adapter".to_string(),
+                target: AdapterTarget::Workflow(WorkflowTargetSpec {
+                    entrypoint: WorkflowEntrypointConfig {
+                        kind: "workflow_registry".to_string(),
+                        r#ref: "test_agent".to_string(),
+                        extensions: BTreeMap::new(),
+                    },
+                    settings_schema,
+                    extensions: BTreeMap::new(),
+                }),
+                extensions: BTreeMap::new(),
+            },
+        }
+    }
+
+    fn tool_definition_schema() -> serde_json::Map<String, Value> {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "kind": {"enum": ["function", "function_group"]},
+                "ref": {"type": "string", "minLength": 1},
+                "settings": {
+                    "type": "object",
+                    "properties": {
+                        "llm": {"type": "string"}
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "required": ["kind", "ref"],
+            "additionalProperties": false
+        })
+        .as_object()
+        .expect("object tool definition schema")
+        .clone()
+    }
+
     fn repository_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
     #[test]
-    fn relay_observability_uses_v2_typed_atof_sinks() {
+    fn relay_observability_uses_v3_typed_endpoints() {
         let observability: RelayObservabilityConfig = serde_json::from_value(serde_json::json!({
             "atof": {
                 "enabled": true,
@@ -2096,14 +4011,713 @@ mod tests {
                         "name": "live-events"
                     }
                 ]
+            },
+            "opentelemetry": {
+                "enabled": true,
+                "endpoints": [
+                    {
+                        "type": "openinference",
+                        "endpoint": "http://localhost:4318/v1/traces",
+                        "header_env": {"authorization": "OTEL_AUTHORIZATION"}
+                    }
+                ]
             }
         }))
-        .expect("Relay v2 observability config");
+        .expect("Relay v3 observability config");
 
         let value = serde_json::to_value(observability).expect("serialized observability");
-        assert_eq!(value["version"], 2);
+        assert_eq!(value["version"], 3);
         assert_eq!(value["atof"]["sinks"][0]["type"], "file");
         assert_eq!(value["atof"]["sinks"][1]["type"], "stream");
+        assert_eq!(
+            value["opentelemetry"]["endpoints"][0]["type"],
+            "openinference"
+        );
+        assert_eq!(
+            value["opentelemetry"]["endpoints"][0]["service_name"],
+            "unknown_service"
+        );
+    }
+
+    #[test]
+    fn relay_opentelemetry_deserializes_complete_typed_v3_config() {
+        let opentelemetry: RelayOpenTelemetryConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "endpoints": [
+                {
+                    "type": "openinference",
+                    "endpoint": "http://localhost:4318/v1/traces",
+                    "mark_projection": "event",
+                    "mark_exclude_names": ["llm.chunk", "tool.result"],
+                    "attribute_mappings": [{"source": "target"}],
+                    "transport": "grpc",
+                    "service_name": "fabric",
+                    "service_namespace": "evaluation",
+                    "service_version": "1.0.0",
+                    "instrumentation_scope": "nemo.fabric",
+                    "timeout_millis": 5000,
+                    "headers": {"authorization": "Bearer token"},
+                    "header_env": {"x-api-key": "API_KEY"},
+                    "resource_attributes": {"deployment.environment": "test"}
+                }
+            ]
+        }))
+        .expect("complete Relay v3 OpenTelemetry config");
+
+        assert!(opentelemetry.enabled);
+        assert!(opentelemetry.extensions.is_empty());
+        let [endpoint] = opentelemetry.endpoints.as_slice() else {
+            panic!("expected one typed OpenTelemetry endpoint");
+        };
+        assert_eq!(
+            endpoint.r#type,
+            RelayOpenTelemetryEndpointType::Openinference
+        );
+        assert_eq!(endpoint.transport, RelayOtlpTransport::Grpc);
+        assert_eq!(endpoint.service_name, "fabric");
+        assert!(endpoint.extensions.is_empty());
+    }
+
+    #[test]
+    fn relay_observability_rejects_explicit_v2() {
+        let error = serde_json::from_value::<RelayObservabilityConfig>(serde_json::json!({
+            "version": 2,
+            "atif": {"enabled": true}
+        }))
+        .expect_err("Relay v2 observability config must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("NeMo Relay 0.7 requires observability config version 3")
+        );
+    }
+
+    #[test]
+    fn generic_relay_observability_component_rejects_explicit_v2() {
+        for component_config in [
+            BTreeMap::from([("version".to_string(), serde_json::json!(2))]),
+            BTreeMap::from([
+                ("version".to_string(), serde_json::json!(2)),
+                (
+                    "opentelemetry".to_string(),
+                    serde_json::json!({
+                        "enabled": true,
+                        "endpoint": "http://localhost:4318/v1/traces"
+                    }),
+                ),
+            ]),
+        ] {
+            let mut config = typed_config("nvidia.fabric.hermes");
+            config.relay = Some(RelayConfig {
+                components: vec![RelayComponentConfig {
+                    kind: "observability".to_string(),
+                    enabled: true,
+                    config: component_config,
+                    extensions: BTreeMap::new(),
+                }],
+                ..RelayConfig::default()
+            });
+
+            let error = validate_config(&config).expect_err("Relay v2 component must fail");
+            assert!(matches!(
+                error,
+                FabricError::InvalidConfig { field, .. }
+                    if field == "relay.components.0.config.version"
+            ));
+        }
+    }
+
+    #[test]
+    fn generic_relay_observability_component_accepts_implicit_v3() {
+        let mut config = typed_config("nvidia.fabric.hermes");
+        config.relay = Some(RelayConfig {
+            components: vec![RelayComponentConfig {
+                kind: "observability".to_string(),
+                enabled: true,
+                config: BTreeMap::new(),
+                extensions: BTreeMap::new(),
+            }],
+            ..RelayConfig::default()
+        });
+
+        validate_config(&config).expect("Relay 0.7 defaults a missing version to v3");
+    }
+
+    #[test]
+    fn generic_relay_observability_component_requires_enabled_endpoint() {
+        for (opentelemetry, valid) in [
+            (serde_json::json!({"enabled": true}), false),
+            (serde_json::json!({"enabled": true, "endpoints": []}), false),
+            (serde_json::json!({"enabled": false, "endpoints": []}), true),
+        ] {
+            let mut config = typed_config("nvidia.fabric.hermes");
+            config.relay = Some(RelayConfig {
+                components: vec![RelayComponentConfig {
+                    kind: "observability".to_string(),
+                    enabled: true,
+                    config: BTreeMap::from([
+                        ("version".to_string(), serde_json::json!(3)),
+                        ("opentelemetry".to_string(), opentelemetry),
+                    ]),
+                    extensions: BTreeMap::new(),
+                }],
+                ..RelayConfig::default()
+            });
+
+            if valid {
+                validate_config(&config).expect("disabled exporter may omit endpoints");
+            } else {
+                let error =
+                    validate_config(&config).expect_err("enabled exporter needs an endpoint");
+                assert!(matches!(
+                    error,
+                    FabricError::InvalidConfig { field, .. }
+                        if field == "relay.components.0.config.opentelemetry.endpoints"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn generic_relay_observability_component_rejects_invalid_endpoint() {
+        for endpoint in [
+            serde_json::json!({"type": "openinference"}),
+            serde_json::json!({"type": "openinference", "endpoint": null}),
+            serde_json::json!({"type": "openinference", "endpoint": 42}),
+            serde_json::json!({"type": "openinference", "endpoint": ""}),
+            serde_json::json!({"type": "openinference", "endpoint": " \t"}),
+        ] {
+            let mut config = typed_config("nvidia.fabric.hermes");
+            config.relay = Some(RelayConfig {
+                components: vec![RelayComponentConfig {
+                    kind: "observability".to_string(),
+                    enabled: true,
+                    config: BTreeMap::from([
+                        ("version".to_string(), serde_json::json!(3)),
+                        (
+                            "opentelemetry".to_string(),
+                            serde_json::json!({
+                                "enabled": true,
+                                "endpoints": [
+                                    {
+                                        "type": "full",
+                                        "endpoint": "http://localhost:4318/v1/traces"
+                                    },
+                                    endpoint
+                                ]
+                            }),
+                        ),
+                    ]),
+                    extensions: BTreeMap::new(),
+                }],
+                ..RelayConfig::default()
+            });
+
+            let error = validate_config(&config).expect_err("invalid endpoint must fail");
+            assert!(matches!(
+                error,
+                FabricError::InvalidConfig { field, .. }
+                    if field == "relay.components.0.config.opentelemetry.endpoints.1.endpoint"
+            ));
+        }
+    }
+
+    #[test]
+    fn generic_relay_observability_component_accepts_endpoint_types() {
+        let mut config = typed_config("nvidia.fabric.hermes");
+        config.relay = Some(RelayConfig {
+            components: vec![RelayComponentConfig {
+                kind: "observability".to_string(),
+                enabled: true,
+                config: BTreeMap::from([
+                    ("version".to_string(), serde_json::json!(3)),
+                    (
+                        "opentelemetry".to_string(),
+                        serde_json::json!({
+                            "endpoints": [
+                                {
+                                    "type": "full",
+                                    "endpoint": "http://localhost:4318/v1/traces"
+                                },
+                                {
+                                    "type": "gen_ai",
+                                    "endpoint": "http://localhost:4318/v1/traces"
+                                },
+                                {
+                                    "type": "openinference",
+                                    "endpoint": "http://localhost:4318/v1/traces"
+                                }
+                            ]
+                        }),
+                    ),
+                ]),
+                extensions: BTreeMap::new(),
+            }],
+            ..RelayConfig::default()
+        });
+
+        validate_config(&config).expect("all Relay 0.7 endpoint types must pass");
+    }
+
+    #[test]
+    fn generic_relay_observability_component_rejects_malformed_opentelemetry() {
+        for (opentelemetry, expected_field) in [
+            (
+                serde_json::json!(false),
+                "relay.components.0.config.opentelemetry",
+            ),
+            (
+                serde_json::json!({"enabled": "true"}),
+                "relay.components.0.config.opentelemetry.enabled",
+            ),
+            (
+                serde_json::json!({"endpoints": null}),
+                "relay.components.0.config.opentelemetry.endpoints",
+            ),
+            (
+                serde_json::json!({"endpoints": "endpoint"}),
+                "relay.components.0.config.opentelemetry.endpoints",
+            ),
+            (
+                serde_json::json!({"endpoints": [false]}),
+                "relay.components.0.config.opentelemetry.endpoints.0",
+            ),
+            (
+                serde_json::json!({
+                    "endpoints": [{"endpoint": "http://localhost:4318/v1/traces"}]
+                }),
+                "relay.components.0.config.opentelemetry.endpoints.0.type",
+            ),
+            (
+                serde_json::json!({
+                    "endpoints": [{
+                        "type": "zipkin",
+                        "endpoint": "http://localhost:4318/v1/traces"
+                    }]
+                }),
+                "relay.components.0.config.opentelemetry.endpoints.0.type",
+            ),
+        ] {
+            let mut config = typed_config("nvidia.fabric.hermes");
+            config.relay = Some(RelayConfig {
+                components: vec![RelayComponentConfig {
+                    kind: "observability".to_string(),
+                    enabled: true,
+                    config: BTreeMap::from([
+                        ("version".to_string(), serde_json::json!(3)),
+                        ("opentelemetry".to_string(), opentelemetry),
+                    ]),
+                    extensions: BTreeMap::new(),
+                }],
+                ..RelayConfig::default()
+            });
+
+            let error = validate_config(&config).expect_err("malformed config must fail");
+            assert!(matches!(
+                error,
+                FabricError::InvalidConfig { field, .. } if field == expected_field
+            ));
+        }
+    }
+
+    #[test]
+    fn enabled_relay_opentelemetry_requires_an_endpoint() {
+        let mut config = typed_config("nvidia.fabric.hermes");
+        config.relay = Some(RelayConfig {
+            observability: Some(RelayObservabilityConfig {
+                opentelemetry: Some(RelayOpenTelemetryConfig {
+                    enabled: true,
+                    ..RelayOpenTelemetryConfig::default()
+                }),
+                ..RelayObservabilityConfig::default()
+            }),
+            ..RelayConfig::default()
+        });
+
+        let error = validate_config(&config).expect_err("enabled exporter needs an endpoint");
+        assert!(matches!(
+            error,
+            FabricError::InvalidConfig { field, .. }
+                if field == "relay.observability.opentelemetry.endpoints"
+        ));
+    }
+
+    #[test]
+    fn relay_observability_rejects_removed_v2_exporter_fields() {
+        let mut config = typed_config("nvidia.fabric.hermes");
+        config.relay = Some(RelayConfig {
+            observability: Some(
+                serde_json::from_value(serde_json::json!({
+                    "version": 3,
+                    "openinference": {
+                        "enabled": true,
+                        "endpoint": "http://localhost:6006/v1/traces"
+                    }
+                }))
+                .expect("additive field deserializes before semantic validation"),
+            ),
+            ..RelayConfig::default()
+        });
+
+        let error = validate_config(&config).expect_err("removed exporter must fail");
+        assert!(matches!(
+            error,
+            FabricError::InvalidConfig { field, .. }
+                if field == "relay.observability.openinference"
+        ));
+    }
+
+    #[test]
+    fn mcp_server_args_and_env_survive_capability_planning() {
+        let mut config = typed_config("nvidia.fabric.hermes");
+        config.skills = None;
+        config.mcp = Some(McpConfig {
+            servers: BTreeMap::from([(
+                "analyzer".to_string(),
+                serde_json::from_value(serde_json::json!({
+                    "transport": "stdio",
+                    "url": "/tmp/analyzer-mcp",
+                    "exposure": "harness_native",
+                    "env": {"NVIDIA_API_KEY": "${NVIDIA_API_KEY}"},
+                    "args": ["--stdio"]
+                }))
+                .expect("mcp server with args and env"),
+            )]),
+            extensions: BTreeMap::new(),
+        });
+
+        let plan = resolve_run_plan_from_config(config, ResolveContext::new(repository_root()))
+            .expect("hermes plan with mcp args and env");
+
+        let server = plan
+            .capability_plan
+            .native
+            .mcp_servers
+            .get("analyzer")
+            .expect("native analyzer mcp server");
+        assert_eq!(server.transport, McpTransport::Stdio);
+        assert_eq!(server.url, "/tmp/analyzer-mcp");
+        assert_eq!(server.exposure, McpExposure::HarnessNative);
+        assert_eq!(server.args, vec!["--stdio".to_string()]);
+        assert_eq!(
+            server.env,
+            BTreeMap::from([(
+                "NVIDIA_API_KEY".to_string(),
+                "${NVIDIA_API_KEY}".to_string()
+            )])
+        );
+        assert!(server.extensions.is_empty());
+    }
+
+    #[test]
+    fn mcp_env_requires_stdio_transport() {
+        for transport in [McpTransport::Sse, McpTransport::StreamableHttp] {
+            let mut config = typed_config("nvidia.fabric.hermes");
+            config.mcp = Some(McpConfig {
+                servers: BTreeMap::from([(
+                    "docs".to_string(),
+                    McpServerConfig {
+                        transport,
+                        url: "https://mcp.example".to_string(),
+                        args: Vec::new(),
+                        env: BTreeMap::from([("MCP_SECRET".to_string(), "secret".to_string())]),
+                        authentication: None,
+                        custom_headers: BTreeMap::new(),
+                        exposure: McpExposure::HarnessNative,
+                        allowed_tools: None,
+                        blocked_tools: Vec::new(),
+                        extensions: BTreeMap::new(),
+                    },
+                )]),
+                extensions: BTreeMap::new(),
+            });
+
+            let error = resolve_run_plan_from_config(
+                config,
+                ResolveContext::new("/tmp/fabric-invalid-mcp-env"),
+            )
+            .expect_err("HTTP MCP env must be rejected");
+
+            assert!(matches!(
+                error,
+                FabricError::InvalidConfig { field, .. }
+                    if field == "mcp.servers.docs.env"
+            ));
+        }
+    }
+
+    #[test]
+    fn mcp_transport_rejects_unknown_values() {
+        let error = serde_json::from_value::<McpServerConfig>(serde_json::json!({
+            "transport": "websocket",
+            "url": "https://mcp.example",
+            "exposure": "harness_native"
+        }))
+        .expect_err("unknown MCP transport");
+
+        assert!(error.to_string().contains("unknown variant `websocket`"));
+    }
+
+    #[test]
+    fn mcp_transport_as_str_matches_serialized_value() {
+        for transport in [
+            McpTransport::Stdio,
+            McpTransport::Sse,
+            McpTransport::StreamableHttp,
+        ] {
+            assert_eq!(
+                serde_json::to_value(transport).expect("serialize MCP transport"),
+                transport.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_oauth_authentication_rejects_unknown_fields() {
+        let error = serde_json::from_value::<McpAuthenticationConfig>(serde_json::json!({
+            "type": "oauth2",
+            "client_id": "fabric-client",
+            "unknown": true
+        }))
+        .expect_err("unknown OAuth field");
+
+        assert!(error.to_string().contains("unknown field `unknown`"));
+    }
+
+    #[test]
+    fn mcp_service_account_authentication_rejects_unknown_fields() {
+        let error = serde_json::from_value::<McpAuthenticationConfig>(serde_json::json!({
+            "type": "service_account",
+            "client_id": "fabric-client",
+            "client_secret_env": "MCP_CLIENT_SECRET",
+            "token_url": "https://auth.example/token",
+            "unknown": true
+        }))
+        .expect_err("unknown service-account field");
+
+        assert!(error.to_string().contains("unknown field `unknown`"));
+    }
+
+    #[test]
+    fn mcp_http_authentication_and_headers_survive_capability_planning() {
+        let mut config = typed_config("nvidia.fabric.hermes");
+        config.skills = None;
+        config.mcp = Some(McpConfig {
+            servers: BTreeMap::from([(
+                "jira".to_string(),
+                serde_json::from_value(serde_json::json!({
+                    "transport": "streamable-http",
+                    "url": "https://mcp.example/jira",
+                    "exposure": "harness_native",
+                    "custom_headers": {"X-Tenant": "fabric"},
+                    "authentication": {
+                        "type": "oauth2",
+                        "client_id": "fabric-client",
+                        "client_secret_env": "MCP_CLIENT_SECRET",
+                        "scopes": ["read:jira", "write:jira"],
+                        "redirect_uri": "http://127.0.0.1:8765/callback",
+                        "enable_dynamic_registration": false,
+                        "client_name": "NeMo Fabric",
+                        "token_endpoint_auth_method": "client_secret_post",
+                        "authorization_timeout_seconds": 120
+                    }
+                }))
+                .expect("authenticated MCP server"),
+            )]),
+            extensions: BTreeMap::new(),
+        });
+
+        let plan = resolve_run_plan_from_config(config, ResolveContext::new(repository_root()))
+            .expect("authenticated Hermes MCP plan");
+        let server = plan
+            .capability_plan
+            .native
+            .mcp_servers
+            .get("jira")
+            .expect("native Jira MCP server");
+
+        assert_eq!(server.transport, McpTransport::StreamableHttp);
+        assert_eq!(
+            server.custom_headers,
+            BTreeMap::from([("X-Tenant".to_string(), "fabric".to_string())])
+        );
+        assert_eq!(
+            server.authentication,
+            Some(McpAuthenticationConfig::OAuth2 {
+                client_id: Some("fabric-client".to_string()),
+                client_secret_env: Some("MCP_CLIENT_SECRET".to_string()),
+                scopes: vec!["read:jira".to_string(), "write:jira".to_string()],
+                redirect_uri: Some("http://127.0.0.1:8765/callback".to_string()),
+                enable_dynamic_registration: false,
+                client_name: Some("NeMo Fabric".to_string()),
+                token_endpoint_auth_method: Some(OAuthTokenEndpointAuthMethod::ClientSecretPost,),
+                authorization_timeout_seconds: 120,
+            })
+        );
+        let projected = plan
+            .agent_config
+            .mcp
+            .as_ref()
+            .and_then(|mcp| mcp.servers.get("jira"))
+            .expect("projected Jira MCP server");
+        assert_eq!(projected.custom_headers, server.custom_headers);
+        assert_eq!(projected.authentication, server.authentication);
+    }
+
+    #[test]
+    fn agent_config_projects_only_harness_native_mcp_servers() {
+        let path = repository_root().join("adapters/hermes/hermes.fabric-adapter.json");
+        let descriptor = load_adapter_descriptor(&path).expect("Hermes descriptor");
+        let resolved = resolved_adapter(path.clone(), descriptor);
+        let mut config = typed_config("nvidia.fabric.hermes");
+        config.skills = None;
+        config.mcp = Some(
+            serde_json::from_value(serde_json::json!({
+                "servers": {
+                    "native": {
+                        "transport": "stdio",
+                        "url": "native-mcp",
+                        "exposure": "harness_native"
+                    },
+                    "managed": {
+                        "transport": "stdio",
+                        "url": "managed-mcp",
+                        "exposure": "fabric_managed"
+                    }
+                }
+            }))
+            .expect("mixed MCP config"),
+        );
+
+        let capability_plan =
+            resolve_capability_plan(&config, Path::new("/tmp/mixed-mcp"), Some(&resolved));
+        let agent_config =
+            project_agent_config(&config, &capability_plan, Some(&resolved.descriptor), None);
+        let projected = &agent_config.mcp.expect("projected MCP config").servers;
+
+        assert!(projected.contains_key("native"));
+        assert!(!projected.contains_key("managed"));
+        assert!(capability_plan.native.mcp_servers.contains_key("native"));
+        assert!(
+            capability_plan
+                .unsupported
+                .mcp_servers
+                .contains_key("managed")
+        );
+    }
+
+    #[test]
+    fn mcp_service_account_authentication_requires_adapter_support() {
+        let mut config = typed_config("nvidia.fabric.langchain.deepagents");
+        config.skills = None;
+        config.mcp = Some(McpConfig {
+            servers: BTreeMap::from([(
+                "automation".to_string(),
+                serde_json::from_value(serde_json::json!({
+                    "transport": "streamable-http",
+                    "url": "https://mcp.example/automation",
+                    "exposure": "harness_native",
+                    "authentication": {
+                        "type": "service_account",
+                        "client_id": "fabric-client",
+                        "client_secret_env": "MCP_CLIENT_SECRET",
+                        "token_url": "https://auth.example/token",
+                        "scopes": ["mcp:invoke"],
+                        "token_endpoint_auth_method": "client_secret_basic",
+                        "token_cache_buffer_seconds": 60
+                    }
+                }))
+                .expect("service-account MCP server"),
+            )]),
+            extensions: BTreeMap::new(),
+        });
+
+        let error = resolve_run_plan_from_config(config, ResolveContext::new(repository_root()))
+            .expect_err("Deep Agents does not support service-account MCP authentication");
+
+        assert!(matches!(
+            error,
+            FabricError::AdapterCompatibility {
+                adapter_id,
+                field,
+                ..
+            } if adapter_id == "nvidia.fabric.langchain.deepagents"
+                && field == "mcp.servers.automation.authentication"
+        ));
+    }
+
+    #[test]
+    fn mcp_oauth_allows_dynamic_registration_to_supply_client_secret() {
+        let mut config = typed_config("nvidia.fabric.langchain.deepagents");
+        config.mcp = Some(McpConfig {
+            servers: BTreeMap::from([(
+                "docs".to_string(),
+                serde_json::from_value(serde_json::json!({
+                    "transport": "streamable-http",
+                    "url": "https://mcp.example/docs",
+                    "exposure": "harness_native",
+                    "authentication": {
+                        "type": "oauth2",
+                        "token_endpoint_auth_method": "client_secret_post"
+                    }
+                }))
+                .expect("dynamically registered MCP server"),
+            )]),
+            extensions: BTreeMap::new(),
+        });
+
+        validate_config(&config).expect("dynamic registration supplies client credentials");
+    }
+
+    #[test]
+    fn rejects_invalid_mcp_authentication_policy() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "oauth2",
+                    "authorization_timeout_seconds": 0
+                }),
+                "authorization_timeout_seconds",
+            ),
+            (
+                serde_json::json!({
+                    "type": "oauth2",
+                    "enable_dynamic_registration": false
+                }),
+                "client_id",
+            ),
+            (
+                serde_json::json!({
+                    "type": "service_account",
+                    "client_id": "fabric-client",
+                    "client_secret_env": "MCP_CLIENT_SECRET",
+                    "token_url": "https://auth.example/token",
+                    "token_endpoint_auth_method": "none"
+                }),
+                "token_endpoint_auth_method",
+            ),
+        ];
+
+        for (authentication, expected) in cases {
+            let mut config = typed_config("nvidia.fabric.langchain.deepagents");
+            config.mcp = Some(McpConfig {
+                servers: BTreeMap::from([(
+                    "invalid".to_string(),
+                    serde_json::from_value(serde_json::json!({
+                        "transport": "streamable-http",
+                        "url": "https://mcp.example/invalid",
+                        "exposure": "harness_native",
+                        "authentication": authentication,
+                    }))
+                    .expect("syntactically valid MCP server"),
+                )]),
+                extensions: BTreeMap::new(),
+            });
+
+            let error = validate_config(&config).expect_err("invalid MCP auth must fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]
@@ -2167,6 +4781,87 @@ mod tests {
     }
 
     #[test]
+    fn resolved_descriptors_reject_empty_provenance() {
+        let adapter_path = repository_root().join("adapters/hermes/hermes.fabric-adapter.json");
+        let descriptor = load_adapter_descriptor(&adapter_path).expect("Hermes descriptor");
+        let mut adapter = serde_json::to_value(resolved_adapter(adapter_path, descriptor))
+            .expect("resolved adapter JSON");
+        adapter["provenance"] = serde_json::json!([]);
+
+        let adapter_error = serde_json::from_value::<ResolvedAdapterDescriptor>(adapter)
+            .expect_err("empty adapter provenance must fail");
+        assert!(
+            adapter_error
+                .to_string()
+                .contains("provenance must not be empty")
+        );
+
+        let mut target = serde_json::to_value(resolved_workflow_target(
+            PathBuf::from("workflow.fabric-target.json"),
+            None,
+        ))
+        .expect("resolved target JSON");
+        target["provenance"] = serde_json::json!([]);
+
+        let target_error = serde_json::from_value::<ResolvedAdapterTargetDescriptor>(target)
+            .expect_err("empty target provenance must fail");
+        assert!(
+            target_error
+                .to_string()
+                .contains("provenance must not be empty")
+        );
+    }
+
+    #[test]
+    fn discovery_rejects_whitespace_only_local_paths() {
+        let mut config = typed_config("nvidia.fabric.hermes");
+        config.discovery = Some(DiscoveryConfig {
+            local_paths: vec![PathBuf::from(" \t ")],
+            extensions: BTreeMap::new(),
+        });
+
+        let error = validate_config(&config).expect_err("blank discovery path must fail");
+
+        assert!(matches!(
+            error,
+            FabricError::InvalidConfig { field, .. }
+                if field == "discovery.local_paths.0"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_discovery_skips_symlinked_directory_cycles() {
+        use std::os::unix::fs::symlink;
+
+        struct RemoveDirOnDrop(PathBuf);
+
+        impl Drop for RemoveDirOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "nemo-fabric-adapter-symlink-cycle-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create descriptor root");
+        let _cleanup = RemoveDirOnDrop(root.clone());
+        symlink(&root, root.join("cycle")).expect("create directory symlink");
+
+        let mut config = typed_config("nvidia.fabric.hermes");
+        config.discovery = Some(DiscoveryConfig {
+            local_paths: vec![root.clone()],
+            extensions: BTreeMap::new(),
+        });
+
+        DescriptorRegistry::from_config(&config, &root, &[])
+            .expect("symlinked directories must not be traversed");
+    }
+
+    #[test]
     fn normalized_fields_survive_planning() {
         let mut config = typed_config("nvidia.fabric.hermes");
         config.instructions = Some(InstructionsConfig {
@@ -2194,6 +4889,7 @@ mod tests {
             },
         );
         config.tools = Some(ToolsConfig {
+            definitions: BTreeMap::new(),
             enabled: Some(vec!["terminal".to_string()]),
             blocked: vec!["browser".to_string()],
             extensions: BTreeMap::new(),
@@ -2277,12 +4973,24 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_model_temperature_reports_canonical_field() {
+    fn unsupported_model_temperature_on_non_default_role_reports_canonical_field() {
         for (adapter_id, provider) in [
             ("nvidia.fabric.claude", "anthropic"),
             ("nvidia.fabric.codex", "openai"),
         ] {
             let mut config = typed_config(adapter_id);
+            config.models.insert(
+                "default".to_string(),
+                ModelConfig {
+                    provider: provider.to_string(),
+                    model: "default-model".to_string(),
+                    temperature: None,
+                    api_key_env: None,
+                    base_url: None,
+                    settings: serde_json::Map::new(),
+                    extensions: BTreeMap::new(),
+                },
+            );
             config.models.insert(
                 "review".to_string(),
                 ModelConfig {
@@ -2298,9 +5006,9 @@ mod tests {
 
             let error = resolve_run_plan_from_config(
                 config,
-                ResolveContext::new("/tmp/fabric-temperature"),
+                ResolveContext::new("/tmp/fabric-model-temperature"),
             )
-            .expect_err("adapter does not advertise model temperature");
+            .expect_err("adapter does not advertise non-default model temperature");
 
             assert!(matches!(
                 error,
@@ -2314,10 +5022,143 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_model_base_url_on_non_default_role_reports_canonical_field() {
+        let mut config = typed_config("nvidia.fabric.claude");
+        config.models.insert(
+            "default".to_string(),
+            ModelConfig {
+                provider: "anthropic".to_string(),
+                model: "default-model".to_string(),
+                temperature: None,
+                api_key_env: None,
+                base_url: None,
+                settings: serde_json::Map::new(),
+                extensions: BTreeMap::new(),
+            },
+        );
+        config.models.insert(
+            "review".to_string(),
+            ModelConfig {
+                provider: "anthropic".to_string(),
+                model: "review-model".to_string(),
+                temperature: None,
+                api_key_env: None,
+                base_url: Some("https://example.test/v1".to_string()),
+                settings: serde_json::Map::new(),
+                extensions: BTreeMap::new(),
+            },
+        );
+        let path = repository_root().join("adapters/claude/claude.fabric-adapter.json");
+        let mut descriptor = load_adapter_descriptor(&path).expect("Claude descriptor");
+        descriptor
+            .config
+            .accepts
+            .retain(|field| *field != AdapterConfigField::ModelBaseUrl);
+
+        let issues = adapter_config_compatibility_issues(&config, Some(&descriptor));
+
+        assert!(issues.iter().any(|issue| {
+            issue.adapter_id == "nvidia.fabric.claude" && issue.field == "models.review.base_url"
+        }));
+    }
+
+    #[test]
+    fn adapter_model_schemas_accept_native_and_explicit_custom_providers() {
+        for (adapter_id, native_provider) in [
+            ("nvidia.fabric.claude", "anthropic"),
+            ("nvidia.fabric.codex", "openai"),
+        ] {
+            resolve_run_plan_from_config(
+                config_with_model(adapter_id, native_provider),
+                ResolveContext::new("/tmp/fabric-native-provider"),
+            )
+            .expect("adapter-native provider");
+
+            let mut custom = config_with_model(adapter_id, "acme");
+            let model = custom.models.get_mut("default").expect("default model");
+            model.api_key_env = Some("ACME_API_KEY".to_string());
+            model.base_url = Some("https://models.example/v1".to_string());
+            resolve_run_plan_from_config(
+                custom,
+                ResolveContext::new("/tmp/fabric-custom-provider"),
+            )
+            .expect("explicit custom provider");
+        }
+
+        resolve_run_plan_from_config(
+            config_with_model("nvidia.fabric.langchain.deepagents", "acme"),
+            ResolveContext::new("/tmp/fabric-dynamic-provider"),
+        )
+        .expect("adapter without a model schema preserves dynamic providers");
+    }
+
+    #[test]
+    fn adapter_model_schemas_validate_every_model_role() {
+        for (adapter_id, native_provider) in [
+            ("nvidia.fabric.claude", "anthropic"),
+            ("nvidia.fabric.codex", "openai"),
+        ] {
+            let mut config = config_with_model(adapter_id, native_provider);
+            config.models.insert(
+                "review".to_string(),
+                ModelConfig {
+                    provider: "acme".to_string(),
+                    model: "review-model".to_string(),
+                    temperature: None,
+                    api_key_env: None,
+                    base_url: None,
+                    settings: serde_json::Map::new(),
+                    extensions: BTreeMap::new(),
+                },
+            );
+            let path = repository_root().join(match adapter_id {
+                "nvidia.fabric.claude" => "adapters/claude/claude.fabric-adapter.json",
+                "nvidia.fabric.codex" => "adapters/codex/codex.fabric-adapter.json",
+                _ => unreachable!("test adapter"),
+            });
+            let descriptor = load_adapter_descriptor(&path).expect("adapter descriptor");
+
+            let fields = adapter_config_compatibility_issues(&config, Some(&descriptor))
+                .into_iter()
+                .map(|issue| issue.field)
+                .collect::<BTreeSet<_>>();
+
+            assert!(fields.contains("models.review.base_url"));
+            assert!(fields.contains("models.review.api_key_env"));
+        }
+    }
+
+    #[test]
+    fn adapter_model_schema_rejects_undeclared_settings() {
+        let mut config = config_with_model("nvidia.fabric.claude", "anthropic");
+        config
+            .models
+            .get_mut("default")
+            .expect("default model")
+            .settings
+            .insert("api_timeout".to_string(), serde_json::json!(30));
+
+        let error =
+            resolve_run_plan_from_config(config, ResolveContext::new("/tmp/fabric-model-settings"))
+                .expect_err("undeclared model setting");
+
+        assert!(matches!(
+            error,
+            FabricError::AdapterCompatibility {
+                adapter_id,
+                field,
+                ..
+            } if adapter_id == "nvidia.fabric.claude"
+                && field == "models.default.settings.api_timeout"
+        ));
+    }
+
+    #[test]
     fn unsupported_enabled_tools_report_canonical_field() {
         let adapter_id = "nvidia.fabric.codex";
         let mut config = typed_config(adapter_id);
         config.tools = Some(ToolsConfig {
+            definitions: BTreeMap::new(),
             enabled: Some(vec!["terminal".to_string()]),
             blocked: Vec::new(),
             extensions: BTreeMap::new(),
@@ -2390,6 +5231,7 @@ mod tests {
     fn enabled_and_blocked_tool_policies_are_routed_independently() {
         let mut config = typed_config("nvidia.fabric.hermes");
         config.tools = Some(ToolsConfig {
+            definitions: BTreeMap::new(),
             enabled: Some(Vec::new()),
             blocked: vec!["browser".to_string()],
             extensions: BTreeMap::new(),
@@ -2410,6 +5252,7 @@ mod tests {
     fn unsupported_tool_policy_fails_during_planning() {
         let mut config = typed_config("nvidia.fabric.codex");
         config.tools = Some(ToolsConfig {
+            definitions: BTreeMap::new(),
             enabled: None,
             blocked: vec!["Bash".to_string()],
             extensions: BTreeMap::new(),
@@ -2438,9 +5281,15 @@ mod tests {
             servers: BTreeMap::from([(
                 "docs".to_string(),
                 McpServerConfig {
-                    transport: "streamable-http".to_string(),
+                    transport: McpTransport::StreamableHttp,
                     url: "https://mcp.example".to_string(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                    authentication: None,
+                    custom_headers: BTreeMap::new(),
                     exposure: McpExposure::FabricManaged,
+                    allowed_tools: None,
+                    blocked_tools: Vec::new(),
                     extensions: BTreeMap::new(),
                 },
             )]),
@@ -2464,9 +5313,240 @@ mod tests {
     }
 
     #[test]
+    fn mcp_authentication_requires_an_explicit_adapter_claim() {
+        for (authentication, capability) in [
+            (serde_json::json!({"type": "oauth2"}), "mcp.auth.oauth2"),
+            (
+                serde_json::json!({
+                    "type": "service_account",
+                    "client_id": "fabric-client",
+                    "client_secret_env": "MCP_CLIENT_SECRET",
+                    "token_url": "https://auth.example/token",
+                    "token_endpoint_auth_method": "client_secret_basic"
+                }),
+                "mcp.auth.service_account",
+            ),
+        ] {
+            let mut config = typed_config("nvidia.fabric.claude");
+            config.mcp = Some(McpConfig {
+                servers: BTreeMap::from([(
+                    "docs".to_string(),
+                    serde_json::from_value(serde_json::json!({
+                        "transport": "streamable-http",
+                        "url": "https://mcp.example/docs",
+                        "exposure": "harness_native",
+                        "authentication": authentication,
+                    }))
+                    .expect("authenticated MCP server"),
+                )]),
+                extensions: BTreeMap::new(),
+            });
+
+            let error = resolve_run_plan_from_config(
+                config,
+                ResolveContext::new("/tmp/fabric-unsupported-mcp-authentication"),
+            )
+            .expect_err("Claude does not advertise MCP authentication support");
+
+            match error {
+                FabricError::AdapterCompatibility {
+                    adapter_id,
+                    field,
+                    reason,
+                } => {
+                    assert_eq!(adapter_id, "nvidia.fabric.claude");
+                    assert_eq!(field, "mcp.servers.docs.authentication");
+                    assert!(reason.contains(capability), "{reason}");
+                }
+                error => panic!("unexpected error: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_tool_filters_survive_capability_planning() {
+        let path = repository_root().join("adapters/claude/claude.fabric-adapter.json");
+        let mut descriptor = load_adapter_descriptor(&path).expect("Claude descriptor");
+        descriptor
+            .config
+            .accepts
+            .push(AdapterConfigField::McpToolFilters);
+        let resolved = resolved_adapter(path, descriptor);
+        let mut config = typed_config("nvidia.fabric.claude");
+        config.mcp = Some(McpConfig {
+            servers: BTreeMap::from([(
+                "docs".to_string(),
+                McpServerConfig {
+                    transport: McpTransport::StreamableHttp,
+                    url: "https://mcp.example".to_string(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                    authentication: None,
+                    custom_headers: BTreeMap::new(),
+                    exposure: McpExposure::HarnessNative,
+                    allowed_tools: Some(Vec::new()),
+                    blocked_tools: vec!["delete".to_string()],
+                    extensions: BTreeMap::new(),
+                },
+            )]),
+            extensions: BTreeMap::new(),
+        });
+
+        let plan = resolve_capability_plan(
+            &config,
+            Path::new("/tmp/fabric-mcp-filters"),
+            Some(&resolved),
+        );
+        let server = plan
+            .native
+            .mcp_servers
+            .get("docs")
+            .expect("native MCP server");
+
+        assert_eq!(server.allowed_tools, Some(Vec::new()));
+        assert_eq!(server.blocked_tools, vec!["delete".to_string()]);
+        let value = serde_json::to_value(server).expect("MCP server plan JSON");
+        assert_eq!(value["allowed_tools"], serde_json::json!([]));
+        assert_eq!(value["blocked_tools"], serde_json::json!(["delete"]));
+    }
+
+    #[test]
+    fn mcp_tool_filters_require_an_explicit_adapter_claim() {
+        for (allowed_tools, blocked_tools, expected_field) in [
+            (
+                Some(vec!["search".to_string()]),
+                Vec::new(),
+                "mcp.servers.docs.allowed_tools",
+            ),
+            (
+                None,
+                vec!["delete".to_string()],
+                "mcp.servers.docs.blocked_tools",
+            ),
+        ] {
+            let mut config = typed_config("nvidia.fabric.claude");
+            config.mcp = Some(McpConfig {
+                servers: BTreeMap::from([(
+                    "docs".to_string(),
+                    McpServerConfig {
+                        transport: McpTransport::StreamableHttp,
+                        url: "https://mcp.example".to_string(),
+                        args: Vec::new(),
+                        env: BTreeMap::new(),
+                        authentication: None,
+                        custom_headers: BTreeMap::new(),
+                        exposure: McpExposure::HarnessNative,
+                        allowed_tools,
+                        blocked_tools,
+                        extensions: BTreeMap::new(),
+                    },
+                )]),
+                extensions: BTreeMap::new(),
+            });
+
+            let error = resolve_run_plan_from_config(
+                config,
+                ResolveContext::new("/tmp/fabric-unsupported-mcp-filters"),
+            )
+            .expect_err("Claude does not advertise per-server MCP tool filters");
+
+            assert!(matches!(
+                error,
+                FabricError::AdapterCompatibility {
+                    adapter_id,
+                    field,
+                    ..
+                } if adapter_id == "nvidia.fabric.claude" && field == expected_field
+            ));
+        }
+    }
+
+    #[test]
+    fn overlapping_mcp_tool_policy_is_invalid() {
+        let mut config = typed_config("nvidia.fabric.hermes");
+        config.mcp = Some(McpConfig {
+            servers: BTreeMap::from([(
+                "docs".to_string(),
+                McpServerConfig {
+                    transport: McpTransport::StreamableHttp,
+                    url: "https://mcp.example".to_string(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                    authentication: None,
+                    custom_headers: BTreeMap::new(),
+                    exposure: McpExposure::HarnessNative,
+                    allowed_tools: Some(vec!["search".to_string()]),
+                    blocked_tools: vec!["search".to_string()],
+                    extensions: BTreeMap::new(),
+                },
+            )]),
+            extensions: BTreeMap::new(),
+        });
+
+        let error = resolve_run_plan_from_config(
+            config,
+            ResolveContext::new("/tmp/fabric-invalid-mcp-filters"),
+        )
+        .expect_err("overlapping MCP tool policy");
+
+        assert!(matches!(
+            error,
+            FabricError::InvalidConfig { field, .. } if field == "mcp.servers.docs"
+        ));
+    }
+
+    #[test]
+    fn empty_mcp_tool_names_are_invalid() {
+        for (allowed_tools, blocked_tools, expected_field) in [
+            (
+                Some(vec!["".to_string()]),
+                Vec::new(),
+                "mcp.servers.docs.allowed_tools",
+            ),
+            (
+                None,
+                vec!["  ".to_string()],
+                "mcp.servers.docs.blocked_tools",
+            ),
+        ] {
+            let mut config = typed_config("nvidia.fabric.hermes");
+            config.mcp = Some(McpConfig {
+                servers: BTreeMap::from([(
+                    "docs".to_string(),
+                    McpServerConfig {
+                        transport: McpTransport::StreamableHttp,
+                        url: "https://mcp.example".to_string(),
+                        args: Vec::new(),
+                        env: BTreeMap::new(),
+                        authentication: None,
+                        custom_headers: BTreeMap::new(),
+                        exposure: McpExposure::HarnessNative,
+                        allowed_tools,
+                        blocked_tools,
+                        extensions: BTreeMap::new(),
+                    },
+                )]),
+                extensions: BTreeMap::new(),
+            });
+
+            let error = resolve_run_plan_from_config(
+                config,
+                ResolveContext::new("/tmp/fabric-invalid-mcp-tool-name"),
+            )
+            .expect_err("empty MCP tool name");
+
+            assert!(matches!(
+                error,
+                FabricError::InvalidConfig { field, .. } if field == expected_field
+            ));
+        }
+    }
+
+    #[test]
     fn overlapping_tool_policy_is_invalid() {
         let mut config = typed_config("nvidia.fabric.hermes");
         config.tools = Some(ToolsConfig {
+            definitions: BTreeMap::new(),
             enabled: Some(vec!["browser".to_string()]),
             blocked: vec!["browser".to_string()],
             extensions: BTreeMap::new(),
@@ -2484,16 +5564,719 @@ mod tests {
 
     #[test]
     fn loads_and_validates_json_adapter_descriptor() {
-        let descriptor =
-            load_adapter_descriptor(repository_root().join("adapters/hermes/fabric-adapter.json"))
-                .expect("adapter descriptor");
+        let descriptor = load_adapter_descriptor(
+            repository_root().join("adapters/hermes/hermes.fabric-adapter.json"),
+        )
+        .expect("adapter descriptor");
 
         assert_eq!(descriptor.contract_version, ADAPTER_CONTRACT_VERSION);
         assert_eq!(descriptor.adapter_kind, AdapterKind::Python);
     }
 
     #[test]
-    fn resolves_additional_adapter_directory_before_agent_local_override() {
+    fn rejects_removed_adapter_descriptor_fields() {
+        let path = repository_root().join("adapters/hermes/hermes.fabric-adapter.json");
+        let descriptor = load_adapter_descriptor(&path).expect("adapter descriptor");
+
+        for field in ["harness", "workflow_schema"] {
+            let mut invalid = descriptor.clone();
+            invalid
+                .extensions
+                .insert(field.to_string(), serde_json::json!({}));
+            let error = validate_adapter_descriptor_shape(&invalid, &path)
+                .expect_err("removed field must fail");
+            assert!(matches!(
+                error,
+                FabricError::InvalidAdapterDescriptor { message, .. }
+                    if message.contains(field)
+            ));
+        }
+    }
+
+    #[test]
+    fn validates_repository_claude_settings_without_applying_defaults() {
+        let mut config = typed_config("nvidia.fabric.claude");
+        config.harness.as_mut().expect("harness").settings = serde_json::Map::from_iter([
+            (
+                "setting_sources".to_string(),
+                serde_json::json!(["user", "project", "local"]),
+            ),
+            ("max_budget_usd".to_string(), serde_json::json!(1.5)),
+            ("permission_mode".to_string(), serde_json::json!("dontAsk")),
+        ]);
+        let expected = config.harness.as_ref().expect("harness").settings.clone();
+
+        let plan = resolve_run_plan_from_config(
+            config,
+            ResolveContext::new("/tmp/nemo-fabric-claude-settings"),
+        )
+        .expect("valid Claude settings");
+
+        assert_eq!(
+            plan.config.harness.as_ref().expect("harness").settings,
+            expected
+        );
+        let resolved = plan.adapter_descriptor.expect("resolved Claude descriptor");
+        assert_eq!(resolved.primary().source, DescriptorSource::Bundled);
+        assert_eq!(resolved.descriptor.adapter_id, "nvidia.fabric.claude");
+
+        let mut config_without_default = typed_config("nvidia.fabric.claude");
+        config_without_default
+            .harness
+            .as_mut()
+            .expect("harness")
+            .settings
+            .insert("permission_mode".to_string(), serde_json::json!("default"));
+        let plan = resolve_run_plan_from_config(
+            config_without_default,
+            ResolveContext::new("/tmp/nemo-fabric-claude-settings"),
+        )
+        .expect("valid Claude settings without optional default");
+        assert!(
+            !plan
+                .config
+                .harness
+                .as_ref()
+                .expect("harness")
+                .settings
+                .contains_key("setting_sources")
+        );
+    }
+
+    #[test]
+    fn validates_workflow_against_resolved_target_schema() {
+        let path = repository_root().join("adapters/claude/claude.fabric-adapter.json");
+        let resolved = resolved_workflow_target(path.clone(), Some(workflow_settings_schema()));
+        let mut config = typed_config("nvidia.fabric.claude");
+        config.workflow = Some(typed_workflow());
+
+        validate_workflow(&config, Some(&resolved)).expect("valid workflow");
+
+        config
+            .workflow
+            .as_mut()
+            .expect("workflow")
+            .settings
+            .insert("llm_name".to_string(), serde_json::json!(7));
+        let error = validate_workflow(&config, Some(&resolved))
+            .expect_err("invalid workflow setting must fail");
+        assert!(matches!(
+            error,
+            FabricError::InvalidWorkflow {
+                adapter_id,
+                descriptor_source: DescriptorSource::Bundled,
+                descriptor_path,
+                workflow_path,
+                reason,
+            } if adapter_id == "test.fabric.adapter"
+                && descriptor_path == path
+                && workflow_path == "workflow.settings.llm_name"
+                && reason.contains("adapter target settings schema")
+        ));
+    }
+
+    #[test]
+    fn validates_and_projects_normalized_tool_definitions() {
+        let path = repository_root().join("adapters/claude/claude.fabric-adapter.json");
+        let mut descriptor = load_adapter_descriptor(&path).expect("Claude descriptor");
+        descriptor
+            .config
+            .accepts
+            .push(AdapterConfigField::ToolDefinitions);
+        descriptor.tool_definition_schema = Some(tool_definition_schema());
+        descriptor.extension_schemas.insert(
+            AdapterExtensionPoint::ToolDefinition,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"profile": {"const": "strict"}},
+                "required": ["profile"],
+                "additionalProperties": false
+            })
+            .as_object()
+            .expect("tool extension schema")
+            .clone(),
+        );
+        let resolved = resolved_adapter(path, descriptor);
+        let mut config = typed_config("nvidia.fabric.claude");
+        config.skills = None;
+        config.tools = Some(ToolsConfig {
+            definitions: BTreeMap::from([(
+                "email_phishing_analyzer".to_string(),
+                ToolDefinitionConfig {
+                    kind: "function".to_string(),
+                    r#ref: "email_phishing_analyzer".to_string(),
+                    settings: serde_json::Map::from_iter([(
+                        "llm".to_string(),
+                        serde_json::json!("default"),
+                    )]),
+                    extensions: BTreeMap::from([(
+                        "profile".to_string(),
+                        serde_json::json!("strict"),
+                    )]),
+                },
+            )]),
+            enabled: Some(vec!["email_phishing_analyzer".to_string()]),
+            blocked: vec!["browser".to_string()],
+            extensions: BTreeMap::new(),
+        });
+
+        validate_tool_definitions(&config, Some(&resolved)).expect("valid definition");
+        validate_agent_config_extensions(&config, Some(&resolved), None)
+            .expect("valid definition extension");
+        let capability_plan = resolve_capability_plan(
+            &config,
+            Path::new("/tmp/fabric-tool-definitions"),
+            Some(&resolved),
+        );
+        let agent_config =
+            project_agent_config(&config, &capability_plan, Some(&resolved.descriptor), None);
+        let definition = agent_config
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.definitions.get("email_phishing_analyzer"))
+            .expect("projected definition");
+        assert_eq!(definition.kind, "function");
+        assert_eq!(definition.r#ref, "email_phishing_analyzer");
+        assert_eq!(definition.settings["llm"], "default");
+        assert_eq!(definition.extensions["profile"], "strict");
+        assert_eq!(
+            capability_plan.tools.definitions,
+            config.tools.as_ref().expect("tools").definitions
+        );
+        assert_eq!(
+            agent_config.tools.as_ref().expect("agent tools").enabled,
+            capability_plan.tools.enabled
+        );
+        assert_eq!(
+            agent_config.tools.as_ref().expect("agent tools").blocked,
+            capability_plan.tools.blocked
+        );
+
+        config
+            .tools
+            .as_mut()
+            .expect("tools")
+            .definitions
+            .get_mut("email_phishing_analyzer")
+            .expect("definition")
+            .settings
+            .insert("unknown".to_string(), serde_json::json!(true));
+        let error = validate_tool_definitions(&config, Some(&resolved))
+            .expect_err("unknown definition setting");
+        assert!(matches!(
+            error,
+            FabricError::InvalidToolDefinition { definition_path, .. }
+                if definition_path == "tools.definitions.email_phishing_analyzer.settings.unknown"
+        ));
+    }
+
+    #[test]
+    fn adapter_extensions_are_fail_closed_and_schema_validated() {
+        let path = repository_root().join("adapters/claude/claude.fabric-adapter.json");
+        let mut descriptor = load_adapter_descriptor(&path).expect("Claude descriptor");
+        let resolved = resolved_adapter(path.clone(), descriptor.clone());
+        let mut config = typed_config("nvidia.fabric.claude");
+        config.skills = None;
+        config.models.insert(
+            "default".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "nvidia",
+                "model": "test-model",
+                "profile": "fast"
+            }))
+            .expect("model extension"),
+        );
+
+        let error = validate_agent_config_extensions(&config, Some(&resolved), None)
+            .expect_err("undeclared extension schema");
+        assert!(matches!(
+            error,
+            FabricError::AdapterCompatibility { field, .. } if field == "models.default"
+        ));
+
+        descriptor.extension_schemas.insert(
+            AdapterExtensionPoint::Model,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"profile": {"enum": ["fast", "accurate"]}},
+                "required": ["profile"],
+                "additionalProperties": false
+            })
+            .as_object()
+            .expect("model extension schema")
+            .clone(),
+        );
+        let resolved = resolved_adapter(path.clone(), descriptor);
+        validate_agent_config_extensions(&config, Some(&resolved), None)
+            .expect("declared extension is valid");
+
+        config
+            .models
+            .get_mut("default")
+            .expect("default model")
+            .extensions
+            .insert("profile".to_string(), serde_json::json!("slow"));
+        let error = validate_agent_config_extensions(&config, Some(&resolved), None)
+            .expect_err("invalid extension value");
+        assert!(matches!(
+            error,
+            FabricError::InvalidAdapterExtension { extension_path, .. }
+                if extension_path == "models.default.profile"
+        ));
+    }
+
+    #[test]
+    fn invocation_extensions_are_fail_closed_and_schema_validated() {
+        let path = repository_root().join("adapters/claude/claude.fabric-adapter.json");
+        let mut descriptor = load_adapter_descriptor(&path).expect("Claude descriptor");
+        let request = AgentRunRequest {
+            input: serde_json::json!("review"),
+            context: BTreeMap::new(),
+            extensions: BTreeMap::from([("profile".to_string(), serde_json::json!("strict"))]),
+        };
+
+        let resolved = resolved_adapter(path.clone(), descriptor.clone());
+        let error = validate_agent_run_request_extensions(&request, Some(&resolved))
+            .expect_err("undeclared request extension schema");
+        assert!(matches!(
+            error,
+            FabricError::AdapterCompatibility { field, .. } if field == "request.extensions"
+        ));
+
+        descriptor.extension_schemas.insert(
+            AdapterExtensionPoint::RunRequest,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"profile": {"const": "strict"}},
+                "required": ["profile"],
+                "additionalProperties": false
+            })
+            .as_object()
+            .expect("request extension schema")
+            .clone(),
+        );
+        let resolved = resolved_adapter(path.clone(), descriptor.clone());
+        validate_agent_run_request_extensions(&request, Some(&resolved))
+            .expect("declared request extension");
+
+        let result: AgentRunResult = serde_json::from_value(serde_json::json!({
+            "status": "succeeded",
+            "output": "done",
+            "extensions": {"trace_id": "trace-1"}
+        }))
+        .expect("agent result");
+        let error = validate_agent_run_result_extensions(&result, Some(&resolved))
+            .expect_err("undeclared result extension schema");
+        assert!(matches!(
+            error,
+            FabricError::AdapterCompatibility { field, .. } if field == "result.extensions"
+        ));
+
+        descriptor.extension_schemas.insert(
+            AdapterExtensionPoint::RunResult,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"trace_id": {"type": "string"}},
+                "required": ["trace_id"],
+                "additionalProperties": false
+            })
+            .as_object()
+            .expect("result extension schema")
+            .clone(),
+        );
+        let resolved = resolved_adapter(path, descriptor);
+        validate_agent_run_result_extensions(&result, Some(&resolved))
+            .expect("declared result extension");
+    }
+
+    #[test]
+    fn workflow_settings_are_fail_closed() {
+        let path = repository_root().join("adapters/claude/claude.fabric-adapter.json");
+        let resolved = resolved_workflow_target(path, None);
+        let mut config = typed_config("nvidia.fabric.claude");
+        config.workflow = Some(typed_workflow());
+
+        let error = validate_workflow(&config, Some(&resolved))
+            .expect_err("settings without a target schema must fail");
+        assert!(matches!(
+            error,
+            FabricError::InvalidWorkflow { workflow_path, .. }
+                if workflow_path == "workflow.settings.llm_name"
+        ));
+
+        config.workflow.as_mut().expect("workflow").settings.clear();
+        validate_workflow(&config, Some(&resolved)).expect("empty settings need no schema");
+    }
+
+    #[test]
+    fn rejects_blank_target_entrypoint_values() {
+        for (field, value) in [("kind", " "), ("ref", "\t")] {
+            let path = PathBuf::from("target.fabric-target.json");
+            let mut resolved = resolved_workflow_target(path.clone(), None);
+            let entrypoint = match &mut resolved.descriptor.target {
+                AdapterTarget::Workflow(workflow) => &mut workflow.entrypoint,
+            };
+            if field == "kind" {
+                entrypoint.kind = value.to_string();
+            } else {
+                entrypoint.r#ref = value.to_string();
+            }
+
+            let error = validate_adapter_target_descriptor_shape(&resolved.descriptor, &path)
+                .expect_err("blank entrypoint must fail");
+            assert!(matches!(
+                error,
+                FabricError::InvalidAdapterTargetDescriptor { message, .. }
+                    if message.contains(&format!("spec.entrypoint.{field}"))
+            ));
+        }
+    }
+
+    #[test]
+    fn validates_empty_settings_against_a_present_schema() {
+        let path = repository_root().join("adapters/claude/claude.fabric-adapter.json");
+        let mut descriptor = load_adapter_descriptor(&path).expect("Claude descriptor");
+        descriptor.settings_schema = Some(
+            serde_json::json!({
+                "type": "object",
+                "$defs": {
+                    "token": {"type": "string"}
+                },
+                "properties": {
+                    "token": {"$ref": "#/$defs/token"}
+                },
+                "required": ["token"],
+                "additionalProperties": false
+            })
+            .as_object()
+            .expect("object schema")
+            .clone(),
+        );
+        let resolved = resolved_adapter(path.clone(), descriptor);
+
+        let mut valid_config = typed_config("nvidia.fabric.claude");
+        valid_config
+            .harness
+            .as_mut()
+            .expect("harness")
+            .settings
+            .insert("token".to_string(), serde_json::json!("valid"));
+        validate_harness_settings(&valid_config, Some(&resolved))
+            .expect("self-contained schema reference");
+
+        let error =
+            validate_harness_settings(&typed_config("nvidia.fabric.claude"), Some(&resolved))
+                .expect_err("required setting");
+
+        assert!(matches!(
+            error,
+            FabricError::InvalidHarnessSettings {
+                adapter_id,
+                descriptor_source: DescriptorSource::Bundled,
+                descriptor_path,
+                settings_path,
+                ..
+            } if adapter_id == "nvidia.fabric.claude"
+                && descriptor_path == path
+                && settings_path == "harness.settings.token"
+        ));
+    }
+
+    #[test]
+    fn reports_item_path_after_prefix_items() {
+        let path = repository_root().join("adapters/claude/claude.fabric-adapter.json");
+        let mut descriptor = load_adapter_descriptor(&path).expect("Claude descriptor");
+        descriptor.settings_schema = Some(
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "values": {
+                        "type": "array",
+                        "prefixItems": [
+                            {"type": "string"},
+                            {"type": "string"}
+                        ],
+                        "items": {"type": "boolean"}
+                    }
+                },
+                "additionalProperties": false
+            })
+            .as_object()
+            .expect("object schema")
+            .clone(),
+        );
+        let resolved = resolved_adapter(path, descriptor);
+        let mut config = typed_config("nvidia.fabric.claude");
+        config.harness.as_mut().expect("harness").settings.insert(
+            "values".to_string(),
+            serde_json::json!(["first", "second", "invalid"]),
+        );
+
+        let error = validate_harness_settings(&config, Some(&resolved))
+            .expect_err("item after prefixItems has the wrong type");
+
+        assert!(matches!(
+            error,
+            FabricError::InvalidHarnessSettings { settings_path, .. }
+                if settings_path == "harness.settings.values.2"
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_repository_claude_settings_with_descriptor_context() {
+        let cases = [
+            (
+                "unknown",
+                serde_json::json!(true),
+                "harness.settings.unknown",
+            ),
+            (
+                "permission_mode",
+                serde_json::json!("invalid"),
+                "harness.settings.permission_mode",
+            ),
+            (
+                "permission_mode",
+                serde_json::json!(false),
+                "harness.settings.permission_mode",
+            ),
+            (
+                "max_budget_usd",
+                serde_json::json!(0),
+                "harness.settings.max_budget_usd",
+            ),
+            (
+                "setting_sources",
+                serde_json::json!(["user", "invalid"]),
+                "harness.settings.setting_sources.1",
+            ),
+        ];
+
+        for (name, value, expected_path) in cases {
+            let mut config = typed_config("nvidia.fabric.claude");
+            config
+                .harness
+                .as_mut()
+                .expect("harness")
+                .settings
+                .insert(name.to_string(), value);
+
+            let error = resolve_run_plan_from_config(
+                config,
+                ResolveContext::new("/tmp/nemo-fabric-claude-settings"),
+            )
+            .expect_err("invalid Claude settings");
+
+            assert!(matches!(
+                error,
+                FabricError::InvalidHarnessSettings {
+                    adapter_id,
+                    descriptor_source: DescriptorSource::Bundled,
+                    descriptor_path,
+                    settings_path,
+                    ..
+                } if adapter_id == "nvidia.fabric.claude"
+                    && descriptor_path.ends_with("adapters/claude/claude.fabric-adapter.json")
+                    && settings_path == expected_path
+            ));
+        }
+    }
+
+    #[test]
+    fn unknown_adapter_precedes_harness_settings_validation() {
+        let mut config = typed_config("test.fabric.missing");
+        config
+            .harness
+            .as_mut()
+            .expect("harness")
+            .settings
+            .insert("unknown".to_string(), serde_json::json!(true));
+
+        let error = resolve_run_plan_from_config(config, ResolveContext::new(repository_root()))
+            .expect_err("missing adapter");
+
+        assert!(matches!(
+            error,
+            FabricError::UnknownAdapter { adapter_id, .. } if adapter_id == "test.fabric.missing"
+        ));
+    }
+
+    #[test]
+    fn malformed_adapter_settings_schema_fails_descriptor_loading() {
+        struct RemoveFileOnDrop(PathBuf);
+
+        impl Drop for RemoveFileOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "nemo-fabric-malformed-settings-schema-{}.json",
+            std::process::id()
+        ));
+        let _cleanup = RemoveFileOnDrop(path.clone());
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "contract_version": ADAPTER_CONTRACT_VERSION,
+                "adapter_id": "test.fabric.malformed",
+                "adapter_kind": "python",
+                "settings_schema": {"type": 7}
+            }))
+            .expect("descriptor JSON"),
+        )
+        .expect("write malformed descriptor");
+
+        let error = load_adapter_descriptor(&path).expect_err("malformed settings schema");
+
+        assert!(matches!(
+            error,
+            FabricError::InvalidAdapterDescriptor {
+                path: error_path,
+                message,
+            } if error_path == path && message.contains("settings_schema")
+        ));
+    }
+
+    #[test]
+    fn adapter_settings_schema_root_type_must_allow_objects() {
+        let path = repository_root().join("adapters/claude/claude.fabric-adapter.json");
+        let valid_descriptor = load_adapter_descriptor(&path).expect("Claude descriptor");
+
+        for root_type in ["string", "array"] {
+            let mut descriptor = valid_descriptor.clone();
+            descriptor.settings_schema = Some(
+                serde_json::json!({"type": root_type})
+                    .as_object()
+                    .expect("settings schema object")
+                    .clone(),
+            );
+
+            let error = validate_adapter_descriptor_shape(&descriptor, &path)
+                .expect_err("non-object settings schema");
+
+            assert!(matches!(
+                error,
+                FabricError::InvalidAdapterDescriptor {
+                    path: error_path,
+                    message,
+                } if error_path == path
+                    && message.contains(
+                        "settings_schema root type must allow object instances"
+                    )
+            ));
+        }
+    }
+
+    #[test]
+    fn adapter_model_schema_must_be_valid_and_allow_objects() {
+        let path = repository_root().join("adapters/claude/claude.fabric-adapter.json");
+        let valid_descriptor = load_adapter_descriptor(&path).expect("Claude descriptor");
+
+        for (schema, expected) in [
+            (
+                serde_json::json!({"type": 7}),
+                "model_schema is not valid JSON Schema",
+            ),
+            (
+                serde_json::json!({"type": "string"}),
+                "model_schema root type must allow object instances",
+            ),
+        ] {
+            let mut descriptor = valid_descriptor.clone();
+            descriptor.model_schema =
+                Some(schema.as_object().expect("model schema object").clone());
+
+            let error = validate_adapter_descriptor_shape(&descriptor, &path)
+                .expect_err("invalid model schema");
+            assert!(matches!(
+                error,
+                FabricError::InvalidAdapterDescriptor {
+                    path: error_path,
+                    message,
+                } if error_path == path && message.contains(expected)
+            ));
+        }
+    }
+
+    #[test]
+    fn adapter_target_settings_schema_must_be_valid_and_allow_objects() {
+        let path = repository_root().join("adapters/claude/claude.fabric-adapter.json");
+
+        for (schema, expected) in [
+            (
+                serde_json::json!({"type": 7}),
+                "spec.settings_schema is not valid JSON Schema",
+            ),
+            (
+                serde_json::json!({"type": "string"}),
+                "spec.settings_schema root type must allow object instances",
+            ),
+        ] {
+            let mut descriptor = resolved_workflow_target(path.clone(), None).descriptor;
+            let AdapterTarget::Workflow(workflow) = &mut descriptor.target;
+            workflow.settings_schema = Some(
+                schema
+                    .as_object()
+                    .expect("workflow settings schema object")
+                    .clone(),
+            );
+
+            let error = validate_adapter_target_descriptor_shape(&descriptor, &path)
+                .expect_err("invalid workflow settings schema");
+            assert!(matches!(
+                error,
+                FabricError::InvalidAdapterTargetDescriptor {
+                    path: error_path,
+                    message,
+                } if error_path == path && message.contains(expected)
+            ));
+        }
+    }
+
+    #[test]
+    fn external_settings_schema_reference_fails_descriptor_loading() {
+        struct RemoveFileOnDrop(PathBuf);
+
+        impl Drop for RemoveFileOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "nemo-fabric-external-settings-schema-{}.json",
+            std::process::id()
+        ));
+        let _cleanup = RemoveFileOnDrop(path.clone());
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "contract_version": ADAPTER_CONTRACT_VERSION,
+                "adapter_id": "test.fabric.external-schema",
+                "adapter_kind": "python",
+                "settings_schema": {
+                    "$ref": "https://schemas.example.test/settings.json"
+                }
+            }))
+            .expect("descriptor JSON"),
+        )
+        .expect("write descriptor with external schema reference");
+
+        let error = load_adapter_descriptor(&path).expect_err("external settings schema");
+
+        assert!(matches!(
+            error,
+            FabricError::InvalidAdapterDescriptor {
+                path: error_path,
+                message,
+            } if error_path == path && message.contains("settings_schema")
+        ));
+    }
+
+    #[test]
+    fn descriptor_registry_deduplicates_identical_records_and_rejects_conflicts() {
         struct RemoveDirOnDrop(PathBuf);
 
         impl Drop for RemoveDirOnDrop {
@@ -2509,16 +6292,23 @@ mod tests {
         let _cleanup = RemoveDirOnDrop(root.clone());
         let installed_directory = root.join("installed");
         let base_dir = root.join("agent");
-        let installed_descriptor = installed_directory.join("stopgap/fabric-adapter.json");
-        let local_descriptor = base_dir.join("adapters/stopgap/fabric-adapter.json");
-        let descriptor = |module: &str| {
+        let installed_descriptor =
+            installed_directory.join("stopgap/installed.fabric-adapter.json");
+        let local_descriptor = base_dir.join("metadata/local.fabric-adapter.json");
+        let descriptor = |module: &str, setting: &str| {
             serde_json::json!({
                 "contract_version": ADAPTER_CONTRACT_VERSION,
                 "adapter_id": "test.fabric.installed",
-                "harness": "installed-test",
                 "adapter_kind": "python",
                 "runner": {"module": module},
-                "config": {"accepts": ["skills"]}
+                "config": {"accepts": ["skills"]},
+                "settings_schema": {
+                    "type": "object",
+                    "properties": {
+                        (setting): {"type": "boolean"}
+                    },
+                    "additionalProperties": false
+                }
             })
         };
 
@@ -2526,12 +6316,20 @@ mod tests {
             .expect("create installed adapter directory");
         std::fs::write(
             &installed_descriptor,
-            serde_json::to_vec_pretty(&descriptor("installed.adapter")).expect("descriptor JSON"),
+            serde_json::to_vec_pretty(&descriptor("installed.adapter", "installed_only"))
+                .expect("descriptor JSON"),
         )
         .expect("write installed descriptor");
 
+        let mut installed_config = typed_config("test.fabric.installed");
+        installed_config
+            .harness
+            .as_mut()
+            .expect("harness")
+            .settings
+            .insert("installed_only".to_string(), serde_json::json!(true));
         let plan = resolve_run_plan_from_config_with_adapter_directories(
-            typed_config("test.fabric.installed"),
+            installed_config.clone(),
             ResolveContext::new(&base_dir),
             std::slice::from_ref(&installed_directory),
         )
@@ -2542,7 +6340,7 @@ mod tests {
         assert_eq!(
             plan.adapter_descriptor
                 .as_ref()
-                .map(|adapter| adapter.path.as_path()),
+                .map(|adapter| adapter.primary().path.as_path()),
             Some(expected_installed_descriptor.as_path())
         );
 
@@ -2550,26 +6348,46 @@ mod tests {
             .expect("create local adapter directory");
         std::fs::write(
             &local_descriptor,
-            serde_json::to_vec_pretty(&descriptor("local.adapter")).expect("descriptor JSON"),
+            serde_json::to_vec_pretty(&descriptor("installed.adapter", "installed_only"))
+                .expect("descriptor JSON"),
         )
         .expect("write local descriptor");
 
+        let mut local_config = installed_config.clone();
+        local_config.discovery = Some(DiscoveryConfig {
+            local_paths: vec![local_descriptor.clone()],
+            extensions: BTreeMap::new(),
+        });
         let plan = resolve_run_plan_from_config_with_adapter_directories(
-            typed_config("test.fabric.installed"),
+            local_config.clone(),
+            ResolveContext::new(&base_dir),
+            std::slice::from_ref(&installed_directory),
+        )
+        .expect("semantically identical records are deduplicated");
+        let resolved = plan.adapter_descriptor.expect("resolved adapter");
+        assert_eq!(resolved.provenance.len(), 2);
+
+        std::fs::write(
+            &local_descriptor,
+            serde_json::to_vec_pretty(&descriptor("local.adapter", "local_only"))
+                .expect("descriptor JSON"),
+        )
+        .expect("write conflicting local descriptor");
+
+        let error = resolve_run_plan_from_config_with_adapter_directories(
+            local_config,
             ResolveContext::new(&base_dir),
             &[installed_directory],
         )
-        .expect("agent-local adapter plan");
-        let resolved = plan.adapter_descriptor.expect("resolved adapter");
-        assert_eq!(
-            resolved.path,
-            local_descriptor
-                .canonicalize()
-                .expect("canonical local descriptor")
-        );
-        assert_eq!(
-            resolved.descriptor.runner["module"],
-            serde_json::json!("local.adapter")
-        );
+        .expect_err("distinct records with one id are ambiguous");
+        assert!(matches!(
+            error,
+            FabricError::AmbiguousDescriptor {
+                descriptor_kind: "adapter",
+                id,
+                paths,
+            } if id == "test.fabric.installed"
+                && paths.len() == 2
+        ));
     }
 }

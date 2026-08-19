@@ -3,6 +3,8 @@
 
 import asyncio
 import json
+import re
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,11 +22,26 @@ SWEBENCH_README = SWEBENCH_ROOT / "README.md"
 SWEBENCH_MCP_CONFIG = SWEBENCH_ROOT / "mcp" / "repo-inspector.mcp.json"
 INTEGRATION_README = ROOT / "examples" / "harbor" / "README.md"
 SDK_INTEGRATION_README = (
-    ROOT / "python" / "src" / "nemo_fabric" / "integrations" / "harbor" / "README.md"
+    ROOT
+    / "sdk"
+    / "python"
+    / "nemo-fabric-runtime"
+    / "src"
+    / "nemo_fabric"
+    / "integrations"
+    / "harbor"
+    / "README.md"
 )
 HARBOR_PACKAGE_INIT = SDK_INTEGRATION_README.parent / "__init__.py"
 
 pytestmark = pytest.mark.usefixtures("requires_harbor")
+
+
+def documented_root_extras(text: str) -> set[str]:
+    extras = set(re.findall(r"--extra\s+([a-z0-9-]+)", text))
+    for selector in re.findall(r"nemo-fabric\[([^]]+)\]", text):
+        extras.update(extra.strip() for extra in selector.split(","))
+    return extras
 
 
 def load_codex_adapter():
@@ -64,7 +81,8 @@ def test_harbor_builder_constructs_complete_config_from_harbor_inputs(tmp_path):
     assert config.mcp is not None
     assert set(config.mcp.servers) == {"remote", "local"}
     assert config.mcp.servers["local"].url == "mcp-server"
-    assert config.mcp.servers["local"].extra_fields["args"] == ["--stdio"]
+    assert config.mcp.servers["local"].args == ["--stdio"]
+    assert "args" not in config.mcp.servers["local"].extra_fields
     assert config.skills is not None
     assert config.skills.paths == [str(tmp_path / "skills")]
     assert (
@@ -202,6 +220,9 @@ def test_each_harbor_job_delegates_to_an_independent_fabric_run(
 
 
 def test_codex_adapter_maps_fabric_request_to_sdk(tmp_path):
+    from nemo_fabric_adapter_contract.models import AgentConfig
+    from nemo_fabric_adapter_contract.models import RuntimeContext
+
     adapter = load_codex_adapter()
 
     payload = {
@@ -223,16 +244,28 @@ def test_codex_adapter_maps_fabric_request_to_sdk(tmp_path):
         },
         "runtime_context": {
             "runtime_id": "harbor-test",
-            "environment": {"workspace": str(tmp_path)},
+            "invocation_id": "harbor-invocation",
+            "request_id": "harbor-request",
+            "environment": {
+                "environment_id": "harbor-environment",
+                "provider": "local",
+                "control_location": "in_env_control",
+                "ownership": "caller_owned",
+                "workspace": str(tmp_path),
+            },
+            "artifacts": {},
         },
         "request": {"input": "Fix the calculator."},
     }
 
-    assert adapter.selected_model(payload) == "gpt-5.4"
-    assert adapter.sandbox(payload) == adapter.Sandbox.workspace_write
-    assert adapter._reasoning_effort(payload) == adapter.ReasoningEffort.high
-    assert adapter.thread_config(payload, relay=None) == {}
-    assert adapter.resolve_cwd(payload) == tmp_path
+    config = AgentConfig.from_mapping(payload["config"])
+    context = RuntimeContext.from_mapping(payload["runtime_context"])
+
+    assert adapter.selected_model(config) == "gpt-5.4"
+    assert adapter.sandbox(config) == adapter.Sandbox.workspace_write
+    assert adapter._reasoning_effort(config) == adapter.ReasoningEffort.high
+    assert adapter.thread_config(config, context, relay=None) == {}
+    assert adapter.resolve_cwd(context, payload["base_dir"]) == tmp_path
 
 
 def test_claude_calculator_run_uses_current_adapter_contract():
@@ -255,7 +288,7 @@ def test_claude_calculator_run_uses_current_adapter_contract():
     dockerfile = CALCULATOR_DOCKERFILE.read_text(encoding="utf-8")
     assert "-e /opt/nemo-fabric/adapters/claude" in dockerfile
     assert "-e /opt/nemo-fabric/adapters/hermes" in dockerfile
-    assert "nemo-fabric[harbor,hermes,hermes-agent,relay,runtime]" in dockerfile
+    assert "nemo-fabric[claude,hermes-agent,relay]" in dockerfile
     assert "@openai/codex" not in dockerfile
 
 
@@ -271,12 +304,14 @@ def test_harbor_smoke_config_resolves_its_local_adapter():
     config = build_harbor_config(
         adapter_id="demo.fabric.scripted",
         workspace="/app",
+        discovery_paths=("adapters",),
     )
     plan = Fabric().plan(config, base_dir=CALCULATOR_FABRIC_ROOT)
 
     assert plan.adapter.adapter_id == "demo.fabric.scripted"
-    assert plan["adapter_descriptor"]["source"] == "local"
-    assert Path(plan["adapter_descriptor"]["root"]).parts[-2:] == (
+    provenance = plan["adapter_descriptor"]["provenance"][0]
+    assert provenance["source"] == "explicit_local"
+    assert Path(provenance["root"]).parts[-2:] == (
         "adapters",
         "scripted",
     )
@@ -284,13 +319,20 @@ def test_harbor_smoke_config_resolves_its_local_adapter():
 
 def test_harbor_calculator_documents_explicit_cli_commands():
     calculator = CALCULATOR_README.read_text(encoding="utf-8")
+    dockerfile = CALCULATOR_DOCKERFILE.read_text(encoding="utf-8")
     landing = INTEGRATION_README.read_text(encoding="utf-8")
     swebench = SWEBENCH_README.read_text(encoding="utf-8")
+    with (ROOT / "sdk/python/nemo-fabric/pyproject.toml").open("rb") as file:
+        sdk_project = tomllib.load(file)["project"]
+    package_version = sdk_project["version"]
+    declared_extras = set(sdk_project["optional-dependencies"])
 
     assert "run.sh" not in calculator
     assert calculator.count(" harbor run \\") == 4
-    assert landing.count("uv run --extra runtime --extra harbor harbor run") == 0
-    assert swebench.count("uv run --extra runtime --extra harbor harbor run") == 5
+    assert calculator.count("uv run --extra harbor harbor run \\") == 4
+    assert "uv run --extra harbor --extra" not in calculator
+    assert landing.count("uv run --extra harbor harbor run") == 0
+    assert swebench.count("uv run --extra harbor harbor run") == 5
     assert "--agent-import-path" not in landing + calculator + swebench
     assert "fabric_config_path" not in calculator
     assert "fabric_config_path" not in landing
@@ -298,18 +340,27 @@ def test_harbor_calculator_documents_explicit_cli_commands():
     assert "fabric_config_factory" not in calculator
     assert "fabric_config_factory" not in landing
     assert "fabric_config_factory" not in swebench
+    assert "fabric_harness_settings" not in calculator
     assert "fabric_workspace=/app" in calculator
-    assert "--model nvidia/nemotron-3-nano-30b-a3b" in calculator
+    assert "--model nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" in calculator
     assert "--model anthropic/claude-sonnet-4-5" in calculator
     assert 'CALCULATOR_DIR="$PWD/examples/harbor/calculator"' in calculator
     assert "calculator/README.md" in landing
     assert "swebench/README.md" in landing
+    assert f"nemo-fabric[harbor]=={package_version}" in landing
+    assert f"nemo-fabric[claude]=={package_version}" in landing
+    assert f"nemo-fabric=={package_version}" in landing
+    assert f"nemo-fabric-adapters-hermes=={package_version}" in landing
+    assert "Hermes Agent 0.20 and later is no longer installable from PyPI" in landing
+    assert documented_root_extras(
+        "\n".join((calculator, dockerfile, landing, swebench))
+    ) <= declared_extras
     assert "fabric_adapter_id" in landing
     assert 'export TMPDIR="$HOME/harbor-tmp"' in landing
     assert "raw.githubusercontent.com/NVIDIA/NeMo-Relay/main/install.sh" in swebench
     assert (
         "FABRIC_PACKAGE="
-        "'nemo-fabric[claude,harbor,hermes-agent,relay,runtime]==0.1.0a20260724'"
+        f"'nemo-fabric[claude,hermes-agent,relay]=={package_version}'"
         in swebench
     )
     assert "PIP_FIND_LINKS" not in swebench
@@ -369,16 +420,22 @@ def test_harbor_calculator_setup_and_solution_fail_fast():
 
 
 def test_harbor_relay_telemetry_exports_direct_atof_and_atif():
+    from nemo_fabric import Fabric
     from nemo_fabric.integrations.harbor.fabric_agent import build_harbor_config
 
     config = build_harbor_config(
         adapter_id="nvidia.fabric.hermes",
         workspace="/app",
-        model_name="nvidia/nemotron-3-nano-30b-a3b",
+        model_name="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
         telemetry="relay",
-    ).to_mapping()
-    assert "relay" in config["telemetry"]["providers"]
-    observability = config["relay"]["observability"]
+    )
+    assert config.harness.settings == {}
+    plan = Fabric().plan(config, base_dir=CALCULATOR_FABRIC_ROOT)
+    assert plan.adapter.adapter_id == "nvidia.fabric.hermes"
+
+    mapping = config.to_mapping()
+    assert "relay" in mapping["telemetry"]["providers"]
+    observability = mapping["relay"]["observability"]
     swebench = SWEBENCH_README.read_text(encoding="utf-8")
 
     assert "openinference" not in observability
@@ -419,7 +476,7 @@ def test_swebench_matrix_translates_harbor_inputs_to_typed_config(tmp_path: Path
         adapter_id="nvidia.fabric.hermes",
         workspace="/testbed",
         telemetry="relay",
-        model_name="nvidia/nemotron-3-nano-30b-a3b",
+        model_name="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
         skills_dir="/harbor/skills",
         mcp_servers=tuple(
             HarborMcpServer.model_validate(server.model_dump(mode="python"))
@@ -442,7 +499,6 @@ def test_swebench_matrix_translates_harbor_inputs_to_typed_config(tmp_path: Path
     claude = build_harbor_config(
         adapter_id="nvidia.fabric.claude",
         workspace="/testbed",
-        harness_settings={"allowed_tools": ["Read"]},
     )
 
     assert base.environment is not None
@@ -452,14 +508,15 @@ def test_swebench_matrix_translates_harbor_inputs_to_typed_config(tmp_path: Path
     assert base.mcp is None
     assert base.tools is None
     assert base.telemetry is None
-    assert relay.models["default"].model == "nvidia/nemotron-3-nano-30b-a3b"
+    assert relay.models["default"].model == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
     assert relay.skills is not None
     assert relay.skills.paths == ["/harbor/skills"]
     assert relay.mcp is not None
     assert set(relay.mcp.servers) == {"fabric-repo-inspector"}
-    assert relay.mcp.servers["fabric-repo-inspector"].extra_fields["args"] == [
+    assert relay.mcp.servers["fabric-repo-inspector"].args == [
         "/tmp/nemo-fabric-config/mcp/repo_inspector.py"
     ]
+    assert "args" not in relay.mcp.servers["fabric-repo-inspector"].extra_fields
     assert tools.tools is not None
     assert tools.tools.blocked == ["browser"]
     assert tools.tools.enabled is None
@@ -474,20 +531,19 @@ def test_swebench_matrix_translates_harbor_inputs_to_typed_config(tmp_path: Path
     assert claude.harness.settings["permission_mode"] == "bypassPermissions"
     assert claude.environment is not None
     assert claude.environment.env == {"IS_SANDBOX": "1"}
-    assert claude.harness.settings["allowed_tools"] == ["Read"]
     assert not list(SWEBENCH_ROOT.rglob("*.yaml"))
     assert not (SWEBENCH_ROOT / "harbor_swebench_config.py").exists()
 
     # TODO: Remove the bundled copies and these equality checks after Fabric
     # discovers adapter descriptors directly from source checkouts and wheels.
-    assert (SWEBENCH_ROOT / "adapters/hermes/fabric-adapter.json").read_text() == (
-        ROOT / "adapters/hermes/fabric-adapter.json"
+    assert (SWEBENCH_ROOT / "adapters/hermes/hermes.fabric-adapter.json").read_text() == (
+        ROOT / "adapters/hermes/hermes.fabric-adapter.json"
     ).read_text()
-    assert (SWEBENCH_ROOT / "adapters/claude/fabric-adapter.json").read_text() == (
-        ROOT / "adapters/claude/fabric-adapter.json"
+    assert (SWEBENCH_ROOT / "adapters/claude/claude.fabric-adapter.json").read_text() == (
+        ROOT / "adapters/claude/claude.fabric-adapter.json"
     ).read_text()
     hermes_descriptor = json.loads(
-        (SWEBENCH_ROOT / "adapters/hermes/fabric-adapter.json").read_text()
+        (SWEBENCH_ROOT / "adapters/hermes/hermes.fabric-adapter.json").read_text()
     )
     assert "models" in hermes_descriptor["config"]["accepts"]
 

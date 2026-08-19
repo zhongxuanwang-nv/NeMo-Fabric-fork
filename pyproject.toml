@@ -1,79 +1,52 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-[build-system]
-requires = [
-  "setuptools>=77",
-]
-build-backend = "setuptools.build_meta"
-
 [project]
-name = "nemo-fabric"
-version = "0.2.0"
-description = "Python SDK distribution for NeMo Fabric"
-authors = [
-  { name = "NVIDIA Corporation" },
-]
-keywords = ["agents", "ai", "nemo-fabric", "runtime", "tools"]
-classifiers = [
-  "Development Status :: 4 - Beta",
-  "Intended Audience :: Developers",
-  "Programming Language :: Python :: 3",
-]
-license = "Apache-2.0"
-license-files = ["LICENSE"]
-readme = "pypi.md"
+name = "nemo-fabric-development"
+version = "0.0.0"
+description = "Development environment for NVIDIA NeMo Fabric"
 requires-python = ">=3.11"
 dependencies = [
-  "nemo-fabric-runtime == 0.2.0",
+  "nemo-fabric",
+  "nemo-fabric-runtime == 0.3.0",
 ]
-
-[project.urls]
-Repository = "https://github.com/NVIDIA/nemo-fabric/"
-Documentation = "https://nvidia-nemo-fabric.docs.buildwithfern.com/nemo/fabric"
-
-[tool.setuptools]
-packages = []
 
 [project.optional-dependencies]
-
-codex = [
-  "nemo-fabric-adapters-codex == 0.2.0",
+claude = [
+  "nemo-fabric[claude]",
 ]
 
-claude = [
-  "nemo-fabric-adapters-claude == 0.2.0",
+codex = [
+  "nemo-fabric[codex]",
 ]
 
 deepagents = [
-  "nemo-fabric-adapters-deepagents == 0.2.0",
+  "nemo-fabric[deepagents]",
+]
+
+mini-swe-agent = [
+  "nemo-fabric[mini-swe-agent]",
+]
+
+pi = [
+  "nemo-fabric[pi]",
 ]
 
 harbor = [
-  "harbor>=0.18,<0.19; python_version >= '3.12'",
-  "pyyaml>=6.0",
-]
-
-hermes = [
-  "nemo-fabric-adapters-hermes == 0.2.0; python_version < '3.14'",
+  "nemo-fabric[harbor]",
 ]
 
 hermes-agent = [
-    "nemo-fabric-adapters-hermes == 0.2.0; python_version < '3.14'",
-    "hermes-agent>=0.17.0; python_version < '3.14'",
+  "nemo-fabric[hermes-agent]; python_version < '3.14'",
 ]
 
 relay = [
-  "nemo-relay>=0.6.0,<0.7",
-  "tomli-w~=1.2", # Needed by adapters to write relay config files
-]
-
-runtime = [
-  "nemo-fabric-runtime == 0.2.0",
+  "nemo-fabric[relay]",
 ]
 
 [dependency-groups]
 adapters = [
+  "nemo-fabric-adapter-contract",
   "nemo-fabric-adapters-common",
   "nemo-fabric-adapters-claude",
   "nemo-fabric-adapters-codex",
@@ -81,14 +54,34 @@ adapters = [
   # and test environments exercise the SDK-native NeMo Relay integration.
   "nemo-fabric-adapters-deepagents[relay]",
   "nemo-fabric-adapters-hermes; python_version < '3.14'",
+  "hermes-agent==0.20.1; python_version < '3.14'",
+  "nemo-fabric-adapters-mini-swe-agent",
+  "nemo-fabric-adapters-pi",
+]
+
+adapter-tests = [
+  "nemo-fabric-adapters-claude[harness]",
+  "nemo-fabric-adapters-codex[harness]",
+  "nemo-fabric-adapters-deepagents[harness]",
+  "nemo-fabric-adapters-hermes[full]; python_version < '3.14'",
+  "nemo-fabric-adapters-mini-swe-agent[harness]",
+  "nemo-fabric-adapters-pi[harness]",
+]
+
+langgraph-example = [
+  "langchain>=1.3,<2.0",
+  "langchain-mcp-adapters>=0.1,<0.3.0",
+  "langchain-openai>=0.3,<2.0",
+  "langgraph>=1.2,<2.0",
+  "mcp>=1.28.1,<2.0",
 ]
 
 dev = [
-    "ipython~=8.20",
-    "pip-licenses>=5,<6",
-    "pkginfo~=1.12",
-    "pre-commit~=4.0",
-    "requests~=2.32",
+  "ipython~=8.20",
+  "pip-licenses>=5,<6",
+  "pkginfo~=1.12",
+  "pre-commit~=4.0",
+  "requests~=2.32",
 ]
 
 docs = [
@@ -103,29 +96,40 @@ package = [
 ]
 
 test = [
-    "fastapi~=0.138",
-    "pytest>=8",
-    "pytest-asyncio>=0.26",
-    "pytest-cov~=7.0",
-    "pyyaml>=6.0",
-    "tomli-w~=1.2",
-    "uvicorn~=0.49",
+  "fastapi~=0.138",
+  "mcp>=1.28.1,<2.0",
+  "mcp-server-time~=2026.7",
+  "pkginfo~=1.12",
+  "pytest>=8",
+  "pytest-asyncio>=0.26",
+  "pytest-cov~=7.0",
+  "pyyaml>=6.0",
+  "requests~=2.32",
+  "starlette>=0.46",
+  "tomli-w~=1.2",
+  "uvicorn~=0.49",
 ]
 
 [tool.uv]
+package = false
 default-groups = ["adapters", "dev", "test"]
-# Keep this override until hermes-agent adopts 12.3.0+.
-override-dependencies = [
-  "pillow>=12.3.0; python_version < '3.14'",
-]
+# Hermes v0.20.1 imports the top-level registration_lifecycle module but omits
+# it from setuptools' py-modules, so standard editable installs cannot import it.
+config-settings-package = { "hermes-agent" = { editable_mode = "compat" } }
 
 [tool.uv.sources]
-nemo-fabric-runtime = { path = "python", editable = true }
+hermes-agent = { path = "external/hermes-agent", editable = true, marker = "python_version < '3.14'" }
+nemo-fabric = { path = "sdk/python/nemo-fabric", editable = true }
+nemo-fabric-runtime = { path = "sdk/python/nemo-fabric-runtime", editable = true }
+nemo-fabric-adapter-contract = { path = "adapter-contract/python", editable = true }
 nemo-fabric-adapters-common = { path = "adapters/common", editable = true }
 nemo-fabric-adapters-claude = { path = "adapters/claude", editable = true }
 nemo-fabric-adapters-codex = { path = "adapters/codex", editable = true }
 nemo-fabric-adapters-deepagents = { path = "adapters/deepagents", editable = true }
 nemo-fabric-adapters-hermes = { path = "adapters/hermes", editable = true }
+nemo-fabric-adapters-mini-swe-agent = { path = "adapters/mini-swe-agent", editable = true }
+nemo-fabric-adapters-pi = { path = "adapters/pi", editable = true }
+nemo-fabric-pi-cli-bin = { path = "adapters/pi-cli-bin", editable = true }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

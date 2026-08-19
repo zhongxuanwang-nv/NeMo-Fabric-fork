@@ -12,17 +12,22 @@ app-server runtime and typed JSON-RPC protocol.
 
 ## Install
 
-To install just the Codex adapter by itself:
+The following table shows which components each installation provides:
 
-```bash
-pip install "nemo-fabric[codex]"
-```
+| Installation | Runtime | Adapter | Harness | NeMo Relay CLI |
+| --- | --- | --- | --- | --- |
+| `pip install "nemo-fabric[codex]"` | Yes | Yes | Yes | Yes |
+| `pip install "nemo-fabric-adapters-codex[harness]"` | No | Yes | Yes | Yes |
+| `pip install nemo-fabric-adapters-codex` | No | Yes | No | No |
 
-To install just the Codex adapter along with the NeMo Fabric Runtime:
+For an environment-managed SDK, use `openai-codex==0.144.4`. For split runtime
+and adapter environments, configure `ADAPTER_PYTHON` and use matching NeMo
+Fabric release versions. Refer to the
+[installation guide](https://docs.nvidia.com/nemo/fabric/getting-started/install#install-an-adapter-and-harness-without-the-runtime).
 
-```bash
-pip install "nemo-fabric[codex, runtime]"
-```
+The `full` extra is equivalent to `harness`. Both install the supported NeMo
+Relay CLI so Relay telemetry and `Runtime.invoke_stream()` work without a
+separate CLI installation.
 
 ## Authentication
 
@@ -58,7 +63,7 @@ NeMo Fabric artifact root, so execution does not depend on or modify a user's
 Codex login. Provider names identify configuration; the adapter does not
 maintain a provider allowlist.
 
-The adapter depends on the Codex SDK, which installs and selects its matching
+The adapter uses the Codex SDK, which installs and selects its matching
 app-server runtime. NeMo Fabric does not declare the runtime package directly or
 treat it as a user-installed command or adapter descriptor requirement.
 
@@ -90,8 +95,8 @@ Use normalized `FabricConfig` fields for portable configuration:
 - `environment.workspace` sets the working directory, and `environment.env`
   supplies explicit harness-visible variables.
 - `mcp` maps stdio, HTTP, and streamable HTTP servers into the Codex thread's
-  `mcp_servers` configuration. For stdio, NeMo Fabric parses `url` as a command plus
-  arguments.
+  `mcp_servers` configuration. For stdio, set `url` to the executable and pass
+  each command-line argument as a separate `args` element.
 - `skills.paths` names skill directories that contain `SKILL.md`. The adapter
   registers each directory as a process-scoped Codex skill root so Codex can
   select matching skills through its normal discovery behavior.
@@ -103,26 +108,36 @@ deny boundary for built-in, local, MCP, and hosted tools. NeMo Fabric therefore
 routes normalized blocked-tool policy as unsupported instead of applying a
 partial policy.
 
-Codex-specific controls belong in `harness.settings`:
+Only Codex-specific controls belong in `harness.settings`:
 
-- `sandbox`: `read-only`, `workspace-write`, or `danger-full-access`
-- `approval_mode`: `auto_review` or `deny_all`
-- `developer_instructions`
-- `personality`, `reasoning_effort`, and `service_tier`
-- `output_schema` for SDK-native structured output
-- `config_overrides` as dotted Codex configuration keys applied when the SDK
-  runtime starts, such as Codex-only MCP timeout or required-server options
+| Setting | Type | Required | Static Default |
+| --- | --- | --- | --- |
+| `sandbox` | One of `read-only`, `workspace-write`, or `danger-full-access` | No | `read-only` |
+| `approval_mode` | One of `auto_review` or `deny_all` | No | `auto_review` |
+| `developer_instructions` | Nonempty string | No | No default |
+| `personality` | One of `none`, `friendly`, or `pragmatic` | No | No default |
+| `reasoning_effort` | One of `none`, `minimal`, `low`, `medium`, `high`, or `xhigh` | No | No default |
+| `service_tier` | Nonempty string | No | No default |
+| `output_schema` | JSON Schema object for the final assistant message | No | No default |
+| `config_overrides` | Object that maps nonempty dotted Codex configuration keys to JSON-compatible values | No | `{}` |
+
+Planning validates these settings against the schema in the resolved Codex
+descriptor. Unknown keys, empty dotted-key segments, invalid types, and invalid
+enum values fail before the adapter starts. Schema defaults are documentation
+only; planning preserves the supplied settings without adding defaults.
+`config_overrides` is the intentional adapter-specific escape hatch for Codex
+configuration that has no normalized NeMo Fabric field.
 
 Set model selection and endpoints through `models`, system instructions through
 `instructions.system`, the invocation deadline through
 `runtime.timeout_seconds`, and the working directory and explicit environment
-through `environment`.
+through `environment`. In particular, the SDK's `base_instructions` value comes
+from `instructions.system`, not `harness.settings`.
 
 For `Fabric.start_runtime(...)`, the model provider, MCP configuration, skill
 roots, and `config_overrides` are fixed when the runtime starts and cannot vary
 between `Runtime.invoke(...)` calls. Start a new runtime to change them.
-`Fabric.run(...)` starts the same runtime, invokes it once, and stops it, so the
-same settings are scoped to that single invocation.
+`Fabric.run(...)` starts the same runtime, invokes it once, and stops it.
 
 The adapter filters the inherited environment. It retains portable OS and
 Codex state variables, the selected model's `api_key_env`, and explicit
@@ -130,7 +145,38 @@ Codex state variables, the selected model's `api_key_env`, and explicit
 
 ## Relay Integration
 
-Relay-enabled runs also require the external `nemo-relay` CLI. Refer to the
-[NeMo Relay CLI](https://docs.nvidia.com/nemo/fabric/getting-started/install#nemo-relay-cli) install guide for instructions on installing the CLI tool.
+Relay requires a NeMo Relay CLI in the `>=0.7.2,<0.8` range on `PATH`. The
+Codex adapter does not provide a separate `relay` extra; its `harness` and
+`full` extras install the compatible CLI through `nemo-relay-cli-bin`. The root
+`nemo-fabric[relay]` extra installs only the Relay Python package.
+
+Enable Relay with `FabricConfig.enable_relay(...)`. The adapter starts the
+installed `nemo-relay` CLI as a supervised sidecar; do not start the gateway
+separately.
 NeMo Fabric routes the selected Responses-compatible provider through the
 gateway and passes its explicit `base_url` to Relay as the upstream endpoint.
+
+
+## Testing
+
+Run the unit and opt-in real SDK tests separately:
+
+```bash
+uv run pytest tests/adapters/test_codex_adapter.py -q
+RUN_FABRIC_CODEX_INTEGRATION=1 uv run pytest tests/e2e/test_codex.py -q
+RUN_FABRIC_CODEX_RELAY_INTEGRATION=1 \
+  FABRIC_TEST_NEMO_RELAY_COMMAND=/path/to/nemo-relay \
+  uv run pytest tests/e2e/test_codex.py -q
+```
+
+Set `FABRIC_TEST_CODEX_BIN=/path/to/codex` on either opt-in command to validate
+an explicit app-server override instead of the SDK-pinned runtime.
+
+The SDK test uses the current Codex authentication state and exercises both the
+single-invocation convenience API and multiple turns against one started
+runtime. The Relay test additionally requires an external gateway binary and
+verifies model responses, stable thread identity across turns, Agent Trajectory
+Observability Format (ATOF), and Agent Trajectory Interchange Format (ATIF);
+gateway startup alone is not a passing result. The semantic regression requires
+the LLM request content to be decoded. It also requires ATIF to contain the
+model, token usage, and expected agent response.

@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 
 from nemo_fabric import EnvironmentConfig
+from nemo_fabric import DiscoveryConfig
 from nemo_fabric import Fabric
 from nemo_fabric import FabricConfig
 from nemo_fabric import HarnessConfig
@@ -31,6 +32,7 @@ def build_config() -> FabricConfig:
             resolution="preinstalled",
             settings={{HARNESS_SETTINGS}},
         ),
+        discovery=DiscoveryConfig(local_paths=["adapters"]),
         models={{MODELS}},
         instructions={{INSTRUCTIONS}},
         runtime=RuntimeConfig(

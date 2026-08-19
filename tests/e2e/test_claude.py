@@ -12,7 +12,12 @@ import warnings
 from pathlib import Path
 
 import pytest
-from _utils.utils import assert_semantic_relay_artifacts
+import requests
+from _utils.utils import (
+    assert_atof_model,
+    assert_atof_skill_selection,
+    assert_semantic_relay_artifacts,
+)
 from nemo_fabric import (
     EnvironmentConfig,
     Fabric,
@@ -25,11 +30,17 @@ from nemo_fabric import (
     RelayAtofFileSinkConfig,
     RelayObservabilityConfig,
     RuntimeConfig,
+    ToolsConfig,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
 MOCK_CLAUDE_CLI = ROOT / "tests" / "fixtures" / "claude" / "mock-claude-cli.py"
 SESSION_ID = "11111111-1111-4111-8111-111111111111"
+
+
+@pytest.fixture(name="use_current_python_for_adapter_discovery", autouse=True)
+def use_current_python_for_adapter_discovery_fixture(restore_environ) -> None:
+    restore_environ["ADAPTER_PYTHON"] = sys.executable
 
 
 def write_mock_relay_gateway(path: Path, log_path: Path) -> None:
@@ -42,7 +53,7 @@ from pathlib import Path
 
 args = sys.argv[1:]
 if args == ["--version"]:
-    print("nemo-relay 0.6.0")
+    print("nemo-relay 0.7.2")
     raise SystemExit(0)
 Path({str(log_path)!r}).write_text(json.dumps(args), encoding="utf-8")
 bind = args[args.index("--bind") + 1]
@@ -68,11 +79,11 @@ def fabric_config(
     *,
     cli_path=None,
     relay=False,
+    atif=True,
     nemo_relay_command=None,
 ):
     tmp_path.mkdir(parents=True, exist_ok=True)
     settings = {
-        "python": sys.executable,
         "setting_sources": [],
         "permission_mode": "dontAsk",
     }
@@ -129,7 +140,7 @@ def fabric_config(
                     enabled=True,
                     sinks=[RelayAtofFileSinkConfig()],
                 ),
-                atif=RelayAtifConfig(enabled=True),
+                atif=RelayAtifConfig(enabled=atif),
             )
         )
     return config
@@ -170,6 +181,167 @@ async def test_fabric_session_reuses_persistent_claude_runtime(tmp_path):
     assert not any(artifact.kind == "stderr" for artifact in second.artifacts.artifacts)
 
 
+async def test_env_secrets_in_headers(api_server, tmp_path):
+    os.environ["MY_KEY"] = "XYZ"
+    tool_name = "mcp__headers__get_authorization_header"
+    scenario_response = requests.post(
+        f"{api_server}/_scenario",
+        json={"tool_call": {"name": tool_name, "arguments": {}}},
+        timeout=5,
+    )
+    scenario_response.raise_for_status()
+
+    config = fabric_config(tmp_path)
+    config.models["default"].provider = "fabric-test"
+    config.models["default"].model = "fabric-echo"
+    config.models["default"].api_key_env = "FABRIC_TEST_API_KEY"
+    config.models["default"].base_url = f"{api_server}/v1"
+    config.environment.env["FABRIC_TEST_API_KEY"] = "test"
+    config.tools = ToolsConfig(enabled=[tool_name])
+    config.add_mcp_server(
+        "headers",
+        transport="streamable-http",
+        url=f"{api_server}/mcp",
+        authentication=None,
+        custom_headers={"Authorization": "Bearer ${MY_KEY}"},
+    )
+
+    result = await Fabric().run(
+        config,
+        base_dir=tmp_path,
+        input="Use the MCP tool to return its Authorization header.",
+    )
+
+    assert result["status"] == "succeeded", result.to_mapping()
+    response = requests.get(f"{api_server}/_mcp_authorization_headers", timeout=5)
+    response.raise_for_status()
+    assert set(response.json()) == {"Bearer XYZ"}
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_mcp_stdio_transport(api_server, tmp_path, enabled):
+    tool_name = "mcp__mcp_server_time__get_current_time"
+    scenario_response = requests.post(
+        f"{api_server}/_scenario",
+        json={
+            "tool_call": {
+                "name": tool_name,
+                "arguments": {"timezone": "America/Los_Angeles"},
+            }
+        },
+        timeout=5,
+    )
+    scenario_response.raise_for_status()
+
+    config = fabric_config(tmp_path)
+    config.models["default"].provider = "fabric-test"
+    config.models["default"].model = "fabric-echo"
+    config.models["default"].api_key_env = "FABRIC_TEST_API_KEY"
+    config.models["default"].base_url = f"{api_server}/v1"
+    config.environment.env["FABRIC_TEST_API_KEY"] = "test"
+    config.tools = ToolsConfig(enabled=[tool_name])
+    config.add_mcp_server(
+        "mcp_server_time",
+        transport="stdio",
+        url=sys.executable,
+        args=["-m", "mcp_server_time"],
+        env={"MCP_TIME_TEST": "enabled"},
+    )
+
+    if not enabled:
+        config.remove_mcp_server("mcp_server_time")
+
+    result = await Fabric().run(
+        config,
+        base_dir=tmp_path,
+        input="Use the time MCP tool to get the current time in America/Los_Angeles.",
+    )
+
+    assert result["status"] == "succeeded", result.to_mapping()
+    tool_uses = [
+        block
+        for event in result["output"]["events"]
+        if event["type"] == "AssistantMessage"
+        for block in event["message"]["content"]
+        if block.get("name") == tool_name
+    ]
+    tool_results = [
+        block
+        for event in result["output"]["events"]
+        if event["type"] == "UserMessage"
+        and isinstance(event["message"]["content"], list)
+        for block in event["message"]["content"]
+        if "tool_use_id" in block
+    ]
+
+    if not enabled:
+        assert not tool_uses
+        assert not tool_results
+    else:
+        assert tool_uses
+        assert tool_results
+        assert not tool_results[0]["is_error"]
+        assert "America/Los_Angeles" in str(tool_results[0]["content"])
+
+
+@pytest.mark.usefixtures("nemo_relay")
+@pytest.mark.parametrize("skill", ["default", "alternate", None])
+async def test_skill_selection(
+    api_server, tmp_path, skill, default_skill, alternate_skill
+):
+    config = fabric_config(tmp_path, relay=True)
+    config.models["default"].provider = "fabric-test"
+    config.models["default"].model = "fabric-echo"
+    config.models["default"].api_key_env = "FABRIC_TEST_API_KEY"
+    config.models["default"].base_url = f"{api_server}/v1"
+    config.environment.env["FABRIC_TEST_API_KEY"] = "test"
+    config.add_skill_path(default_skill)
+
+    if skill == "alternate" or skill is None:
+        config.remove_skill_path(default_skill)
+
+    if skill == "alternate":
+        config.add_skill_path(alternate_skill)
+
+    if skill is not None:
+        scenario_response = requests.post(
+            f"{api_server}/_scenario",
+            json={
+                "tool_call": {
+                    "name": "Skill",
+                    "arguments": {"skill": skill},
+                }
+            },
+            timeout=5,
+        )
+        scenario_response.raise_for_status()
+
+    result = await Fabric().run(
+        config,
+        base_dir=tmp_path,
+        input=f"Use the {skill} skill." if skill else "Reply without using a skill.",
+    )
+
+    assert result["status"] == "succeeded", result.to_mapping()
+    assert_atof_skill_selection(result["output"], skill)
+
+
+@pytest.mark.usefixtures("nemo_relay")
+@pytest.mark.parametrize("model", ["m1", "m2"])
+async def test_model_selection(api_server, tmp_path, model):
+    config = fabric_config(tmp_path, relay=True)
+    config.models["default"].provider = "fabric-test"
+    config.models["default"].model = model
+    config.models["default"].api_key_env = "FABRIC_TEST_API_KEY"
+    config.models["default"].base_url = f"{api_server}/v1"
+    config.environment.env["FABRIC_TEST_API_KEY"] = "test"
+
+    result = await Fabric().run(config, base_dir=tmp_path, input="Reply with hello.")
+
+    assert result["status"] == "succeeded", result.to_mapping()
+    assert_atof_model(result["output"], model)
+
+
 @pytest.mark.skipif(
     sys.platform in {"darwin", "win32"},
     reason="the mock Relay gateway is not supported on macOS or Windows",
@@ -178,10 +350,12 @@ async def test_fabric_claude_relay_supervises_gateway_and_injects_plugin(tmp_pat
     mock_relay = tmp_path / "nemo-relay"
     relay_args_path = tmp_path / "relay-args.json"
     write_mock_relay_gateway(mock_relay, relay_args_path)
+    # This fake implements gateway lifecycle only, not subscriber artifact writes.
     config = fabric_config(
         tmp_path,
         cli_path=MOCK_CLAUDE_CLI,
         relay=True,
+        atif=False,
         nemo_relay_command=mock_relay,
     )
 
@@ -224,10 +398,15 @@ async def test_fabric_claude_relay_supervises_gateway_and_injects_plugin(tmp_pat
     reason="set FABRIC_NEMO_RELAY_COMMAND to test an installed NeMo Relay CLI",
 )
 async def test_fabric_claude_accepts_real_relay_gateway_with_mock_claude(tmp_path):
+    project_plugin_config = tmp_path / ".nemo-relay" / "plugins.toml"
+    project_plugin_config.parent.mkdir()
+    project_plugin_config.write_text("version = [\n", encoding="utf-8")
+    os.environ["NEMO_RELAY_CONFIG_SCOPE"] = "project"
     config = fabric_config(
         tmp_path,
         cli_path=MOCK_CLAUDE_CLI,
         relay=True,
+        atif=False,
         nemo_relay_command=os.environ["FABRIC_NEMO_RELAY_COMMAND"],
     )
 
@@ -237,6 +416,7 @@ async def test_fabric_claude_accepts_real_relay_gateway_with_mock_claude(tmp_pat
     assert result.output["relay_runtime"]["enabled"] is True
     gateway_log_path = Path(result.output["relay_runtime"]["gateway_log_path"])
     assert gateway_log_path.is_file()
+    assert os.environ["NEMO_RELAY_CONFIG_SCOPE"] == "project"
 
 
 @pytest.mark.skipif(

@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use nemo_fabric_core::{FabricConfig, MetadataConfig, SkillConfig};
+use nemo_fabric_core::{DiscoveryConfig, FabricConfig, MetadataConfig, SkillConfig};
 
 use crate::assets::{EmbeddedFile, StagedAssets};
 use crate::presets::{self, Preset};
@@ -132,6 +132,10 @@ fn code_review_config(preset: Preset) -> Result<FabricConfig, String> {
         description: Some("Maintained example for reviewing a small Python workspace.".to_string()),
         extensions: BTreeMap::new(),
     };
+    config.discovery = Some(DiscoveryConfig {
+        local_paths: vec![PathBuf::from("adapters")],
+        extensions: BTreeMap::new(),
+    });
     let environment = config
         .environment
         .as_mut()

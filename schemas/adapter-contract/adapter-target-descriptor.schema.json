@@ -1,0 +1,98 @@
+{
+  "$defs": {
+    "WorkflowEntrypointConfig": {
+      "additionalProperties": true,
+      "description": "Adapter-owned workflow entry point supplied by an Adapter Target Descriptor.",
+      "properties": {
+        "kind": {
+          "description": "Adapter-defined entry-point resolution semantics.",
+          "minLength": 1,
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "ref": {
+          "description": "Adapter-defined workflow reference.",
+          "minLength": 1,
+          "pattern": "\\S",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "ref"
+      ],
+      "type": "object"
+    },
+    "WorkflowTargetSpec": {
+      "additionalProperties": true,
+      "description": "Workflow-specific Adapter Target Descriptor fields.",
+      "properties": {
+        "entrypoint": {
+          "$ref": "#/$defs/WorkflowEntrypointConfig",
+          "description": "Entry point projected southbound to the adapter."
+        },
+        "settings_schema": {
+          "additionalProperties": true,
+          "description": "JSON Schema for `FabricConfig.workflow.settings`.",
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "entrypoint"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Independently registered target implemented by an adapter.",
+  "oneOf": [
+    {
+      "description": "Registered workflow target.",
+      "properties": {
+        "spec": {
+          "$ref": "#/$defs/WorkflowTargetSpec"
+        },
+        "type": {
+          "const": "workflow",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "spec"
+      ],
+      "type": "object"
+    }
+  ],
+  "properties": {
+    "adapter_id": {
+      "description": "Adapter implementation selected by this target.",
+      "minLength": 1,
+      "pattern": "\\S",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": "fabric.adapter/v1alpha2",
+      "description": "Adapter Contract version shared with Adapter Descriptor.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "id": {
+      "description": "Unique registered target id.",
+      "minLength": 1,
+      "pattern": "\\S",
+      "type": "string"
+    }
+  },
+  "required": [
+    "contract_version",
+    "id",
+    "adapter_id"
+  ],
+  "title": "AdapterTargetDescriptor",
+  "type": "object",
+  "unevaluatedProperties": true
+}

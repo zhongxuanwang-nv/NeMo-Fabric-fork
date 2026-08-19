@@ -14,8 +14,8 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import math
 import os
-import shlex
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -24,6 +24,15 @@ from typing import NamedTuple
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import ToolMessage
+from nemo_fabric_adapter_contract.models import AgentConfig
+from nemo_fabric_adapter_contract.models import AgentMcpServerConfig
+from nemo_fabric_adapter_contract.models import AgentModelConfig
+from nemo_fabric_adapter_contract.models import AgentRunError
+from nemo_fabric_adapter_contract.models import AgentRunRequest
+from nemo_fabric_adapter_contract.models import AgentRunResult
+from nemo_fabric_adapter_contract.models import AgentRunStatus
+from nemo_fabric_adapter_contract.models import AgentUsage
+from nemo_fabric_adapter_contract.models import RuntimeContext
 from nemo_fabric_adapters.common import lifecycle
 import nemo_fabric_adapters.common.utils as common_utils
 
@@ -51,6 +60,19 @@ FABRIC_OWNED_AGENT_KEYS = frozenset(
 # through harness.settings.deepagents. Executable objects (AgentMiddleware, BaseTool,
 # Python callables) cannot cross the SDK->JSON->payload boundary and are excluded.
 DEEPAGENTS_PASSTHROUGH_KEYS = frozenset({"subagents", "interrupt_on"})
+# Appended to the fault that poisoned Relay's scope stack, and then reported on every
+# later turn of the same runtime so none of them can look telemetry-clean. Deliberately
+# does not claim later turns are untraced: the Relay middleware is attached to the
+# compiled agent at start and keeps emitting, so what is actually lost is trustworthy
+# nesting, not all telemetry.
+_QUARANTINE_NOTE = (
+    "telemetry unreliable for the rest of this runtime: an earlier turn left the Relay "
+    "scope stack dirty, so this turn is not wrapped in a request scope and any events "
+    "the agent middleware still emits are nested under a stale scope"
+)
+# Sentinel for "this handle carries no identity", kept distinct from a real ``None``
+# attribute value so an unreadable handle can never compare equal to another one.
+_UNREADABLE = object()
 
 
 class AdapterConfigError(RuntimeError):
@@ -87,21 +109,17 @@ class ToolGateMiddleware(AgentMiddleware):  # type: ignore[misc]
         return handler(request)
 
 
-def resolve_api_key_env(model_config: dict[str, Any]) -> str:
+def resolve_api_key_env(model_config: AgentModelConfig) -> str:
     """Resolve the credential env var.
 
     OpenAI retains its conventional environment variable. Other providers must
     name the credential explicitly so a key is never sent to the wrong endpoint.
     """
 
-    explicit = model_config.get("api_key_env")
-    if isinstance(explicit, str) and explicit:
-        return explicit
+    explicit = model_config.api_key_env
     if explicit is not None:
-        raise AdapterConfigError(
-            "models.default.api_key_env must be a non-empty string."
-        )
-    provider = str(model_config.get("provider") or "").lower()
+        return explicit
+    provider = model_config.provider
     if provider == "openai":
         return "OPENAI_API_KEY"
     raise AdapterConfigError(
@@ -112,16 +130,17 @@ def resolve_api_key_env(model_config: dict[str, Any]) -> str:
 def main() -> None:
     """Serve the persistent local-host lifecycle protocol."""
 
-    lifecycle.serve(DeepAgentsRuntime)
+    lifecycle.serve(DeepAgentsRuntime, config_loader=AgentConfig.from_mapping)
 
 
-def preflight_check(payload: dict[str, Any]) -> None:
+def preflight_check(model_config: AgentModelConfig) -> None:
     """Validate invocation-time prerequisites and fail fast with clear errors.
 
-    These are runtime preflight checks, not ``fabric doctor`` checks: Fabric core
-    has no adapter-doctor hook, so doctor cannot verify these. At invocation time
-    the ``deepagents`` package must be importable and the configured
-    model-provider credential must be present in the environment.
+    These checks run during adapter startup. Core descriptor diagnostics do not
+    invoke adapter-specific preflight hooks, so they cannot verify these
+    prerequisites. At invocation time the ``deepagents`` package must be
+    importable and the configured model-provider credential must be present in
+    the environment.
     """
 
     import importlib.util
@@ -129,12 +148,11 @@ def preflight_check(payload: dict[str, Any]) -> None:
     if importlib.util.find_spec("deepagents") is None:
         raise RuntimeError(
             "the 'deepagents' package is required for the Deep Agents adapter; install "
-            "it with the 'deepagents' extra (pip install nemo-fabric-adapters-deepagents)."
+            "a compatible Deep Agents harness in the adapter environment."
         )
 
-    model_config = selected_model_config(payload)
     api_key_env = resolve_api_key_env(model_config)
-    if api_key_env not in os.environ:
+    if not os.environ.get(api_key_env):
         raise RuntimeError(
             f"the model-provider credential env var '{api_key_env}' is not set in the "
             "environment. Set it to your API key, or set models.default.api_key_env to the "
@@ -142,38 +160,30 @@ def preflight_check(payload: dict[str, Any]) -> None:
         )
 
 
-def selected_model_config(payload: dict[str, Any]) -> dict[str, Any]:
-    return common_utils.selected_model_config(payload)
+def selected_model_config(config: AgentConfig) -> AgentModelConfig:
+    if model_config := config.models.get("default"):
+        return model_config
+    if len(config.models) == 1:
+        return next(iter(config.models.values()))
+    raise AdapterConfigError(
+        "Deep Agents requires a default model or exactly one model."
+    )
 
 
-def resolve_base_url(model_config: dict[str, Any]) -> str | None:
-    return common_utils.get_base_url(model_config)
-
-
-def build_chat_model(payload: dict[str, Any]) -> tuple[Any, str, str | None]:
+def build_chat_model(model_config: AgentModelConfig) -> tuple[Any, str, str | None]:
     """Build a LangChain chat model from Fabric model config.
 
     Known OpenAI-compatible providers use ``ChatOpenAI``. Other providers are
     delegated to ``langchain.chat_models.init_chat_model``.
     """
 
-    model_config = selected_model_config(payload)
-    model_name = model_config.get("model")
-    if not model_name:
-        raise RuntimeError(
-            "models.default.model is required for the Deep Agents adapter"
-        )
-
+    model_name = model_config.model
     api_key_env = resolve_api_key_env(model_config)
-    api_key = os.environ.get(api_key_env)
-    if not api_key:
-        raise RuntimeError(f"{api_key_env} is required for the Deep Agents adapter")
+    api_key = os.environ[api_key_env]
 
-    provider = str(model_config.get("provider") or "").lower()
-    if not provider:
-        raise AdapterConfigError("models.default.provider is required.")
-    base_url = resolve_base_url(model_config)
-    temperature = model_config.get("temperature")
+    provider = model_config.provider
+    base_url = model_config.base_url
+    temperature = model_config.temperature
 
     if provider in OPENAI_COMPATIBLE_PROVIDERS - {"openai"} and not base_url:
         raise AdapterConfigError(
@@ -205,16 +215,15 @@ def build_chat_model(payload: dict[str, Any]) -> tuple[Any, str, str | None]:
     return ChatOpenAI(**_supported_kwargs(ChatOpenAI, kwargs)), model_name, base_url
 
 
-def resolve_backend(payload: dict[str, Any]) -> Any:
+def resolve_backend(runtime_context: RuntimeContext, base_dir: str) -> Any:
     """Root the Deep Agents filesystem backend at the Fabric workspace, if set."""
 
-    environment = common_utils.environment_payload(payload)
-    workspace = environment.get("workspace")
+    workspace = runtime_context.environment.workspace
     if not workspace:
         return None
     root = Path(str(workspace))
     if not root.is_absolute():
-        root = Path(common_utils.base_dir(payload)) / root
+        root = Path(base_dir) / root
     from deepagents.backends import FilesystemBackend
 
     # virtual_mode=True confines the agent to root_dir; absolute paths and ``..``
@@ -222,19 +231,19 @@ def resolve_backend(payload: dict[str, Any]) -> Any:
     return FilesystemBackend(root_dir=str(root), virtual_mode=True)
 
 
-async def resolve_tools(payload: dict[str, Any]) -> list[Any] | None:
+async def resolve_tools(config: AgentConfig) -> list[Any] | None:
     """Resolve Fabric MCP servers into Deep Agents tools."""
 
-    tools = await _mcp_tools(payload)
+    tools = await _mcp_tools(config)
     return tools or None
 
 
-def _blocked_tool_names(payload: dict[str, Any]) -> set[str]:
-    return set(common_utils.blocked_tools(payload))
+def _blocked_tool_names(config: AgentConfig) -> set[str]:
+    return set(config.tools.blocked if config.tools is not None else [])
 
 
-def _enabled_tool_names(payload: dict[str, Any]) -> set[str] | None:
-    enabled = common_utils.enabled_tools(payload)
+def _enabled_tool_names(config: AgentConfig) -> set[str] | None:
+    enabled = config.tools.enabled if config.tools is not None else None
     return None if enabled is None else set(enabled)
 
 
@@ -253,17 +262,15 @@ def tool_policy_middleware(enabled: set[str] | None, blocked: set[str]) -> Any:
     )
 
 
-def resolve_skills(payload: dict[str, Any]) -> list[str] | None:
-    """Map routed ``native.skill_paths`` onto the Deep Agents ``skills`` sources."""
+def resolve_skills(config: AgentConfig) -> list[str] | None:
+    """Map Fabric skill paths onto the Deep Agents ``skills`` sources."""
 
-    native = common_utils.capability_plan(payload).get("native") or {}
-    skills = [str(path) for path in (native.get("skill_paths") or [])]
+    skills = [str(path) for path in (config.skills.paths if config.skills else [])]
     return skills or None
 
 
-async def _mcp_tools(payload: dict[str, Any]) -> list[Any]:
-    native = common_utils.capability_plan(payload).get("native") or {}
-    servers = native.get("mcp_servers") or {}
+async def _mcp_tools(config: AgentConfig) -> list[Any]:
+    servers = config.mcp.servers if config.mcp is not None else {}
     connections = {name: _mcp_connection(name, spec) for name, spec in servers.items()}
     if not connections:
         return []
@@ -273,46 +280,60 @@ async def _mcp_tools(payload: dict[str, Any]) -> list[Any]:
     return list(await client.get_tools())
 
 
-def _mcp_connection(name: str, spec: dict[str, Any]) -> dict[str, Any]:
+def _mcp_connection(name: str, spec: AgentMcpServerConfig) -> dict[str, Any]:
     # A misconfigured server must fail loudly, not be silently dropped.
-    if not isinstance(spec, dict):
-        raise AdapterConfigError(f"MCP server '{name}' must be a mapping.")
-    transport = str(spec.get("transport") or "").strip().lower().replace("-", "_")
-    # McpServerPlan carries the URL or command in ``url``; there is no ``command``.
-    target = os.path.expandvars(str(spec.get("url") or "")).strip()
+    transport = spec.transport.strip().lower().replace("-", "_")
+    # AgentMcpServerConfig carries the command in ``url`` and stdio extensions.
+    target = os.path.expandvars(spec.url).strip()
     if not target:
         raise AdapterConfigError(
             f"MCP server '{name}' requires a url (or command in url)."
         )
     if transport in ("stdio", "command", "process"):
-        parts = shlex.split(target)
-        if not parts:
-            raise AdapterConfigError(f"MCP server '{name}' has an empty stdio command.")
-        return {"transport": "stdio", "command": parts[0], "args": parts[1:]}
+        connection: dict[str, Any] = {
+            "transport": "stdio",
+            "command": target,
+            "args": spec.args,
+        }
+        if env := spec.env:
+            connection["env"] = env
+        return connection
     if transport in ("", "http", "streamable_http", "streamablehttp"):
         transport = "streamable_http"
     if transport not in VALID_MCP_TRANSPORTS:
         raise AdapterConfigError(
             f"MCP server '{name}' has unsupported transport '{transport}'."
         )
-    return {"transport": transport, "url": target}
+    connection = {"transport": transport, "url": target}
+    if headers := spec.custom_headers:
+        try:
+            headers = common_utils.expand_http_headers(name, headers)
+        except Exception as error:
+            raise AdapterConfigError(f"{error}.") from error
+        connection["headers"] = headers
+
+    auth = spec.authentication
+    if auth is not None:
+        raise AdapterConfigError(
+            f"MCP server {name!r} {auth.type!r} authentication is not supported by Deep Agents."
+        )
+    return connection
 
 
 # --- runtime state ---------------------------------------------------------
 
 
-def state_dir(payload: dict[str, Any]) -> Path:
-    base_dir = Path(common_utils.base_dir(payload)).resolve()
-    artifacts = common_utils.runtime_context(payload).get("artifacts") or {}
-    root = artifacts.get("root") or os.environ.get("FABRIC_ARTIFACTS")
+def state_dir(runtime_context: RuntimeContext, base_dir: str) -> Path:
+    base_dir = Path(base_dir).resolve()
+    root = runtime_context.artifacts.root
     if root:
         return Path(str(root)).resolve() / ".fabric" / "deepagents"
     return base_dir / "artifacts" / "deepagents" / ".fabric"
 
 
-def checkpointer_path(payload: dict[str, Any], runtime_id: str) -> Path:
+def checkpointer_path(context: RuntimeContext, base_dir: str, runtime_id: str) -> Path:
     key = hashlib.sha256(runtime_id.encode("utf-8")).hexdigest()
-    base = state_dir(payload) / "runtimes"
+    base = state_dir(context, base_dir) / "runtimes"
     return base / f"{key}.sqlite"
 
 
@@ -343,23 +364,32 @@ async def close_checkpointer(checkpointer: Any) -> None:
 
 
 async def build_agent_kwargs(
-    payload: dict[str, Any], model: Any, settings: dict[str, Any]
+    config: AgentConfig,
+    runtime_context: RuntimeContext,
+    base_dir: str,
+    model: Any,
+    settings: dict[str, Any],
 ) -> dict[str, Any]:
+    instructions = config.instructions
     kwargs: dict[str, Any] = {
         "model": model,
-        "tools": await resolve_tools(payload),
+        "tools": await resolve_tools(config),
         # deepagents 0.5.x/0.6.x take the system prompt as ``system_prompt``.
-        "system_prompt": common_utils.system_instruction(payload),
-        "skills": resolve_skills(payload),
-        "backend": resolve_backend(payload),
+        "system_prompt": (
+            instructions.system.content
+            if instructions and instructions.system
+            else None
+        ),
+        "skills": resolve_skills(config),
+        "backend": resolve_backend(runtime_context, base_dir),
     }
     # Deep Agents-specific settings (e.g. subagents, interrupt_on) pass through,
     # after validation against the documented JSON-serializable allow-list.
     extra = settings.get("deepagents")
     if extra is not None:
         kwargs.update(_validated_passthrough(extra))
-    enabled = _enabled_tool_names(payload)
-    blocked = _blocked_tool_names(payload)
+    enabled = _enabled_tool_names(config)
+    blocked = _blocked_tool_names(config)
     if enabled is not None or blocked:
         middleware = list(kwargs.get("middleware") or [])
         middleware.append(tool_policy_middleware(enabled, blocked))
@@ -467,6 +497,8 @@ class DeepAgentsRuntime:
         self._relay_scope_type: Any = None
         self._relay_plugin_config: dict[str, Any] | None = None
         self._callback_handler_type: Any = None
+        self._telemetry_quarantine: str | None = None
+        self._telemetry_quarantine_cause: str | None = None
 
     async def start(self, payload: dict[str, Any]) -> None:
         if self._started:
@@ -476,15 +508,24 @@ class DeepAgentsRuntime:
             )
 
         try:
-            preflight_check(payload)
-            settings = common_utils.settings_payload(payload)
-            runtime_id = common_utils.runtime_context(payload).get("runtime_id")
-            model, self._model_name, self._base_url = build_chat_model(payload)
+            agent_config = payload["config"]
+            runtime_context = RuntimeContext.from_mapping(
+                payload.get("runtime_context")
+            )
+            model_config = selected_model_config(agent_config)
+            preflight_check(model_config)
+            settings = agent_config.harness.settings if agent_config.harness else {}
+            base_dir = common_utils.base_dir(payload)
+            runtime_id = runtime_context.runtime_id
+            model, self._model_name, self._base_url = build_chat_model(model_config)
             self._runtime_id = runtime_id
-            self._thread_id = uuid.uuid4().hex if runtime_id else None
+            self._thread_id = uuid.uuid4().hex
 
-            telemetry_providers = common_utils.telemetry_providers(payload)
-            relay_enabled = common_utils.relay_enabled(payload)
+            telemetry = runtime_context.telemetry
+            telemetry_providers = (
+                telemetry.metadata.get("telemetry_providers", []) if telemetry else []
+            )
+            relay_enabled = bool(telemetry and telemetry.relay_enabled)
             self._telemetry_provider = (
                 "relay"
                 if relay_enabled
@@ -493,17 +534,25 @@ class DeepAgentsRuntime:
                 else ""
             )
             self._observability = resolve_observability(
-                payload,
+                runtime_context,
+                base_dir,
+                common_utils.agent_name(payload),
+                model_config.model,
                 self._telemetry_provider,
                 relay_enabled,
             )
 
-            agent_kwargs = await build_agent_kwargs(payload, model, settings)
-            if runtime_id:
-                self._checkpointer = await open_checkpointer(
-                    checkpointer_path(payload, runtime_id)
-                )
-                agent_kwargs["checkpointer"] = self._checkpointer
+            agent_kwargs = await build_agent_kwargs(
+                agent_config,
+                runtime_context,
+                base_dir,
+                model,
+                settings,
+            )
+            self._checkpointer = await open_checkpointer(
+                checkpointer_path(runtime_context, base_dir, runtime_id)
+            )
+            agent_kwargs["checkpointer"] = self._checkpointer
 
             if self._observability is not None:
                 agent_kwargs = self._configure_observability(agent_kwargs)
@@ -524,6 +573,7 @@ class DeepAgentsRuntime:
 
         if importlib.util.find_spec("nemo_relay") is None:
             raise _relay_dependency_error()
+        common_utils.reject_ambient_relay_plugin_config()
         try:
             from nemo_relay import ScopeType, plugin, scope
             from nemo_relay.integrations.deepagents import (
@@ -541,98 +591,215 @@ class DeepAgentsRuntime:
         self._callback_handler_type = NemoRelayDeepAgentsCallbackHandler
         return add_nemo_relay_integration(agent_kwargs)
 
-    async def invoke(self, invocation: dict[str, Any]) -> dict[str, Any]:
+    async def invoke(
+        self,
+        request: AgentRunRequest,
+        runtime_context: RuntimeContext,
+    ) -> AgentRunResult:
         start_payload = self._start_payload
         if not self._started or self._agent is None or start_payload is None:
             raise lifecycle.LifecycleError(
                 "deepagents_runtime_not_started",
                 "Deep Agents runtime is not started",
             )
-        runtime_id = common_utils.runtime_context(invocation).get("runtime_id")
+        runtime_id = runtime_context.runtime_id
         if runtime_id != self._runtime_id:
             raise lifecycle.LifecycleError(
                 "deepagents_runtime_mismatch",
                 "Deep Agents invocation does not match the active runtime",
             )
 
-        payload = {
-            **start_payload,
-            "runtime_context": invocation.get("runtime_context"),
-            "request": invocation.get("request"),
-        }
-        request = payload.get("request") or {}
-        user_message = request.get("input") or ""
+        user_message = "" if request.input is None else request.input
         if not isinstance(user_message, str):
             user_message = json.dumps(user_message, sort_keys=True)
-        request_id = request.get("request_id")
+        request_id = runtime_context.request_id
 
-        result_state: Any = None
-        events: list[dict[str, Any]] = []
-        turn_messages: list[dict[str, Any]] = []
-        error: str | None = None
         resumed = self._completed_invocations > 0
-        try:
-            if self._observability is not None:
-                callback_handler = self._callback_handler_type()
-                async with self._relay_plugin.plugin(self._relay_plugin_config):
-                    with self._relay_scope.scope(
-                        "deepagents-request",
-                        self._relay_scope_type.Agent,
-                        metadata={"nemo_fabric_request_id": request_id},
-                    ):
-                        (
-                            result_state,
-                            events,
-                            turn_messages,
-                        ) = await invoke_compiled_agent(
-                            self._agent,
-                            user_message,
-                            self._thread_id,
-                            callbacks=[callback_handler],
-                        )
-            else:
-                result_state, events, turn_messages = await invoke_compiled_agent(
-                    self._agent,
-                    user_message,
-                    self._thread_id,
-                )
-        except Exception as exc:  # normalized adapter failure
-            error = f"{type(exc).__name__}: {exc}"
+        inherited_quarantine = self._telemetry_quarantine is not None
+        if self._observability is None:
+            outcome = await self._invoke_agent(user_message)
+        else:
+            outcome = await self._invoke_with_telemetry(user_message, request_id)
 
-        if error is None:
+        if outcome.error is None:
             self._completed_invocations += 1
 
-        telemetry_runtime, relay_artifacts = self._telemetry_output()
-        return normalize_output(
+        telemetry_runtime, relay_artifacts, collect_error = self._telemetry_output(
+            inherited_quarantine=inherited_quarantine
+        )
+        output = normalize_output(
             model_name=self._model_name,
             base_url=self._base_url,
             runtime_id=self._runtime_id,
             thread_id=self._thread_id,
             resumed=resumed,
+            result_state=outcome.result_state,
+            events=outcome.events or [],
+            turn_messages=outcome.turn_messages or [],
+            error=outcome.error,
+            telemetry_runtime=telemetry_runtime,
+            relay_artifacts=relay_artifacts,
+            telemetry_error=_join_faults(outcome.telemetry_error, collect_error),
+            telemetry_quarantine_cause=(
+                self._telemetry_quarantine_cause if inherited_quarantine else None
+            ),
+        )
+        failed = bool(output.pop("failed", False))
+        reported_error = output.pop("error", None)
+        raw_usage = output.get("usage")
+        usage = raw_usage if isinstance(raw_usage, dict) else {}
+        token_fields = {
+            "input_tokens": usage.get("prompt_tokens"),
+            "output_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+        }
+        tokens = {
+            name: value
+            for name, value in token_fields.items()
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 <= value <= (1 << 64) - 1
+        }
+        cost = usage.get("cost")
+        if (
+            not isinstance(cost, (int, float))
+            or isinstance(cost, bool)
+            or not math.isfinite(cost)
+            or cost < 0
+        ):
+            cost = None
+        return AgentRunResult(
+            status=AgentRunStatus.FAILED if failed else AgentRunStatus.SUCCEEDED,
+            output=output,
+            error=(
+                AgentRunError(
+                    code="deepagents_invocation_failed",
+                    message=str(reported_error or "Deep Agents invocation failed"),
+                )
+                if failed
+                else None
+            ),
+            usage=(
+                AgentUsage(**tokens, cost_usd=cost)
+                if tokens or cost is not None
+                else None
+            ),
+        )
+
+    async def _invoke_with_telemetry(
+        self,
+        user_message: str,
+        request_id: str | None,
+    ) -> TurnOutcome:
+        """Run one turn inside the Relay plugin/scope, isolating telemetry faults.
+
+        ``_invoke_agent`` has already absorbed any invocation failure, so an exception
+        caught here can only have come from telemetry setup or teardown.
+        """
+
+        if self._telemetry_quarantine is not None:
+            # Relay's scope stack is still dirty from an earlier turn. Skip the request
+            # scope: pushing onto that stack would nest this turn under a stale scope and
+            # invite another failed pop.
+            outcome = await self._invoke_agent(user_message)
+            return outcome._replace(telemetry_error=self._telemetry_quarantine)
+
+        baseline = _current_scope_handle()
+        outcome: TurnOutcome | None = None
+        scope_error: str | None = None
+        try:
+            common_utils.reject_ambient_relay_plugin_config()
+            callback_handler = self._callback_handler_type()
+            async with self._relay_plugin.plugin(
+                self._relay_plugin_config
+            ) as activation_report:
+                common_utils.reject_inherited_relay_plugin_config(activation_report)
+                # Caught here rather than left to propagate: an exception crossing the
+                # plugin's ``__aexit__`` is replaced by any fault the plugin raises in
+                # turn, which would lose one of the two.
+                try:
+                    with self._relay_scope.scope(
+                        "deepagents-request",
+                        self._relay_scope_type.Agent,
+                        metadata={"nemo_fabric_request_id": request_id},
+                    ):
+                        outcome = await self._invoke_agent(
+                            user_message,
+                            callbacks=[callback_handler],
+                        )
+                except Exception as exc:
+                    scope_error = _error_text(exc)
+        except Exception as exc:  # telemetry lifecycle fault
+            telemetry_error = _join_faults(scope_error, _error_text(exc))
+        else:
+            telemetry_error = scope_error
+
+        if telemetry_error is not None and not _scope_top_unchanged(baseline):
+            self._telemetry_quarantine = _QUARANTINE_NOTE
+            self._telemetry_quarantine_cause = telemetry_error
+            telemetry_error = _join_faults(telemetry_error, _QUARANTINE_NOTE)
+
+        if outcome is None:
+            # No outcome means the agent never ran, so there is nothing to preserve.
+            return TurnOutcome(error=telemetry_error, telemetry_error=telemetry_error)
+        return outcome._replace(telemetry_error=telemetry_error)
+
+    async def _invoke_agent(
+        self,
+        user_message: str,
+        callbacks: list[Any] | None = None,
+    ) -> TurnOutcome:
+        """Run one agent turn, normalizing an invocation failure into an error string."""
+
+        try:
+            result_state, events, turn_messages = await invoke_compiled_agent(
+                self._agent,
+                user_message,
+                self._thread_id,
+                callbacks=callbacks,
+            )
+        except Exception as exc:  # normalized adapter failure
+            return TurnOutcome(error=_error_text(exc))
+        return TurnOutcome(
             result_state=result_state,
             events=events,
             turn_messages=turn_messages,
-            error=error,
-            telemetry_runtime=telemetry_runtime,
-            relay_artifacts=relay_artifacts,
         )
 
     def _telemetry_output(
         self,
-    ) -> tuple[dict[str, Any] | None, list[dict[str, str]] | None]:
+        *,
+        inherited_quarantine: bool,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, str]] | None, str | None]:
+        """Return the telemetry block, artifact references, and any collection fault.
+
+        Collecting references walks the filesystem, so it is returned as a fault rather
+        than raised: raising here would discard an already-completed turn.
+
+        ``inherited_quarantine`` is the state from *before* this turn: the turn that
+        poisoned the runtime opened a scope and produced its own partial artifacts, so it
+        still publishes them; only turns that inherit the quarantine have none of their
+        own to publish.
+        """
+
         if self._observability is None:
-            return None, None
+            return None, None, None
         telemetry_runtime = {
             "enabled": True,
             "provider": self._telemetry_provider,
             "emitter": self._observability.emitter,
         }
-        relay_artifacts = (
-            common_utils.collect_relay_artifacts(self._observability.plugin_config)
-            if self._observability.collect_artifacts
-            else None
-        )
-        return telemetry_runtime, relay_artifacts
+        if not self._observability.collect_artifacts:
+            return telemetry_runtime, None, None
+        if inherited_quarantine:
+            return telemetry_runtime, None, None
+        try:
+            relay_artifacts = common_utils.collect_relay_artifacts(
+                self._observability.plugin_config
+            )
+        except Exception as exc:
+            return telemetry_runtime, None, _error_text(exc)
+        return telemetry_runtime, relay_artifacts, None
 
     async def stop(self) -> None:
         checkpointer = self._checkpointer
@@ -732,6 +899,66 @@ class Observability(NamedTuple):
     collect_artifacts: bool
 
 
+class TurnOutcome(NamedTuple):
+    """One agent turn, with its two failure domains kept apart: ``error`` means the
+    agent failed, ``telemetry_error`` means recording it did.
+    """
+
+    result_state: Any = None
+    events: list[dict[str, Any]] | None = None
+    turn_messages: list[dict[str, Any]] | None = None
+    error: str | None = None
+    telemetry_error: str | None = None
+
+
+def _error_text(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _current_scope_handle() -> Any:
+    """Return Relay's current scope handle, or ``None`` when it cannot be read."""
+
+    try:
+        import nemo_relay
+
+        return nemo_relay.scope.get_handle()
+    except Exception:
+        return None
+
+
+def _scope_top_unchanged(baseline: Any) -> bool:
+    """Report whether the scope current now is the one current before the turn.
+
+    This checks the top of the stack, not the whole stack: Relay exposes no depth, so a
+    fault that left the stack deeper while restoring the top would read as unchanged.
+    The observed failure strands a child scope on top, which this does catch. Anything
+    unreadable — a missing handle, or a handle without the identity attribute — counts
+    as changed, so a Relay rename cannot silently turn the check off.
+    """
+
+    if baseline is None:
+        return False
+    current = _current_scope_handle()
+    if current is None:
+        return False
+    baseline_uuid = getattr(baseline, "uuid", _UNREADABLE)
+    current_uuid = getattr(current, "uuid", _UNREADABLE)
+    if baseline_uuid is _UNREADABLE or current_uuid is _UNREADABLE:
+        return False
+    return bool(current_uuid == baseline_uuid)
+
+
+def _join_faults(*faults: str | None) -> str | None:
+    """Combine telemetry faults into one message; teardown and artifact collection can
+    both fail in the same turn.
+    """
+
+    present = [fault for fault in faults if fault]
+    if not present:
+        return None
+    return "; ".join(present)
+
+
 def _relay_dependency_error() -> RuntimeError:
     return RuntimeError(
         "telemetry is enabled but a compatible 'nemo-relay' package is not installed; "
@@ -740,25 +967,42 @@ def _relay_dependency_error() -> RuntimeError:
 
 
 def resolve_observability(
-    payload: dict[str, Any], telemetry_provider: str, relay_enabled: bool
+    runtime_context: RuntimeContext,
+    base_dir: str,
+    agent_name: str,
+    model_name: str,
+    telemetry_provider: str,
+    relay_enabled: bool,
 ) -> Observability | None:
     """Resolve the nemo_relay observability plugin config for relay or native telemetry.
 
     Relay telemetry loads its plugin config from ``FABRIC_RELAY_CONFIG_PATH`` and
     collects ATOF/ATIF artifacts. Native telemetry reads
-    ``telemetry_plan.native_config`` from the payload (e.g. an
+    ``RuntimeContext.telemetry.metadata.native_config`` (e.g. an
     OpenTelemetry/OpenInference exporter) and exports spans directly to the
     configured collector without writing relay artifacts.
     """
 
     if relay_enabled and telemetry_provider == "relay":
+        plugin_config = common_utils.load_relay_plugin_config(
+            {
+                "agent_name": agent_name,
+                "base_dir": base_dir,
+                "config": {"models": {"default": {"model": model_name}}},
+                "runtime_context": runtime_context.to_mapping(),
+            }
+        )
         return Observability(
-            common_utils.load_relay_plugin_config(payload),
+            plugin_config,
             "deepagents.observability/nemo_relay",
             True,
         )
     if telemetry_provider == "native":
-        native_config = common_utils.native_telemetry_config(payload)
+        native_config = runtime_context.telemetry.metadata.get("native_config", {})
+        if not isinstance(native_config, dict):
+            raise AdapterConfigError(
+                "runtime_context.telemetry.metadata.native_config must be a mapping."
+            )
         if native_config.get("components"):
             return Observability(
                 native_config, "deepagents.observability/native", False
@@ -782,6 +1026,8 @@ def normalize_output(
     error: str | None,
     telemetry_runtime: dict[str, Any] | None,
     relay_artifacts: list[dict[str, str]] | None,
+    telemetry_error: str | None = None,
+    telemetry_quarantine_cause: str | None = None,
 ) -> dict[str, Any]:
     messages = _extract_messages(result_state)
     response = _final_response(messages)
@@ -808,8 +1054,16 @@ def normalize_output(
         "failed": error is not None,
         "error": error,
     }
-    if telemetry_runtime is not None:
-        output["telemetry"] = telemetry_runtime
+    if telemetry_runtime is not None or telemetry_error is not None:
+        # ``degraded`` marks the referenced artifacts as possibly truncated; both keys
+        # are absent on a clean run, so the telemetry block keeps its existing shape.
+        telemetry: dict[str, Any] = dict(telemetry_runtime or {})
+        if telemetry_error is not None:
+            telemetry["degraded"] = True
+            telemetry["error"] = telemetry_error
+        if telemetry_quarantine_cause is not None:
+            telemetry["quarantine_cause"] = telemetry_quarantine_cause
+        output["telemetry"] = telemetry
     if relay_artifacts is not None:
         output["relay_artifacts"] = relay_artifacts
     return output
@@ -888,14 +1142,23 @@ def _aggregate_usage(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
             ("total_tokens", "total_tokens"),
         ):
             value = usage.get(source)
-            if isinstance(value, int):
+            if (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and 0 <= value <= (1 << 64) - 1
+            ):
                 totals[target] = int(totals.get(target, 0)) + value
         # Cost is not part of LangChain's UsageMetadata; surface it only when a
         # model/provider reports it on the usage or response metadata.
         candidate = (
             usage.get("total_cost") or usage.get("cost") or _metadata_cost(message)
         )
-        if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+        if (
+            isinstance(candidate, (int, float))
+            and not isinstance(candidate, bool)
+            and math.isfinite(candidate)
+            and candidate >= 0
+        ):
             cost += float(candidate)
             has_cost = True
     if has_cost:
@@ -907,7 +1170,12 @@ def _metadata_cost(message: dict[str, Any]) -> float | None:
     metadata = message.get("response_metadata")
     if isinstance(metadata, dict):
         value = metadata.get("cost")
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value >= 0
+        ):
             return float(value)
     return None
 

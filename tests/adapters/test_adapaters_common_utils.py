@@ -4,6 +4,7 @@
 import builtins
 import json
 import os
+import re
 import sys
 import tomllib
 from io import StringIO
@@ -12,6 +13,78 @@ from typing import Any
 
 import nemo_fabric_adapters.common.utils as common_utils
 import pytest
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        " ",
+        "X Foo",
+        "X:Foo",
+        "X-Föö",
+        "X-Foo\0",
+        "X-Foo\v",
+        "X-Foo\r",
+        "X-Foo\n",
+    ],
+)
+def test_validate_http_headers_rejects_invalid_names(name):
+    with pytest.raises(
+        ValueError,
+        match=re.escape(f"Invalid HTTP header name {name!r} for MCP server 'docs'"),
+    ):
+        common_utils.validate_http_headers("docs", {name: "bar"})
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("", "must not be blank"),
+        (" \t ", "must not be blank"),
+        (" value", "outer whitespace"),
+        ("value\t", "outer whitespace"),
+        ("bar\0", "control character"),
+        ("bar\v", "control character"),
+        ("bar\r", "control character"),
+        ("bar\nX-Evil: injected", "control character"),
+        ("bar\x7f", "control character"),
+        ("Bearer 🔑", "not Latin-1 encodable"),
+    ],
+)
+def test_validate_http_headers_rejects_invalid_values(value, message):
+    with pytest.raises(
+        ValueError,
+        match=rf"HTTP header value for 'X-Foo' on MCP server 'docs' .*{message}",
+    ):
+        common_utils.validate_http_headers("docs", {"X-Foo": value})
+
+
+def test_validate_http_headers_accepts_latin_1_and_embedded_tab():
+    assert (
+        common_utils.validate_http_headers("docs", {"X-Description": "café\tvalue"})
+        is None
+    )
+
+
+def test_validate_http_headers_rejects_non_string_value():
+    with pytest.raises(
+        TypeError,
+        match="HTTP header value for 'X-Foo' on MCP server 'docs' must be a string",
+    ):
+        common_utils.validate_http_headers("docs", {"X-Foo": None})
+
+
+def test_expand_http_headers_expands_environment_variables_before_validation():
+    os.environ["FABRIC_TEST_HEADER"] = "fabric"
+
+    assert common_utils.expand_http_headers(
+        "docs",
+        {
+            "X-Tenant": "${FABRIC_TEST_HEADER}",
+            "X-Static": "static",
+        },
+    ) == {"X-Tenant": "fabric", "X-Static": "static"}
 
 
 @pytest.mark.parametrize(
@@ -69,13 +142,6 @@ def test_virtualenv_subprocess_env_preserves_environment_outside_virtualenv(
 
     assert env == os.environ
     assert env is not os.environ
-
-
-def test_request_payload():
-    assert common_utils.request_payload({"request": {"input": "hello"}}) == {
-        "input": "hello"
-    }
-    assert common_utils.request_payload({}) == {}
 
 
 @pytest.mark.parametrize(
@@ -138,9 +204,7 @@ def test_selected_model_config(
 def test_normalized_instruction_runtime_and_tool_accessors():
     payload = {
         "config": {
-            "instructions": {
-                "system": {"content": "Be concise.", "mode": "replace"}
-            },
+            "instructions": {"system": {"content": "Be concise.", "mode": "replace"}},
             "runtime": {"timeout_seconds": 12.5, "max_turns": 7},
             "tools": {
                 "enabled": [],
@@ -238,20 +302,127 @@ def test_runtime_id_requires_runtime_context():
         common_utils.runtime_id({"runtime_context": {}})
 
 
-def test_runtime_state_directory_is_scoped_to_runtime(
+def test_ambient_relay_plugin_config_paths_prefers_xdg_and_nearest_project(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    xdg = tmp_path / "xdg"
+    home = tmp_path / "home"
+    project = tmp_path / "workspace"
+    nested = project / "repos" / "service"
+    user_config = xdg / "nemo-relay" / "plugins.toml"
+    project_config = project / ".nemo-relay" / "plugins.toml"
+    ignored_home_config = home / ".config" / "nemo-relay" / "plugins.toml"
+    for path in (user_config, project_config, ignored_home_config):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("version = 1\n", encoding="utf-8")
+    nested.mkdir(parents=True)
+    os.environ["XDG_CONFIG_HOME"] = str(xdg)
+    os.environ["HOME"] = str(home)
+    monkeypatch.chdir(nested)
+
+    assert common_utils.ambient_relay_plugin_config_paths() == [
+        user_config,
+        project_config,
+    ]
+
+
+def test_ambient_relay_plugin_config_paths_falls_back_to_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    home = tmp_path / "home"
+    user_config = home / ".config" / "nemo-relay" / "plugins.toml"
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text("version = 1\n", encoding="utf-8")
+    os.environ.pop("XDG_CONFIG_HOME", None)
+    os.environ["HOME"] = str(home)
+    monkeypatch.chdir(tmp_path)
+
+    assert common_utils.ambient_relay_plugin_config_paths() == [user_config]
+
+
+@pytest.mark.parametrize("xdg_config_home", ["", "relative-config"])
+def test_ambient_relay_plugin_config_paths_ignores_invalid_xdg_home(
+    xdg_config_home: str,
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
-    first = common_utils.runtime_state_directory(
-        tmp_path / "hermes-home",
-        {"runtime_context": {"runtime_id": "runtime-1"}},
-    )
-    second = common_utils.runtime_state_directory(
-        tmp_path / "hermes-home",
-        {"runtime_context": {"runtime_id": "runtime-2"}},
+    home = tmp_path / "home"
+    user_config = home / ".config" / "nemo-relay" / "plugins.toml"
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text("version = 1\n", encoding="utf-8")
+    os.environ["XDG_CONFIG_HOME"] = xdg_config_home
+    os.environ["HOME"] = str(home)
+    monkeypatch.chdir(tmp_path)
+
+    assert common_utils.ambient_relay_plugin_config_paths() == [user_config]
+
+
+def test_reject_ambient_relay_plugin_config_allows_clean_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    os.environ["XDG_CONFIG_HOME"] = str(tmp_path / "xdg")
+    monkeypatch.chdir(tmp_path)
+
+    common_utils.reject_ambient_relay_plugin_config()
+
+
+def test_reject_ambient_relay_plugin_config_reports_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    project_config = tmp_path / ".nemo-relay" / "plugins.toml"
+    project_config.parent.mkdir()
+    project_config.write_text("version = 1\n", encoding="utf-8")
+    os.environ["XDG_CONFIG_HOME"] = str(tmp_path / "xdg")
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(RuntimeError, match=re.escape(str(project_config))):
+        common_utils.reject_ambient_relay_plugin_config()
+
+
+def test_reject_inherited_relay_plugin_config_allows_system_policy():
+    common_utils.reject_inherited_relay_plugin_config(
+        {
+            "diagnostics": [
+                {
+                    "level": "warning",
+                    "code": "plugin.configuration_inherited",
+                    "message": (
+                        "inherited plugin configuration from discovered file: "
+                        "/etc/nemo-relay/plugins.toml"
+                    ),
+                }
+            ]
+        }
     )
 
-    assert first == tmp_path / "hermes-home" / "runtimes" / "runtime-1"
-    assert second == tmp_path / "hermes-home" / "runtimes" / "runtime-2"
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "inherited plugin configuration from discovered file: "
+            "/workspace/.nemo-relay/plugins.toml"
+        ),
+        (
+            "inherited plugin configuration from discovered file: "
+            "/etc/nemo-relay/../nemo-relay/plugins.toml"
+        ),
+        "inherited plugin configuration from an unknown source",
+    ],
+)
+def test_reject_inherited_relay_plugin_config_rejects_unmanaged_sources(message):
+    with pytest.raises(RuntimeError, match="user or project files"):
+        common_utils.reject_inherited_relay_plugin_config(
+            {
+                "diagnostics": [
+                    {
+                        "level": "warning",
+                        "code": "plugin.configuration_inherited",
+                        "message": message,
+                    }
+                ]
+            }
+        )
 
 
 def test_dump_yaml_falls_back_to_json_when_yaml_is_unavailable(
@@ -300,7 +471,7 @@ def test_without_none_preserves_falsey_values():
     }
 
 
-def test_load_relay_plugin_config_wraps_and_normalizes_bare_observability_config(
+def test_load_relay_plugin_config_wraps_and_normalizes_bare_v3_observability_config(
     tmp_path: Path,
 ):
     config_path = tmp_path / "relay.json"
@@ -309,6 +480,7 @@ def test_load_relay_plugin_config_wraps_and_normalizes_bare_observability_config
             {
                 "relay": {
                     "config": {
+                        "version": 3,
                         "atof": {
                             "enabled": True,
                             "sinks": [
@@ -351,7 +523,7 @@ def test_load_relay_plugin_config_wraps_and_normalizes_bare_observability_config
 
     assert plugin_config["version"] == 1
     assert plugin_config["components"][0]["kind"] == "observability"
-    assert observability["version"] == 2
+    assert observability["version"] == 3
     file_sink, stream_sink = observability["atof"]["sinks"]
     assert file_sink["output_directory"] == str(
         tmp_path / "custom-relay" / "runtime-current"
@@ -385,6 +557,44 @@ def test_load_relay_plugin_config_wraps_and_normalizes_bare_observability_config
         {"kind": "atof", "path": str(atof_file)},
         {"kind": "atif", "path": str(atif_file)},
     ]
+
+
+def test_load_relay_plugin_config_keeps_empty_config_component_free(tmp_path: Path):
+    config_path = tmp_path / "relay.json"
+    config_path.write_text(json.dumps({"relay": {"config": {}}}), encoding="utf-8")
+    os.environ["FABRIC_RELAY_CONFIG_PATH"] = str(config_path)
+
+    plugin_config = common_utils.load_relay_plugin_config(
+        {
+            "base_dir": str(tmp_path),
+            "runtime_context": {"runtime_id": "runtime-current"},
+        }
+    )
+
+    assert plugin_config == {"version": 1, "components": []}
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_load_relay_plugin_config_accepts_implicit_v3_without_inserting_version(
+    tmp_path: Path,
+):
+    config_path = tmp_path / "relay.json"
+    config_path.write_text(
+        json.dumps({"relay": {"config": {"atif": {"enabled": False}}}}),
+        encoding="utf-8",
+    )
+    os.environ["FABRIC_RELAY_CONFIG_PATH"] = str(config_path)
+
+    plugin_config = common_utils.load_relay_plugin_config(
+        {
+            "base_dir": str(tmp_path),
+            "runtime_context": {"runtime_id": "runtime-current"},
+        }
+    )
+
+    observability = plugin_config["components"][0]["config"]
+    assert observability == {"atif": {"enabled": False}}
+    assert "version" not in observability
 
 
 def test_collect_relay_artifacts(tmp_path: Path):
@@ -594,12 +804,16 @@ def test_collect_relay_artifacts_ignores_path_resolution_runtime_errors(
 
     monkeypatch.setattr(Path, "resolve", resolve)
 
-    assert common_utils.collect_relay_artifacts(
-        _atof_artifact_config(tmp_path / "loop")
-    ) == []
-    assert common_utils.collect_relay_artifacts(
-        _atof_artifact_config(artifact_dir, filename="loop")
-    ) == []
+    assert (
+        common_utils.collect_relay_artifacts(_atof_artifact_config(tmp_path / "loop"))
+        == []
+    )
+    assert (
+        common_utils.collect_relay_artifacts(
+            _atof_artifact_config(artifact_dir, filename="loop")
+        )
+        == []
+    )
 
 
 def test_collect_relay_artifacts_non_string_atof_filename_uses_glob(tmp_path: Path):
@@ -640,7 +854,7 @@ def test_collect_relay_artifacts_ignores_malformed_paths(tmp_path: Path):
     assert common_utils.collect_relay_artifacts(plugin_config) == []
 
 
-def test_relay_validates_raw_v06_plugin_config():
+def test_relay_0_7_validates_v3_plugin_config():
     from nemo_relay import plugin
 
     os.environ["TOKEN"] = "test-token"
@@ -651,7 +865,7 @@ def test_relay_validates_raw_v06_plugin_config():
                 "kind": "observability",
                 "enabled": True,
                 "config": {
-                    "version": 2,
+                    "version": 3,
                     "atof": {
                         "enabled": True,
                         "sinks": [
@@ -678,6 +892,115 @@ def test_relay_validates_raw_v06_plugin_config():
         ],
     }
 
+    common_utils.validate_relay_observability_v3(plugin_config)
+    assert plugin.validate(plugin_config)["diagnostics"] == []
+
+
+async def test_relay_0_7_initializes_v3_atof_atif_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Regress the initialize-only failure that prompted the Relay 0.6 pin."""
+
+    from nemo_relay import plugin
+
+    os.environ["XDG_CONFIG_HOME"] = str(tmp_path / "xdg")
+    monkeypatch.chdir(tmp_path)
+    artifact_directory = tmp_path / "artifacts"
+    artifact_directory.mkdir()
+    plugin_config = {
+        "version": 1,
+        "components": [
+            {
+                "kind": "observability",
+                "enabled": True,
+                "config": {
+                    "version": 3,
+                    "atof": {
+                        "enabled": True,
+                        "sinks": [
+                            {
+                                "type": "file",
+                                "output_directory": str(artifact_directory),
+                                "filename": "events.atof.jsonl",
+                                "mode": "append",
+                            }
+                        ],
+                    },
+                    "atif": {
+                        "enabled": True,
+                        "output_directory": str(artifact_directory),
+                        "filename_template": "trajectory-{session_id}.atif.json",
+                        "agent_name": "fabric-agent",
+                        "agent_version": "test",
+                        "model_name": "test-model",
+                    },
+                },
+            }
+        ],
+    }
+    common_utils.validate_relay_observability_v3(plugin_config)
+    assert plugin.validate(plugin_config)["diagnostics"] == []
+    async with plugin.plugin(plugin_config) as activation_report:
+        assert activation_report["diagnostics"] == []
+
+
+def test_relay_0_7_validates_all_v3_otlp_fields():
+    from nemo_relay import plugin
+
+    os.environ["OTEL_TOKEN"] = "test-token"
+    plugin_config = {
+        "version": 1,
+        "components": [
+            {
+                "kind": "observability",
+                "enabled": True,
+                "config": {
+                    "version": 3,
+                    "atif": {
+                        "enabled": True,
+                        "output_directory": "/tmp/atif",
+                        "filename_template": "trajectory-{session_id}.atif.json",
+                    },
+                    "opentelemetry": {
+                        "enabled": True,
+                        "endpoints": [
+                            {
+                                "type": "full",
+                                "endpoint": "http://localhost:4318/v1/traces",
+                                "mark_projection": "tool",
+                                "mark_exclude_names": ["llm.chunk"],
+                                "attribute_mappings": [
+                                    {
+                                        "key": "gen_ai.request.model",
+                                        "alias": "llm.model",
+                                    }
+                                ],
+                                "transport": "http_binary",
+                                "headers": {"x-tenant": "evaluation"},
+                                "header_env": {"authorization": "OTEL_TOKEN"},
+                                "resource_attributes": {
+                                    "deployment.environment": "test"
+                                },
+                                "service_name": "fabric",
+                                "service_namespace": "platform",
+                                "service_version": "0.4.0",
+                                "instrumentation_scope": "fabric.relay",
+                                "timeout_millis": 1000,
+                            },
+                            {
+                                "type": "openinference",
+                                "endpoint": "http://localhost:6006/v1/traces",
+                                "transport": "grpc",
+                            },
+                        ],
+                    },
+                },
+            }
+        ],
+    }
+
+    common_utils.validate_relay_observability_v3(plugin_config)
     assert plugin.validate(plugin_config)["diagnostics"] == []
 
 
@@ -691,7 +1014,7 @@ def test_relay_validates_unknown_atof_sink_type():
                 "kind": "observability",
                 "enabled": True,
                 "config": {
-                    "version": 2,
+                    "version": 3,
                     "atof": {
                         "enabled": True,
                         "sinks": [{"type": "unknown"}],
@@ -747,8 +1070,90 @@ def test_write_relay_configs(
                 assert tomllib.load(stream) == config
 
 
-def test_write_relay_configs_preserves_current_cli_contract(tmp_path: Path):
-    os.environ["FABRIC_RELAY_CONFIG_PATH"] = str(tmp_path / "relay.json")
+def test_validate_relay_observability_v3_accepts_v3_and_implicit_v3_without_mutation():
+    plugin_config = {
+        "version": 1,
+        "components": [
+            {
+                "kind": "observability",
+                "enabled": True,
+                "config": {"version": 3, "atif": {"enabled": False}},
+            },
+            {
+                "kind": "observability",
+                "enabled": False,
+                "config": {"atof": {"enabled": False}},
+            },
+            {
+                "kind": "model_pricing",
+                "enabled": True,
+                "config": {"version": 2, "currency": "USD"},
+            },
+        ],
+    }
+    original = json.loads(json.dumps(plugin_config))
+
+    common_utils.validate_relay_observability_v3(plugin_config)
+
+    assert plugin_config == original
+
+
+def test_validate_relay_observability_v3_matches_relay_implicit_version():
+    from nemo_relay import plugin
+
+    plugin_config = {
+        "version": 1,
+        "components": [
+            {
+                "kind": "observability",
+                "enabled": True,
+                "config": {},
+            }
+        ],
+    }
+
+    common_utils.validate_relay_observability_v3(plugin_config)
+
+    assert plugin.validate(plugin_config)["diagnostics"] == []
+
+
+@pytest.mark.parametrize(
+    ("version", "enabled"),
+    [
+        (1, True),
+        (2, True),
+        (2, False),
+        (4, True),
+        (True, True),
+        (False, True),
+        ("3", True),
+        (3.0, True),
+        (None, True),
+    ],
+)
+def test_validate_relay_observability_v3_rejects_explicit_non_v3_versions(
+    version: object,
+    enabled: bool,
+):
+    plugin_config = {
+        "version": 1,
+        "components": [
+            {
+                "kind": "observability",
+                "enabled": enabled,
+                "config": {"version": version},
+            }
+        ],
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"unsupported NeMo Relay observability config version .*expected version 3",
+    ):
+        common_utils.validate_relay_observability_v3(plugin_config)
+
+
+def test_validate_relay_observability_v3_reports_version_before_v3_shape():
     plugin_config = {
         "version": 1,
         "components": [
@@ -757,64 +1162,383 @@ def test_write_relay_configs_preserves_current_cli_contract(tmp_path: Path):
                 "enabled": True,
                 "config": {
                     "version": 2,
-                    "atof": {
+                    "opentelemetry": {
                         "enabled": True,
-                        "sinks": [
-                            {
-                                "type": "file",
-                                "output_directory": "/tmp/atof",
-                                "filename": "events.jsonl",
-                                "mode": "overwrite",
-                            },
-                            {
-                                "type": "stream",
-                                "url": "https://example.test/events",
-                                "transport": "http_post",
-                                "headers": {"x-test": "value"},
-                                "header_env": {"authorization": "TOKEN"},
-                                "timeout_millis": 1000,
-                                "field_name_policy": "replace_dots",
-                            },
-                        ],
+                        "endpoint": "http://localhost:4318/v1/traces",
                     },
-                    "atif": {"enabled": True, "output_directory": "/tmp/atif"},
                 },
             }
         ],
     }
 
-    _, plugin_path = common_utils.write_relay_configs(
-        plugin_config=plugin_config,
-        observability_version=2,
+    with pytest.raises(
+        ValueError,
+        match=r"unsupported NeMo Relay observability config version 2",
+    ):
+        common_utils.validate_relay_observability_v3(plugin_config)
+
+
+@pytest.mark.parametrize(
+    ("opentelemetry", "valid"),
+    [
+        ({"enabled": True}, False),
+        ({"enabled": True, "endpoints": []}, False),
+        ({"enabled": False, "endpoints": []}, True),
+    ],
+)
+def test_validate_relay_observability_v3_requires_endpoint_when_enabled(
+    opentelemetry: dict[str, object],
+    valid: bool,
+):
+    plugin_config = {
+        "version": 1,
+        "components": [
+            {
+                "kind": "observability",
+                "enabled": True,
+                "config": {
+                    "version": 3,
+                    "opentelemetry": opentelemetry,
+                },
+            }
+        ],
+    }
+
+    if valid:
+        common_utils.validate_relay_observability_v3(plugin_config)
+    else:
+        with pytest.raises(ValueError, match="requires at least one endpoint"):
+            common_utils.validate_relay_observability_v3(plugin_config)
+
+
+@pytest.mark.parametrize(
+    ("opentelemetry", "message"),
+    [
+        (False, "opentelemetry config must be an object"),
+        ({"enabled": "true"}, r"opentelemetry\.enabled must be a boolean"),
+        ({"endpoints": None}, r"opentelemetry\.endpoints must be a list"),
+        ({"endpoints": "endpoint"}, r"opentelemetry\.endpoints must be a list"),
+        (
+            {"endpoints": [False]},
+            r"endpoint must be an object for opentelemetry\.endpoints\[0\]",
+        ),
+        (
+            {"endpoints": [{"endpoint": "http://localhost:4318/v1/traces"}]},
+            r"endpoint type must be one of .*opentelemetry\.endpoints\[0\]\.type",
+        ),
+        (
+            {
+                "endpoints": [
+                    {
+                        "type": "zipkin",
+                        "endpoint": "http://localhost:4318/v1/traces",
+                    }
+                ]
+            },
+            r"endpoint type must be one of .*opentelemetry\.endpoints\[0\]\.type",
+        ),
+        (
+            {"endpoints": [{"type": "full"}]},
+            r"endpoint must be a non-empty string for opentelemetry\.endpoints\[0\]",
+        ),
+    ],
+)
+def test_validate_relay_observability_v3_rejects_malformed_opentelemetry(
+    opentelemetry: object,
+    message: str,
+):
+    plugin_config = {
+        "version": 1,
+        "components": [
+            {
+                "kind": "observability",
+                "enabled": True,
+                "config": {"version": 3, "opentelemetry": opentelemetry},
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match=message):
+        common_utils.validate_relay_observability_v3(plugin_config)
+
+
+@pytest.mark.parametrize("endpoint_type", ["full", "gen_ai", "openinference"])
+def test_validate_relay_observability_v3_accepts_endpoint_types(endpoint_type: str):
+    common_utils.validate_relay_observability_v3(
+        {
+            "version": 1,
+            "components": [
+                {
+                    "kind": "observability",
+                    "enabled": True,
+                    "config": {
+                        "version": 3,
+                        "opentelemetry": {
+                            "endpoints": [
+                                {
+                                    "type": endpoint_type,
+                                    "endpoint": "http://localhost:4318/v1/traces",
+                                }
+                            ]
+                        },
+                    },
+                }
+            ],
+        }
     )
 
-    assert plugin_path is not None
-    with plugin_path.open("rb") as stream:
-        rendered = tomllib.load(stream)
-    observability = rendered["components"][0]["config"]
-    assert observability["version"] == 2
-    assert observability["atof"] == {
-        "enabled": True,
-        "sinks": [
+
+@pytest.mark.parametrize("endpoint", [None, 42, "", " \t "])
+def test_validate_relay_observability_v3_rejects_invalid_endpoint(endpoint: object):
+    plugin_config = {
+        "version": 1,
+        "components": [
             {
-                "type": "file",
-                "output_directory": "/tmp/atof",
-                "filename": "events.jsonl",
-                "mode": "overwrite",
+                "kind": "observability",
+                "enabled": True,
+                "config": {
+                    "version": 3,
+                    "opentelemetry": {
+                        "enabled": True,
+                        "endpoints": [{"type": "full", "endpoint": endpoint}],
+                    },
+                },
+            }
+        ],
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"non-empty string for opentelemetry\.endpoints\[0\]",
+    ):
+        common_utils.validate_relay_observability_v3(plugin_config)
+
+
+@pytest.mark.parametrize("config", [None, [], "version = 3", 3])
+def test_validate_relay_observability_v3_requires_object_config(config: object):
+    plugin_config = {
+        "version": 1,
+        "components": [
+            {
+                "kind": "observability",
+                "enabled": False,
+                "config": config,
+            }
+        ],
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="NeMo Relay observability component config must be an object",
+    ):
+        common_utils.validate_relay_observability_v3(plugin_config)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {
+            "version": 3,
+            "openinference": {
+                "enabled": True,
+                "endpoint": "http://localhost:6006/v1/traces",
+            },
+        },
+        {
+            "version": 3,
+            "opentelemetry": {
+                "enabled": True,
+                "endpoint": "http://localhost:4318/v1/traces",
+            },
+        },
+    ],
+)
+def test_validate_relay_observability_v3_rejects_legacy_exporter_shapes(config):
+    plugin_config = {
+        "version": 1,
+        "components": [
+            {
+                "kind": "observability",
+                "enabled": True,
+                "config": config,
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="observability config version 3"):
+        common_utils.validate_relay_observability_v3(plugin_config)
+
+
+def test_normalize_relay_output_dirs_validates_all_components_before_mutation(
+    tmp_path: Path,
+):
+    plugin_config = {
+        "version": 1,
+        "components": [
+            {
+                "kind": "observability",
+                "enabled": True,
+                "config": {
+                    "version": 3,
+                    "atof": {
+                        "enabled": True,
+                        "sinks": [
+                            {
+                                "type": "file",
+                                "output_directory": "first",
+                            }
+                        ],
+                    },
+                },
             },
             {
-                "type": "stream",
-                "url": "https://example.test/events",
-                "transport": "http_post",
-                "headers": {"x-test": "value"},
-                "header_env": {"authorization": "TOKEN"},
-                "timeout_millis": 1000,
-                "field_name_policy": "replace_dots",
+                "kind": "observability",
+                "enabled": False,
+                "config": {
+                    "version": 2,
+                    "atif": {"enabled": True},
+                },
             },
         ],
     }
-    assert observability["atif"] == {
-        "enabled": True,
-        "output_directory": "/tmp/atif",
+    original = json.loads(json.dumps(plugin_config))
+
+    with pytest.raises(ValueError, match="config version 2"):
+        common_utils.normalize_relay_output_dirs(
+            plugin_config,
+            {
+                "base_dir": str(tmp_path),
+                "runtime_context": {"runtime_id": "runtime-current"},
+            },
+        )
+
+    assert plugin_config == original
+    assert not (tmp_path / "first").exists()
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_load_relay_plugin_config_rejects_v2_before_creating_directories(
+    tmp_path: Path,
+):
+    config_path = tmp_path / "relay.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "relay": {
+                    "config": {
+                        "version": 1,
+                        "components": [
+                            {
+                                "kind": "observability",
+                                "enabled": True,
+                                "config": {
+                                    "version": 2,
+                                    "atif": {"enabled": True},
+                                },
+                            }
+                        ],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.environ["FABRIC_RELAY_CONFIG_PATH"] = str(config_path)
+
+    with pytest.raises(ValueError, match="config version 2"):
+        common_utils.load_relay_plugin_config(
+            {
+                "base_dir": str(tmp_path),
+                "runtime_context": {"runtime_id": "runtime-current"},
+            }
+        )
+
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_write_relay_configs_preserves_v3_plugin_config_exactly(tmp_path: Path):
+    os.environ["FABRIC_RELAY_CONFIG_PATH"] = str(tmp_path / "relay.json")
+    plugin_config = {
+        "version": 1,
+        "policy": {"unknown_component": "warn"},
+        "components": [
+            {
+                "kind": "observability",
+                "enabled": True,
+                "config": {
+                    "version": 3,
+                    "atif": {"enabled": False},
+                    "opentelemetry": {
+                        "enabled": True,
+                        "endpoints": [
+                            {
+                                "type": "openinference",
+                                "endpoint": "http://localhost:6006/v1/traces",
+                            }
+                        ],
+                    },
+                },
+            },
+            {
+                "kind": "model_pricing",
+                "enabled": True,
+                "config": {"version": 2, "currency": "USD"},
+            },
+        ],
     }
-    assert rendered == plugin_config
+    original = json.loads(json.dumps(plugin_config))
+
+    _, plugin_path = common_utils.write_relay_configs(plugin_config=plugin_config)
+
+    assert plugin_path is not None
+    with plugin_path.open("rb") as stream:
+        assert tomllib.load(stream) == original
+    assert plugin_config == original
+
+
+def test_write_relay_configs_rejects_v2_before_creating_config_directory(
+    tmp_path: Path,
+):
+    os.environ["FABRIC_RELAY_CONFIG_PATH"] = str(tmp_path / "nested" / "relay.json")
+    plugin_config = {
+        "version": 1,
+        "components": [
+            {
+                "kind": "observability",
+                "enabled": True,
+                "config": {"version": 2},
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="config version 2"):
+        common_utils.write_relay_configs(
+            relay_config={"agents": {}},
+            plugin_config=plugin_config,
+        )
+
+    assert not (tmp_path / "nested" / "relay-config").exists()
+
+
+def test_write_relay_configs_rejects_null_endpoints_before_creating_directory(
+    tmp_path: Path,
+):
+    os.environ["FABRIC_RELAY_CONFIG_PATH"] = str(tmp_path / "nested" / "relay.json")
+    plugin_config = {
+        "version": 1,
+        "components": [
+            {
+                "kind": "observability",
+                "enabled": True,
+                "config": {
+                    "version": 3,
+                    "opentelemetry": {"endpoints": None},
+                },
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match=r"opentelemetry\.endpoints must be a list"):
+        common_utils.write_relay_configs(plugin_config=plugin_config)
+
+    assert not (tmp_path / "nested" / "relay-config").exists()

@@ -12,7 +12,9 @@ ref_name := ""
 # Linux wheel artifacts target this minimum glibc version for compatibility.
 linux_glibc_version := "2.17"
 
-python_projects := ". python adapters/common adapters/claude adapters/codex adapters/deepagents adapters/hermes"
+python_projects := ". sdk/python/nemo-fabric sdk/python/nemo-fabric-runtime adapter-contract/python adapters/common adapters/claude adapters/codex adapters/deepagents adapters/hermes adapters/mini-swe-agent adapters/pi adapters/pi-cli-bin"
+
+python_packages := "sdk/python/nemo-fabric sdk/python/nemo-fabric-runtime adapter-contract/python adapters/common adapters/claude adapters/codex adapters/deepagents adapters/hermes adapters/mini-swe-agent adapters/pi adapters/pi-cli-bin"
 
 bash_helpers := '''
 set -euo pipefail
@@ -203,7 +205,8 @@ PY
 
     local metadata_file=""
     metadata_file="$(mktemp)"
-    if ! cargo metadata --no-deps --format-version 1 > "$metadata_file"; then
+    # Resolve dependencies so Cargo refreshes workspace package versions in Cargo.lock.
+    if ! cargo metadata --format-version 1 > "$metadata_file"; then
         rm -f "$metadata_file"
         return 1
     fi
@@ -245,84 +248,53 @@ set_python_project_versions() {
     local python_executable=""
     version="$(semver_to_pep440 "$1")"
     python_executable="$(uv_python_executable)"
+    "$python_executable" scripts/ci/set_python_project_versions.py "$version"
+}
 
-    "$python_executable" - "$version" <<'PY'
-from pathlib import Path
-import re
-import sys
-import tomllib
-
-version = sys.argv[1]
-project_paths = (
-    Path("pyproject.toml"),
-    *sorted(Path("adapters").glob("**/pyproject.toml")),
-)
-pin_pattern = re.compile(r'(nemo-fabric-[a-z0-9-]+\s*==\s*)([^"\s,;]+)')
-
-for path in project_paths:
-    text = path.read_text()
-    updated, count = re.subn(
-        r'^version\s*=\s*"[^"]+"$',
-        f'version = "{version}"',
-        text,
-        count=1,
-        flags=re.MULTILINE,
-    )
-    if count != 1:
-        raise SystemExit(f"Failed to find exactly one project version in {path}")
-    updated = pin_pattern.sub(rf"\g<1>{version}", updated)
-    if updated != text:
-        path.write_text(updated)
-        print(f"{path} version and internal pins updated to {version}")
-    else:
-        print(f"{path} already set to {version}")
-
-runtime_path = Path("python/pyproject.toml")
-runtime = tomllib.loads(runtime_path.read_text())
-project = runtime.get("project", {})
-if "version" in project or "version" not in project.get("dynamic", []):
-    raise SystemExit(
-        "python/pyproject.toml must keep a dynamic version derived from Cargo.toml"
-    )
-
-mismatched_pins = []
-for path in project_paths:
-    for match in pin_pattern.finditer(path.read_text()):
-        if match.group(2) != version:
-            mismatched_pins.append(f"{path}: {match.group(0)}")
-if mismatched_pins:
-    raise SystemExit(
-        "Internal Python dependency pins are not synchronized: "
-        + ", ".join(mismatched_pins)
-    )
-print("python/pyproject.toml continues to derive its version from Cargo.toml")
-PY
+set_typescript_project_version() {
+    local version="$1"
+    local python_executable=""
+    python_executable="$(uv_python_executable)"
+    "$python_executable" scripts/ci/set_typescript_project_version.py "$version"
 }
 
 set_project_version() {
     local version="$1"
     set_cargo_workspace_version "$version"
     set_python_project_versions "$version"
+    set_typescript_project_version "$version"
 }
 '''
 
-# Remove local Rust and Python build and test artifacts.
+# Remove local Rust, Python, and TypeScript build and test artifacts.
 clean:
     #!/usr/bin/env bash
-    shopt -s globstar nullglob
+    set -euo pipefail
     cargo clean
     rm -rf \
         .coverage \
-        .pytest_cache \
-        python/.pytest_cache \
-        **/__pycache__ \
-        **/*.egg-info \
-        **/*.so \
-        **/coverage.xml \
-        **/dist \
+        build \
+        dist \
+        adapter-contract/python/build \
+        adapter-contract/python/dist \
         docs/node_modules \
-        target/ \
-        **/build/
+        adapter-contract/typescript/node_modules \
+        adapter-contract/typescript/dist \
+        adapters/*/build \
+        adapters/*/dist \
+        sdk/python/*/build \
+        sdk/python/*/dist \
+        adapter-contract/typescript/*.tgz
+    find . \
+        \( -path './.venv' -o -path './.git' \) -prune -o \
+        -type d \( \
+            -name .pytest_cache -o \
+            -name __pycache__ -o \
+            -name '*.egg-info' \
+        \) -prune -exec rm -rf {} +
+    find . \
+        \( -path './.venv' -o -path './.git' \) -prune -o \
+        -type f \( -name '*.so' -o -name coverage.xml \) -exec rm -f {} +
 
 # Build the Rust workspace using the locked dependency set.
 build-rust:
@@ -336,20 +308,70 @@ build-python:
     set -euo pipefail
     if [[ "{{ no_uv }}" == "true" ]]; then
         editable_projects=()
-        for project in {{ python_projects }}; do
+        for project in {{ python_packages }}; do
             editable_projects+=(--editable "$project")
         done
         uv pip install --python .venv/bin/python --no-deps --reinstall \
             --group adapters \
             "${editable_projects[@]}"
     else
-        uv sync --no-default-groups --group adapters --extra claude --extra runtime \
+        uv sync --no-default-groups --group adapters \
             --reinstall-package nemo-fabric \
             --reinstall-package nemo-fabric-runtime
     fi
 
+# Install the TypeScript adapter contract dependencies from the lockfile.
+install-typescript:
+    npm ci --prefix adapter-contract/typescript --ignore-scripts
+
+# Install the Hermes Agent into the Fabric virtualenv for local development
+# and testing.
+# Hermes Agent no longer publishes a PyPI package, so we need to install it
+# from source.
+# The documented https://hermes-agent.nousresearch.com/install.sh script is
+# tied directly to Python 3.11, we also want to ensure that we are installing
+# into our Fabric virtualenv
+# f80f453ae0679347e38abc917c7f94f717bf96c5 aligns with Hermes Agent v0.20.1.
+install-hermes-agent:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    hermes_commit="f80f453ae0679347e38abc917c7f94f717bf96c5"
+    hermes_checkout="$REPO_ROOT/external/hermes-agent"
+
+    if [[ -e "$hermes_checkout" && ! -d "$hermes_checkout/.git" ]]; then
+        echo "ERROR: expected a Git checkout at $hermes_checkout" >&2
+        exit 1
+    fi
+    if [[ ! -d "$hermes_checkout/.git" ]]; then
+        mkdir -p "$(dirname "$hermes_checkout")"
+        git init --quiet "$hermes_checkout"
+        git -C "$hermes_checkout" remote add origin https://github.com/NousResearch/hermes-agent.git
+    elif ! git -C "$hermes_checkout" diff --quiet || ! git -C "$hermes_checkout" diff --cached --quiet; then
+        echo "ERROR: Hermes Agent checkout has tracked changes: $hermes_checkout" >&2
+        exit 1
+    fi
+    git -C "$hermes_checkout" fetch --depth 1 origin "$hermes_commit"
+    git -C "$hermes_checkout" checkout --quiet --detach FETCH_HEAD
+    uv sync --inexact --reinstall-package hermes-agent
+
+# Build the TypeScript adapter contract using the locked dependency set.
+build-typescript: install-typescript
+    npm run build --prefix adapter-contract/typescript
+
+# Generate the TypeScript adapter contract from the committed JSON Schemas.
+generate-typescript-contract: install-typescript
+    npm run generate --prefix adapter-contract/typescript
+
+# Verify the TypeScript adapter contract package tarball.
+pack-typescript: install-typescript
+    npm run pack:check --prefix adapter-contract/typescript
+
+# Generate the JSON Schema files from the Rust configuration types.
+schemas:
+    cargo run -p nemo-fabric-core --example generate-schemas -- schemas
+
 # Build all supported language packages.
-build-all: build-rust build-python
+build-all: build-rust build-python schemas build-typescript
 
 # Create or update the lockfile for every Python project.
 lock-python:
@@ -362,15 +384,32 @@ lock-python:
 
 # Normalize a release tag to the version used by package metadata.
 normalize-release-tag tag:
-    @uv run --no-project --no-cache python scripts/ci/normalize_release_tag.py "{{ tag }}"
+    @uv run --no-project --no-cache python scripts/ci/normalize_release_tag.py {{ quote(tag) }}
+
+# Apply a release version only to Cargo workspace metadata and Cargo.lock.
+# Tag publication uses this narrow recipe in a disposable checkout.
+set-cargo-version version="":
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    version={{ quote(version) }}
+    if [[ -z "$version" ]]; then
+        version={{ quote(ref_name) }}
+    fi
+    if [[ -z "$version" ]]; then
+        echo "Error: version is required for set-cargo-version" >&2
+        exit 1
+    fi
+    version="$(just normalize-release-tag "$version")"
+    cd "$REPO_ROOT"
+    set_cargo_workspace_version "$version"
 
 # [version-or-tag] or --set ref_name=<version-or-tag>
 set-version version="":
     #!/usr/bin/env bash
     {{ bash_helpers }}
-    version="{{ version }}"
+    version={{ quote(version) }}
     if [[ -z "$version" ]]; then
-        version="{{ ref_name }}"
+        version={{ quote(ref_name) }}
     fi
     if [[ -z "$version" ]]; then
         echo "Error: version is required for set-version" >&2
@@ -387,7 +426,7 @@ docs:
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ "{{ no_uv }}" != "true" ]]; then
-        uv sync --group docs
+        uv sync --frozen --no-default-groups --group docs
     fi
     npm ci --prefix docs --ignore-scripts
     PATH="{{ REPO_ROOT }}/.venv/bin:$PATH" bash scripts/generate_api_docs.sh
@@ -414,7 +453,7 @@ test-python:
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ "{{ no_uv }}" != "true" ]]; then
-        uv sync --group test --no-group dev --extra claude --extra codex --extra deepagents --extra harbor --extra hermes --extra hermes-agent --extra relay --extra runtime
+        uv sync --no-default-groups --group adapters --group adapter-tests --group test --extra harbor --extra relay
     fi
     uv run --no-sync pytest
 
@@ -422,8 +461,12 @@ test-python:
 test-rust:
     cargo test --workspace --locked
 
-# Run all Rust and Python tests.
-test-all: test-rust test-python
+# Run the TypeScript adapter contract checks using the locked dependency set.
+test-typescript: install-typescript
+    npm test --prefix adapter-contract/typescript
+
+# Run all Rust, Python, and TypeScript tests.
+test-all: test-rust test-python test-typescript
 
 # Build wheels for every Python project into the repository dist directory.
 wheels:
@@ -435,12 +478,12 @@ wheels:
     if [[ "$(uname -s)" == "Linux" ]]; then
         prepend_ziglang_to_path "$(uv_python_executable)"
     fi
-    projects=({{ python_projects }})
-    uv build --wheel --clear --out-dir dist .
+    projects=({{ python_packages }})
+    uv build --wheel --clear --out-dir dist sdk/python/nemo-fabric
     for project in "${projects[@]}"; do
-        if [[ "$project" == "." || "$project" == "python" ]]; then
-            # Exclude the top-level package as we already built that
-            # Exclude the python package as that needs special handling for maturin
+        if [[ "$project" == "sdk/python/nemo-fabric" || "$project" == "sdk/python/nemo-fabric-runtime" ]]; then
+            # The metapackage was built first so --clear applies exactly once.
+            # The native runtime needs Maturin's platform compatibility handling.
             continue
         fi
         uv build --wheel --out-dir dist "$project"
@@ -451,10 +494,14 @@ wheels:
         build_args+=("$arg")
     done < <(python_wheel_build_args)
     (
-        cd python
+        cd sdk/python/nemo-fabric-runtime
         maturin build \
             --release \
             --locked \
             "${build_args[@]}" \
-            --out ../dist
+            --out "$REPO_ROOT/dist"
     )
+
+# Verify every built wheel contains the canonical repository license.
+check-wheel-licenses:
+    uv run --no-project --no-cache python scripts/ci/check_wheel_licenses.py

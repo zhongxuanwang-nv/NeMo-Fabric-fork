@@ -523,16 +523,29 @@ async def test_async_lifecycle_methods_resolve_plans(
     assert len(planning_calls) == 2
 
 
+@pytest.mark.parametrize(
+    ("stop_error", "expected_message"),
+    [
+        (RuntimeError("stop failed"), "stop failed"),
+        (RuntimeError(), "runtime shutdown failed"),
+    ],
+)
 async def test_run_surfaces_cleanup_failure_after_success(
     native_client: Fabric,
     mock_native: MagicMock,
+    stop_error: RuntimeError,
+    expected_message: str,
 ):
-    mock_native.stop_runtime.side_effect = RuntimeError("stop failed")
+    mock_native.stop_runtime.side_effect = stop_error
 
-    with pytest.raises(FabricRuntimeError, match="stop failed") as caught:
-        await native_client.run(_config(), input="hello")
+    result = await native_client.run(_config(), input="hello")
 
-    assert caught.value.stage == "run"
+    assert result.status == "failed"
+    assert result.output["messages"][-1]["content"] == "reply-1"
+    assert result.error is not None
+    assert result.error.stage == "stop"
+    assert result.error.code == "runtime_stop_failed"
+    assert result.error.message == expected_message
     assert mock_native.stop_runtime.call_count == 1
 
 

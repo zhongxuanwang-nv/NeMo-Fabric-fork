@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nemo_fabric_core::{
-    FabricConfig, ResolveContext, RunPlan, RunRequest, RuntimeHandle, doctor_plan,
-    resolve_diagnostic_plan_from_config_with_adapter_directories,
+    FabricConfig, OpenAiStreamTransport, ResolveContext, RunPlan, RunRequest, RuntimeHandle,
+    doctor_plan, resolve_diagnostic_plan_from_config_with_adapter_directories,
     resolve_run_plan_from_config_with_adapter_directories, run_plan,
 };
 use pyo3::exceptions::PyRuntimeError;
@@ -22,14 +22,6 @@ const PYTHON_DATA_PATH_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const PYTHON_DATA_PATH_QUERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PYTHON_DATA_PATH_SCRIPT: &str =
     "import json, sysconfig; print(json.dumps(sysconfig.get_path('data')))";
-
-#[derive(serde::Deserialize)]
-struct PythonDiscoverySettings {
-    #[serde(default)]
-    python: Option<PathBuf>,
-    #[serde(default)]
-    python_env: Option<String>,
-}
 
 /// Return the NeMo Fabric core version.
 #[pyfunction]
@@ -42,7 +34,7 @@ fn version() -> PyResult<String> {
 #[pyo3(signature = (config_json, base_dir=None))]
 fn plan_config(py: Python<'_>, config_json: String, base_dir: Option<String>) -> PyResult<String> {
     let config = parse_config(config_json)?;
-    let (context, adapter_directories) = resolve_context(py, base_dir, &config)?;
+    let (context, adapter_directories) = resolve_context(py, base_dir)?;
     let plan = py
         .detach(|| {
             resolve_run_plan_from_config_with_adapter_directories(
@@ -64,7 +56,7 @@ fn doctor_config(
     base_dir: Option<String>,
 ) -> PyResult<String> {
     let config = parse_config(config_json)?;
-    let (context, adapter_directories) = resolve_context(py, base_dir, &config)?;
+    let (context, adapter_directories) = resolve_context(py, base_dir)?;
     let plan = py
         .detach(|| {
             resolve_diagnostic_plan_from_config_with_adapter_directories(
@@ -90,7 +82,7 @@ fn run_config(
     request_file: Option<String>,
 ) -> PyResult<String> {
     let config = parse_config(config_json)?;
-    let (context, adapter_directories) = resolve_context(py, base_dir, &config)?;
+    let (context, adapter_directories) = resolve_context(py, base_dir)?;
     let plan = py
         .detach(|| {
             resolve_run_plan_from_config_with_adapter_directories(
@@ -152,6 +144,25 @@ fn invoke_runtime(
     to_json(&result)
 }
 
+/// Invoke a previously started runtime with native OpenAI streaming.
+#[pyfunction]
+fn invoke_openai_stream(
+    py: Python<'_>,
+    plan_json: String,
+    runtime_json: String,
+    request_json: String,
+    transport_json: String,
+) -> PyResult<String> {
+    let plan = parse_run_plan(plan_json)?;
+    let runtime = parse_runtime_handle(runtime_json)?;
+    let request = parse_run_request(request_json)?;
+    let transport = parse_openai_stream_transport(transport_json)?;
+    let result = py
+        .detach(|| nemo_fabric_core::invoke_openai_stream(&plan, &runtime, request, transport))
+        .map_err(to_py_error)?;
+    to_json(&result)
+}
+
 /// Stop a previously started runtime and return FabricEvent list JSON.
 #[pyfunction]
 fn stop_runtime(py: Python<'_>, plan_json: String, runtime_json: String) -> PyResult<String> {
@@ -171,6 +182,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_config, m)?)?;
     m.add_function(wrap_pyfunction!(start_runtime, m)?)?;
     m.add_function(wrap_pyfunction!(invoke_runtime, m)?)?;
+    m.add_function(wrap_pyfunction!(invoke_openai_stream, m)?)?;
     m.add_function(wrap_pyfunction!(stop_runtime, m)?)?;
     Ok(())
 }
@@ -189,10 +201,9 @@ fn to_py_error(error: nemo_fabric_core::FabricError) -> PyErr {
 fn resolve_context(
     py: Python<'_>,
     base_dir: Option<String>,
-    config: &FabricConfig,
 ) -> PyResult<(ResolveContext, Vec<PathBuf>)> {
     let base_dir = PathBuf::from(base_dir.unwrap_or_else(|| ".".to_string()));
-    let data_path = match discovery_python(config, &base_dir)? {
+    let data_path = match discovery_python(&base_dir) {
         Some((python, origin)) => py
             .detach(|| query_python_data_path(&python, &origin))
             .map_err(PyRuntimeError::new_err)?,
@@ -201,45 +212,21 @@ fn resolve_context(
             .call_method1("get_path", ("data",))?
             .extract()?,
     };
-    // Stopgap: Python adapter wheels install descriptors under the interpreter's
-    // data root. Use the runtime's explicit interpreter precedence so descriptor
-    // metadata matches the adapter code that will execute. A provider-backed
-    // adapter registry should replace this implicit environment scan.
-    let installed_adapters = PathBuf::from(data_path)
-        .join("share")
-        .join("nemo-fabric")
-        .join("adapters");
-    Ok((ResolveContext::new(base_dir), vec![installed_adapters]))
+    // Adapter and target packages publish declarative metadata under the
+    // selected interpreter's shared NeMo Fabric data root.
+    let installed_descriptors = PathBuf::from(data_path).join("share").join("nemo-fabric");
+    Ok((ResolveContext::new(base_dir), vec![installed_descriptors]))
 }
 
-fn discovery_python(config: &FabricConfig, base_dir: &Path) -> PyResult<Option<(PathBuf, String)>> {
-    let settings: PythonDiscoverySettings =
-        serde_json::from_value(serde_json::Value::Object(config.harness.settings.clone()))
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-    if let Some(python) = settings.python {
-        return Ok(Some((
-            resolve_adapter_python(base_dir, python.into_os_string()),
-            "harness.settings.python".to_string(),
-        )));
-    }
-    if let Some(env_name) = settings.python_env {
-        return Ok(std::env::var_os(&env_name)
-            .filter(|python| !python.is_empty())
-            .map(|python| {
-                (
-                    resolve_adapter_python(base_dir, python),
-                    format!("harness.settings.python_env (`{env_name}`)"),
-                )
-            }));
-    }
-    Ok(std::env::var_os(ADAPTER_PYTHON_ENV)
+fn discovery_python(base_dir: &Path) -> Option<(PathBuf, String)> {
+    std::env::var_os(ADAPTER_PYTHON_ENV)
         .filter(|python| !python.is_empty())
         .map(|python| {
             (
                 resolve_adapter_python(base_dir, python),
                 ADAPTER_PYTHON_ENV.to_string(),
             )
-        }))
+        })
 }
 
 fn resolve_adapter_python(base_dir: &Path, adapter_python: OsString) -> PathBuf {
@@ -252,6 +239,14 @@ fn resolve_adapter_python(base_dir: &Path, adapter_python: OsString) -> PathBuf 
 }
 
 fn query_python_data_path(python: &Path, origin: &str) -> Result<String, String> {
+    query_python_data_path_with_timeout(python, origin, PYTHON_DATA_PATH_QUERY_TIMEOUT)
+}
+
+fn query_python_data_path_with_timeout(
+    python: &Path,
+    origin: &str,
+    timeout: Duration,
+) -> Result<String, String> {
     let mut child = Command::new(python)
         .arg("-c")
         .arg(PYTHON_DATA_PATH_SCRIPT)
@@ -264,7 +259,7 @@ fn query_python_data_path(python: &Path, origin: &str) -> Result<String, String>
                 python.display()
             )
         })?;
-    let deadline = Instant::now() + PYTHON_DATA_PATH_QUERY_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -277,7 +272,7 @@ fn query_python_data_path(python: &Path, origin: &str) -> Result<String, String>
                 return Err(format!(
                     "{origin} interpreter `{}` timed out after {} seconds while reporting its data path",
                     python.display(),
-                    PYTHON_DATA_PATH_QUERY_TIMEOUT.as_secs()
+                    timeout.as_secs_f64()
                 ));
             }
             Err(error) => {
@@ -318,6 +313,49 @@ fn query_python_data_path(python: &Path, origin: &str) -> Result<String, String>
     Ok(data_path)
 }
 
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant, SystemTime};
+
+    use super::query_python_data_path_with_timeout;
+
+    #[test]
+    fn python_data_path_query_times_out() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let test_dir = std::env::temp_dir().join(format!(
+            "nemo-fabric-python-data-path-timeout-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&test_dir).expect("temporary test directory should be created");
+        let slow_python = test_dir.join("slow-python");
+        fs::write(&slow_python, "#!/bin/sh\nwhile :; do :; done\n")
+            .expect("slow test executable should be written");
+        let mut permissions = fs::metadata(&slow_python)
+            .expect("slow test executable metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&slow_python, permissions)
+            .expect("slow test executable should be executable");
+
+        let started = Instant::now();
+        let error = query_python_data_path_with_timeout(
+            &slow_python,
+            "ADAPTER_PYTHON",
+            Duration::from_millis(50),
+        )
+        .expect_err("slow data path query should time out");
+
+        assert!(error.contains("timed out after 0.05 seconds"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        fs::remove_dir_all(test_dir).expect("temporary test directory should be removed");
+    }
+}
+
 fn parse_config(contents: String) -> PyResult<FabricConfig> {
     serde_json::from_str(&contents).map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }
@@ -331,5 +369,9 @@ fn parse_run_plan(contents: String) -> PyResult<RunPlan> {
 }
 
 fn parse_runtime_handle(contents: String) -> PyResult<RuntimeHandle> {
+    serde_json::from_str(&contents).map_err(|error| PyRuntimeError::new_err(error.to_string()))
+}
+
+fn parse_openai_stream_transport(contents: String) -> PyResult<OpenAiStreamTransport> {
     serde_json::from_str(&contents).map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }

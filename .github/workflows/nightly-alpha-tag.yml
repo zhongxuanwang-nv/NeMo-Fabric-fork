@@ -47,7 +47,7 @@ jobs:
           fi
 
           tag_date="$(date -u +%Y%m%d)"
-          tag="${version}-alpha.${tag_date}"
+          tag="v${version}-alpha.${tag_date}"
           target_sha="$(git rev-parse HEAD)"
           printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
 
@@ -84,3 +84,16 @@ jobs:
       ref: refs/tags/${{ needs.tag-nightly-alpha.outputs.tag }}
       ref_name: ${{ needs.tag-nightly-alpha.outputs.tag }}
       ref_type: tag
+      skip_tests: true
+
+  publish-typescript:
+    name: TypeScript
+    needs: tag-nightly-alpha
+    permissions:
+      # The called workflow checks out the newly created tag.
+      contents: read
+      # The called workflow uses npm trusted publishing through GitHub OIDC.
+      id-token: write
+    uses: ./.github/workflows/publish_typescript.yml
+    with:
+      ref: refs/tags/${{ needs.tag-nightly-alpha.outputs.tag }}

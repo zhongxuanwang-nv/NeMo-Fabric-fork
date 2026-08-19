@@ -11,11 +11,214 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+import sys
 import uuid
 import warnings
 
 import pytest
-from _utils.utils import assert_semantic_relay_artifacts
+import requests
+from _utils.utils import (
+    assert_atof_model,
+    assert_atof_skill_selection,
+    assert_semantic_relay_artifacts,
+)
+
+
+def _mock_codex_config(api_server, tmp_path):
+    from examples.code_review_agent import codex_config, with_relay
+
+    config = with_relay(codex_config())
+    config.models["default"].provider = "fabric-test"
+    config.models["default"].api_key_env = "FABRIC_TEST_API_KEY"
+    config.models["default"].base_url = f"{api_server}/v1"
+    config.environment.workspace = tmp_path
+    config.environment.artifacts = tmp_path / "artifacts"
+    config.environment.env["FABRIC_TEST_API_KEY"] = "test"
+    config.runtime.artifacts = tmp_path / "artifacts"
+    return config
+
+
+def _skill_tool_call(selected_skill, workdir):
+    if sys.platform == "win32":
+        return {
+            "name": "shell_command",
+            "arguments": {
+                "command": f'Get-Content -Raw "{selected_skill / "SKILL.md"}"',
+                "workdir": str(workdir),
+            },
+        }
+    return {
+        "name": "exec_command",
+        "arguments": {
+            "cmd": f"cat {selected_skill / 'SKILL.md'}",
+            "workdir": str(workdir),
+        },
+    }
+
+
+def test_skill_tool_call_uses_classic_shell_on_windows(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    tool_call = _skill_tool_call(tmp_path / "default", tmp_path)
+
+    assert tool_call["name"] == "shell_command"
+    assert set(tool_call["arguments"]) == {"command", "workdir"}
+
+
+@pytest.mark.usefixtures("nemo_relay")
+@pytest.mark.parametrize("skill", ["default", "alternate", None])
+async def test_skill_selection(
+    api_server, tmp_path, skill, default_skill, alternate_skill
+):
+    from nemo_fabric import Fabric
+
+    config = _mock_codex_config(api_server, tmp_path)
+    config.models["default"].model = "fabric-echo"
+    config.add_skill_path(default_skill)
+
+    if skill == "alternate" or skill is None:
+        config.remove_skill_path(default_skill)
+    if skill == "alternate":
+        config.add_skill_path(alternate_skill)
+
+    if skill is not None:
+        selected_skill = default_skill if skill == "default" else alternate_skill
+        scenario_response = requests.post(
+            f"{api_server}/_scenario",
+            json={"tool_call": _skill_tool_call(selected_skill, tmp_path)},
+            timeout=5,
+        )
+        scenario_response.raise_for_status()
+
+    result = await Fabric().run(
+        config,
+        base_dir=tmp_path,
+        input=f"Use the {skill} skill." if skill else "Reply without using a skill.",
+    )
+
+    assert result["status"] == "succeeded", result.to_mapping()
+    assert_atof_skill_selection(result["output"], skill)
+
+
+@pytest.mark.usefixtures("nemo_relay")
+@pytest.mark.parametrize("model", ["m1", "m2"])
+async def test_model_selection(api_server, tmp_path, model):
+    from nemo_fabric import Fabric
+
+    config = _mock_codex_config(api_server, tmp_path)
+    config.models["default"].model = model
+
+    result = await Fabric().run(config, base_dir=tmp_path, input="Reply with hello.")
+
+    assert result["status"] == "succeeded", result.to_mapping()
+    assert_atof_model(result["output"], model)
+
+
+async def test_env_secrets_in_headers(api_server, tmp_path):
+    from examples.code_review_agent import codex_config
+    from nemo_fabric import Fabric
+
+    os.environ["MY_KEY"] = "Bearer XYZ"
+    scenario_response = requests.post(
+        f"{api_server}/_scenario",
+        json={
+            "tool_call": {
+                "name": "get_authorization_header",
+                "namespace": "mcp__headers",
+                "arguments": {},
+            }
+        },
+        timeout=5,
+    )
+    scenario_response.raise_for_status()
+
+    config = codex_config()
+    config.models["default"].provider = "fabric-test"
+    config.models["default"].model = "fabric-echo"
+    config.models["default"].api_key_env = "FABRIC_TEST_API_KEY"
+    config.models["default"].base_url = f"{api_server}/v1"
+    config.environment.workspace = tmp_path
+    config.environment.artifacts = tmp_path / "artifacts"
+    config.environment.env["FABRIC_TEST_API_KEY"] = "test"
+    config.runtime.artifacts = tmp_path / "artifacts"
+    config.add_mcp_server(
+        "headers",
+        transport="streamable-http",
+        url=f"{api_server}/mcp",
+        authentication=None,
+        custom_headers={"Authorization": "${MY_KEY}"},
+    )
+
+    result = await Fabric().run(
+        config,
+        base_dir=tmp_path,
+        input="Use the MCP tool to return its Authorization header.",
+    )
+
+    assert result["status"] == "succeeded", result.to_mapping()
+    response = requests.get(f"{api_server}/_mcp_authorization_headers", timeout=5)
+    response.raise_for_status()
+    assert set(response.json()) == {"Bearer XYZ"}
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_mcp_stdio_transport(api_server, tmp_path, enabled):
+    from examples.code_review_agent import codex_config
+    from nemo_fabric import Fabric
+
+    tool_name = "get_current_time"
+    scenario_response = requests.post(
+        f"{api_server}/_scenario",
+        json={
+            "tool_call": {
+                "name": tool_name,
+                "namespace": "mcp__mcp_server_time",
+                "arguments": {"timezone": "America/Los_Angeles"},
+            }
+        },
+        timeout=5,
+    )
+    scenario_response.raise_for_status()
+
+    config = codex_config()
+    config.models["default"].provider = "fabric-test"
+    config.models["default"].model = "fabric-echo"
+    config.models["default"].api_key_env = "FABRIC_TEST_API_KEY"
+    config.models["default"].base_url = f"{api_server}/v1"
+    config.environment.workspace = tmp_path
+    config.environment.artifacts = tmp_path / "artifacts"
+    config.environment.env["FABRIC_TEST_API_KEY"] = "test"
+    config.runtime.artifacts = tmp_path / "artifacts"
+    config.add_mcp_server(
+        "mcp_server_time",
+        transport="stdio",
+        url=sys.executable,
+        args=["-m", "mcp_server_time"],
+        env={"MCP_TIME_TEST": "enabled"},
+    )
+
+    if not enabled:
+        config.remove_mcp_server("mcp_server_time")
+
+    result = await Fabric().run(
+        config,
+        base_dir=tmp_path,
+        input="Use the time MCP tool to get the current time in America/Los_Angeles.",
+    )
+
+    assert result["status"] == "succeeded", result.to_mapping()
+    tool_events = [
+        event for event in result["output"]["events"] if event["type"] == "mcpToolCall"
+    ]
+
+    if not enabled:
+        assert not tool_events
+    else:
+        assert len(tool_events) == 1
+        assert tool_events[0]["server"] == "mcp_server_time"
+        assert tool_events[0]["tool"] == "get_current_time"
+        assert tool_events[0]["status"] == "completed"
+        assert "America/Los_Angeles" in str(tool_events[0]["result"])
 
 
 async def test_codex_sdk():

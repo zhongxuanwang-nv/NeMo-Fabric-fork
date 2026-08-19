@@ -1,0 +1,48 @@
+{
+  "contract_version": "fabric.adapter/v1alpha2",
+  "adapter_id": "nvidia.fabric.pi",
+  "adapter_kind": "python",
+  "runner": {
+    "module": "nemo_fabric_adapters.pi.adapter"
+  },
+  "requirements": {},
+  "settings_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pi_executable": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^(?:/|[A-Za-z]:[\\\\/])",
+        "description": "Absolute path to the local Pi executable."
+      }
+    },
+    "required": ["pi_executable"],
+    "additionalProperties": false
+  },
+  "model_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "provider": {"type": "string", "minLength": 1},
+      "model": {"type": "string", "minLength": 1},
+      "api_key_env": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+      }
+    },
+    "required": ["provider", "model", "api_key_env"],
+    "additionalProperties": false
+  },
+  "config": {
+    "input": "agent_config",
+    "accepts": ["models", "skills"]
+  },
+  "capabilities": {
+    "service": false,
+    "streaming": false,
+    "updates": false,
+    "cancellation": false
+  }
+}

@@ -63,7 +63,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          just set-version "$RELEASE_TAG"
+          just set-cargo-version "$RELEASE_TAG"
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           packages=(
             nemo-fabric-core
@@ -76,5 +76,19 @@ jobs:
               continue
             fi
 
-            cargo publish --package "$package" --no-verify --allow-dirty
+            cargo publish --package "$package" --no-verify --locked --allow-dirty
+
+            if [[ "$package" == "nemo-fabric-core" ]]; then
+              for attempt in {1..12}; do
+                if cargo info "${package}@${version}" --registry crates-io >/dev/null 2>&1; then
+                  break
+                fi
+                if [[ "$attempt" == 12 ]]; then
+                  echo "${package} ${version} did not become visible on crates.io" >&2
+                  exit 1
+                fi
+                echo "Waiting for ${package} ${version} to become visible on crates.io"
+                sleep 10
+              done
+            fi
           done

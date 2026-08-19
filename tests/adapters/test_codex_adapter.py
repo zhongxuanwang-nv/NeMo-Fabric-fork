@@ -4,6 +4,8 @@
 import asyncio
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -12,27 +14,60 @@ from unittest.mock import MagicMock
 
 import pytest
 from nemo_fabric import Fabric
+from nemo_fabric_adapter_contract.codec import ContractValidationError
+from nemo_fabric_adapter_contract.models import AgentConfig
+from nemo_fabric_adapter_contract.models import AgentRunRequest
+from nemo_fabric_adapter_contract.models import AgentRunResult
+from nemo_fabric_adapter_contract.models import AgentRunStatus
+from nemo_fabric_adapter_contract.models import RuntimeContext
 from nemo_fabric_adapters.codex import adapter
-from openai_codex import AsyncCodex, AsyncThread, AsyncTurnHandle
+from openai_codex import AsyncCodex, AsyncThread, AsyncTurnHandle, JsonRpcError
 from openai_codex.types import TurnStatus
 
 
 def lifecycle_start_payload(payload):
-    return {key: value for key, value in payload.items() if key != "request"}
+    config, context, _ = runtime_input(payload)
+    return {
+        **payload,
+        "config": config,
+        "runtime_context": context,
+        "request": None,
+    }
+
+
+def runtime_input(payload):
+    return (
+        AgentConfig.from_mapping(payload["config"]),
+        RuntimeContext.from_mapping(payload["runtime_context"]),
+        payload["base_dir"],
+    )
 
 
 def lifecycle_invocation(payload):
-    return {
-        "runtime_context": payload["runtime_context"],
-        "request": payload["request"],
+    request = {
+        key: value for key, value in payload["request"].items() if key != "request_id"
     }
+    return AgentRunRequest.from_mapping(request), runtime_input(payload)[1]
+
+
+def result_view(result: AgentRunResult) -> dict[str, Any]:
+    assert isinstance(result, AgentRunResult)
+    output = dict(result.output)
+    raw_usage = output.get("usage")
+    if isinstance(raw_usage, dict) and any(
+        name in raw_usage for name in ("input_tokens", "output_tokens", "total_tokens")
+    ):
+        assert result.usage is not None
+    output["failed"] = result.status is AgentRunStatus.FAILED
+    output["error"] = None if result.error is None else result.error.to_mapping()
+    return output
 
 
 async def invoke_once_async(payload):
     runtime = adapter.CodexRuntime()
     await runtime.start(lifecycle_start_payload(payload))
     try:
-        return await runtime.invoke(lifecycle_invocation(payload))
+        return result_view(await runtime.invoke(*lifecycle_invocation(payload)))
     finally:
         await runtime.stop()
 
@@ -60,7 +95,6 @@ def codex_payload_fixture(tmp_path):
         "base_dir": str(tmp_path),
         "config": {
             "harness": {
-                "adapter_id": "nvidia.fabric.codex",
                 "settings": {
                     "sandbox": "workspace-write",
                     "config_overrides": {
@@ -84,11 +118,21 @@ def codex_payload_fixture(tmp_path):
             "runtime_id": "runtime-1",
             "invocation_id": "invocation-1",
             "request_id": "request-1",
-            "environment": {"workspace": str(workspace)},
+            "environment": {
+                "environment_id": "environment-codex-1",
+                "provider": "local",
+                "control_location": "in_env_control",
+                "ownership": "caller_owned",
+                "workspace": str(workspace),
+            },
             "artifacts": {"root": str(tmp_path / "artifacts")},
         },
         "request": {"input": "Inspect the change."},
     }
+
+
+def configure_mcp(payload, servers):
+    payload["config"]["mcp"] = {"servers": servers}
 
 
 def successful_result(response="done"):
@@ -110,6 +154,14 @@ def successful_result(response="done"):
         ],
         usage={"total": {"inputTokens": 10, "outputTokens": 3}},
     )
+
+
+def test_agent_run_result_discards_oversized_token_count():
+    result = adapter._agent_run_result(
+        {"response": "done", "usage": {"input_tokens": 1 << 64}}
+    )
+
+    assert result.usage is None
 
 
 def mock_turn_handle(result=None):
@@ -136,6 +188,48 @@ def mock_thread(thread_id, result=None):
     return mock_sdk_thread
 
 
+def atif_plugin_config(output_directory: Path) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "components": [
+            {
+                "kind": "observability",
+                "config": {
+                    "version": 3,
+                    "atif": {
+                        "enabled": True,
+                        "output_directory": str(output_directory),
+                        "filename_template": "trajectory-{session_id}.atif.json",
+                    },
+                },
+            }
+        ],
+    }
+
+
+def relay_settings(tmp_path: Path, plugin_config: dict[str, Any]):
+    return adapter.CodexRelaySettings(
+        gateway=adapter.relay_gateway.RelayGatewayLaunch(
+            executable=tmp_path / "nemo-relay",
+            config_path=tmp_path / "relay" / "config.toml",
+            bind="127.0.0.1:43210",
+            url="http://127.0.0.1:43210",
+            log_path=tmp_path / "relay" / "gateway.log",
+        ),
+        plugin_config=plugin_config,
+    )
+
+
+def install_mock_relay(monkeypatch, relay: adapter.CodexRelaySettings):
+    monkeypatch.setattr(adapter, "prepare_codex_relay", MagicMock(return_value=relay))
+    monkeypatch.setattr(
+        adapter.relay_gateway,
+        "start_relay_gateway",
+        MagicMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(adapter.relay_gateway, "stop_relay_gateway", MagicMock())
+
+
 @pytest.fixture(name="mock_codex")
 def mock_codex_fixture(monkeypatch):
     mock_codex = MagicMock(spec=AsyncCodex)
@@ -143,7 +237,49 @@ def mock_codex_fixture(monkeypatch):
     mock_codex.next_thread_id = "thread-123"
     mock_codex.next_result = None
     mock_codex.next_thread = None
-    mock_codex.skill_request = AsyncMock()
+    mock_codex.mcp_auth_statuses = {}
+    mock_codex.report_mcp_auth_statuses = True
+    mock_codex.mcp_login_success = True
+    mock_codex.mcp_login_error = None
+    mock_codex.oauth_authorization_url = "https://auth.example.test/authorize"
+    mock_codex.login_params = None
+
+    async def protocol_request(method, params, *, response_model):
+        if method == "skills/extraRoots/set":
+            return None
+        if method == "mcpServerStatus/list":
+            return response_model(
+                data=[
+                    {
+                        "name": name,
+                        "authStatus": status,
+                        "resourceTemplates": [],
+                        "resources": [],
+                        "tools": {},
+                    }
+                    for name, status in mock_codex.mcp_auth_statuses.items()
+                ]
+            )
+        if method == "mcpServer/oauth/login":
+            mock_codex.login_params = params
+            return response_model(authorizationUrl=mock_codex.oauth_authorization_url)
+        raise AssertionError(f"unexpected Codex protocol request: {method}")
+
+    async def next_notification():
+        params = mock_codex.login_params
+        assert params is not None
+        return SimpleNamespace(
+            method="mcpServer/oauthLogin/completed",
+            payload=adapter.McpServerOauthLoginCompletedNotification(
+                error=mock_codex.mcp_login_error,
+                name=params["name"],
+                success=mock_codex.mcp_login_success,
+                threadId=params["threadId"],
+            ),
+        )
+
+    mock_codex.skill_request = AsyncMock(side_effect=protocol_request)
+    mock_codex.next_notification = AsyncMock(side_effect=next_notification)
     mock_codex.close_error = None
 
     def build_client(*, config):
@@ -151,14 +287,26 @@ def mock_codex_fixture(monkeypatch):
         mock_client.config = config
         mock_client.closed = False
         mock_client.thread = None
-        mock_client._client = SimpleNamespace(request=mock_codex.skill_request)
+        mock_client._client = SimpleNamespace(
+            request=mock_codex.skill_request,
+            next_notification=mock_codex.next_notification,
+        )
 
         async def close():
             if mock_codex.close_error is not None:
                 raise mock_codex.close_error
             mock_client.closed = True
 
-        async def thread_start(**_kwargs):
+        async def thread_start(**kwargs):
+            config = kwargs.get("config") or {}
+            for name, server in config.get("mcp_servers", {}).items():
+                if (
+                    server.get("auth") == "oauth"
+                    and mock_codex.report_mcp_auth_statuses
+                ):
+                    mock_codex.mcp_auth_statuses.setdefault(
+                        name, adapter.McpAuthStatus.o_auth
+                    )
             mock_client.thread = (
                 mock_codex.next_thread
                 if mock_codex.next_thread is not None
@@ -181,7 +329,9 @@ def test_single_invocation_uses_native_thread_and_turn_contract(
 ):
     os.environ["CODEX_HOME"] = str(tmp_path / "codex-home")
     os.environ["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] = "parent-codex"
+    os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/1000/bus"
     os.environ["FABRIC_UNRELATED_SECRET"] = "do-not-forward"
+    os.environ["XDG_RUNTIME_DIR"] = "/run/user/1000"
     codex_payload["runtime_context"]["environment"]["env"] = {
         "CODEX_EXPLICIT": "forward-me"
     }
@@ -208,7 +358,11 @@ def test_single_invocation_uses_native_thread_and_turn_contract(
     assert client.config.env["CODEX_HOME"] == str(tmp_path / "codex-home")
     assert client.config.env["CODEX_EXPLICIT"] == "forward-me"
     assert client.config.env["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] == "codex_python_sdk"
+    assert (
+        client.config.env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1000/bus"
+    )
     assert client.config.env["FABRIC_UNRELATED_SECRET"] == ""
+    assert client.config.env["XDG_RUNTIME_DIR"] == "/run/user/1000"
     start = client.thread_start.await_args.kwargs
     assert start["model"] == "gpt-5.4"
     assert start["model_provider"] == "openai"
@@ -233,7 +387,7 @@ def test_runtime_stop_reports_close_failure_after_completed_turn(
     async def scenario() -> tuple[dict[str, Any], adapter.lifecycle.LifecycleError]:
         runtime = adapter.CodexRuntime()
         await runtime.start(lifecycle_start_payload(codex_payload))
-        output = await runtime.invoke(lifecycle_invocation(codex_payload))
+        output = result_view(await runtime.invoke(*lifecycle_invocation(codex_payload)))
         with pytest.raises(adapter.lifecycle.LifecycleError) as caught:
             await runtime.stop()
         return output, caught.value
@@ -279,20 +433,42 @@ def test_start_failure_is_not_masked_by_sdk_close_failure(
 
 def test_sdk_maps_native_mcp_servers_into_thread_config(codex_payload, mock_codex):
     os.environ["FABRIC_TEST_MCP_URL"] = "https://mcp.example.test/mcp"
-    codex_payload["capability_plan"] = {
-        "native": {
-            "mcp_servers": {
-                "repo": {
-                    "transport": "stdio",
-                    "url": "python -m repo_mcp --root .",
+    os.environ["FABRIC_TEST_MCP_HEADER"] = "fabric"
+    os.environ["FABRIC_TEST_WINDOWS_HEADER"] = "windows"
+    os.environ["FABRIC_TEST_UNBRACED_HEADER"] = "unbraced"
+    configure_mcp(
+        codex_payload,
+        {
+            "repo": {
+                "transport": "stdio",
+                "url": "python",
+                "args": [
+                    "-m",
+                    "repo_mcp",
+                    "--root",
+                    ".",
+                    "--config",
+                    "repo config.json",
+                ],
+                "env": {"REPO_MCP_MODE": "test"},
+            },
+            "remote": {
+                "transport": "streamable-http",
+                "url": "${FABRIC_TEST_MCP_URL}",
+                "custom_headers": {
+                    "X-Tenant": "${FABRIC_TEST_MCP_HEADER}",
+                    "X-Windows": "%FABRIC_TEST_WINDOWS_HEADER%",
+                    "X-Unbraced": "$FABRIC_TEST_UNBRACED_HEADER",
+                    "X-Static": "static",
                 },
-                "remote": {
-                    "transport": "streamable-http",
-                    "url": "${FABRIC_TEST_MCP_URL}",
+                "authentication": {
+                    "type": "oauth2",
+                    "scopes": ["read", "write"],
+                    "redirect_uri": "http://127.0.0.1:8765/callback",
                 },
-            }
-        }
-    }
+            },
+        },
+    )
     codex_payload["config"]["harness"]["settings"]["config_overrides"][
         "mcp_servers.remote.required"
     ] = True
@@ -304,13 +480,326 @@ def test_sdk_maps_native_mcp_servers_into_thread_config(codex_payload, mock_code
     assert config["mcp_servers"] == {
         "remote": {
             "url": "https://mcp.example.test/mcp",
+            "http_headers": {
+                "X-Tenant": "fabric",
+                "X-Unbraced": "unbraced",
+                "X-Windows": (
+                    "windows" if os.name == "nt" else "%FABRIC_TEST_WINDOWS_HEADER%"
+                ),
+                "X-Static": "static",
+            },
+            "auth": "oauth",
+            "scopes": ["read", "write"],
             "required": True,
         },
         "repo": {
             "command": "python",
-            "args": ["-m", "repo_mcp", "--root", "."],
+            "args": [
+                "-m",
+                "repo_mcp",
+                "--root",
+                ".",
+                "--config",
+                "repo config.json",
+            ],
+            "env": {"REPO_MCP_MODE": "test"},
         },
     }
+    assert mock_codex.instances[0].config.env["FABRIC_TEST_MCP_HEADER"] == ""
+    assert mock_codex.instances[0].config.env["FABRIC_TEST_WINDOWS_HEADER"] == ""
+    assert mock_codex.instances[0].config.env["FABRIC_TEST_UNBRACED_HEADER"] == ""
+    assert config["mcp_oauth_callback_url"] == "http://127.0.0.1:8765/callback"
+
+
+def test_codex_preserves_prefixed_environment_reference_as_static_header(
+    codex_payload,
+):
+    configure_mcp(
+        codex_payload,
+        {
+            "remote": {
+                "transport": "streamable-http",
+                "url": "https://mcp.example.test/mcp",
+                "custom_headers": {"Authorization": "Bearer ${MCP_TOKEN}"},
+            }
+        },
+    )
+
+    assert adapter._native_mcp_servers(runtime_input(codex_payload)[0])["remote"] == {
+        "url": "https://mcp.example.test/mcp",
+        "http_headers": {"Authorization": "Bearer ${MCP_TOKEN}"},
+    }
+
+
+def test_codex_rejects_mcp_oauth_client_secret(codex_payload):
+    configure_mcp(
+        codex_payload,
+        {
+            "remote": {
+                "transport": "streamable-http",
+                "url": "https://mcp.example.test/mcp",
+                "authentication": {
+                    "type": "oauth2",
+                    "client_id": "fabric-client",
+                    "client_secret_env": "FABRIC_MCP_CLIENT_SECRET",
+                },
+            },
+        },
+    )
+
+    with pytest.raises(adapter.AdapterConfigError, match="client_secret_env"):
+        adapter.thread_config(*runtime_input(codex_payload)[:2], relay=None)
+
+
+def test_codex_rejects_mcp_oauth_client_id(codex_payload):
+    configure_mcp(
+        codex_payload,
+        {
+            "remote": {
+                "transport": "streamable-http",
+                "url": "https://mcp.example.test/mcp",
+                "authentication": {
+                    "type": "oauth2",
+                    "client_id": "fabric-client",
+                },
+            },
+        },
+    )
+
+    with pytest.raises(adapter.AdapterConfigError, match="client_id"):
+        adapter.thread_config(*runtime_input(codex_payload)[:2], relay=None)
+
+
+async def test_mcp_auth_statuses_paginates_until_cursor_is_none():
+    client = MagicMock()
+    client.request = AsyncMock(
+        side_effect=[
+            SimpleNamespace(
+                data=[
+                    SimpleNamespace(
+                        name="first", auth_status=adapter.McpAuthStatus.o_auth
+                    )
+                ],
+                next_cursor="page-2",
+            ),
+            SimpleNamespace(
+                data=[
+                    SimpleNamespace(
+                        name="second",
+                        auth_status=adapter.McpAuthStatus.not_logged_in,
+                    )
+                ],
+                next_cursor=None,
+            ),
+        ]
+    )
+
+    statuses = await adapter._mcp_auth_statuses(
+        client, thread_id="thread-123", timeout=1
+    )
+
+    assert statuses == {
+        "first": adapter.McpAuthStatus.o_auth,
+        "second": adapter.McpAuthStatus.not_logged_in,
+    }
+    assert client.request.await_args_list[0].args[1] == {
+        "detail": "toolsAndAuthOnly",
+        "threadId": "thread-123",
+    }
+    assert client.request.await_args_list[1].args[1] == {
+        "detail": "toolsAndAuthOnly",
+        "threadId": "thread-123",
+        "cursor": "page-2",
+    }
+
+
+async def test_mcp_auth_statuses_rejects_repeated_cursor():
+    client = MagicMock()
+    client.request = AsyncMock(
+        side_effect=[
+            SimpleNamespace(data=[], next_cursor="repeated"),
+            SimpleNamespace(data=[], next_cursor="repeated"),
+        ]
+    )
+
+    with pytest.raises(
+        adapter.AdapterConfigError, match="returned a repeated cursor"
+    ) as caught:
+        await adapter._mcp_auth_statuses(client, thread_id="thread-123", timeout=1)
+
+    assert caught.value.code == "codex_mcp_authentication_failed"
+    assert client.request.await_count == 2
+
+
+async def test_mcp_auth_statuses_respects_invocation_timeout():
+    async def block_request(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    client = MagicMock()
+    client.request = AsyncMock(side_effect=block_request)
+
+    with pytest.raises(
+        adapter.AdapterConfigError, match="status listing timed out"
+    ) as caught:
+        await adapter._mcp_auth_statuses(client, thread_id="thread-123", timeout=0.01)
+
+    assert caught.value.code == "codex_mcp_authentication_failed"
+
+
+async def test_mcp_auth_statuses_distinguishes_request_timeout():
+    request_timeout = TimeoutError("request transport timed out")
+    client = MagicMock()
+    client.request = AsyncMock(side_effect=request_timeout)
+
+    with pytest.raises(
+        adapter.AdapterConfigError, match="status listing request timed out"
+    ) as caught:
+        await adapter._mcp_auth_statuses(client, thread_id="thread-123", timeout=1)
+
+    assert caught.value.code == "codex_mcp_authentication_failed"
+    assert caught.value.__cause__ is request_timeout
+
+
+@pytest.mark.parametrize(
+    ("invocation_timeout", "oauth_timeout", "expected_timeout"),
+    [(30, 12, 12), (5, 12, 5), (5.1, 12, 6)],
+)
+def test_codex_logs_into_mcp_server_before_first_turn(
+    codex_payload,
+    mock_codex,
+    monkeypatch,
+    invocation_timeout,
+    oauth_timeout,
+    expected_timeout,
+):
+    monkeypatch.setattr(adapter, "timeout_seconds", lambda: invocation_timeout)
+    configure_mcp(
+        codex_payload,
+        {
+            "remote": {
+                "transport": "streamable-http",
+                "url": "https://mcp.example.test/mcp",
+                "authentication": {
+                    "type": "oauth2",
+                    "scopes": ["read", "write"],
+                    "authorization_timeout_seconds": oauth_timeout,
+                },
+            },
+        },
+    )
+    mock_codex.mcp_auth_statuses["remote"] = adapter.McpAuthStatus.not_logged_in
+    open_browser = AsyncMock(return_value=True)
+    monkeypatch.setattr(adapter, "_open_authorization_url", open_browser)
+
+    output = invoke_once(codex_payload)
+
+    assert output["completed"] is True
+    requests = mock_codex.skill_request.await_args_list
+    assert [call.args[0] for call in requests] == [
+        "mcpServerStatus/list",
+        "mcpServer/oauth/login",
+    ]
+    assert requests[1].args[1] == {
+        "name": "remote",
+        "scopes": ["read", "write"],
+        "threadId": "thread-123",
+        "timeoutSecs": expected_timeout,
+    }
+    open_browser.assert_awaited_once_with(mock_codex.oauth_authorization_url)
+    mock_codex.next_notification.assert_awaited_once_with()
+    mock_codex.instances[0].thread.turn.assert_awaited_once()
+
+
+def test_codex_reports_failed_mcp_oauth_login_before_turn(
+    codex_payload, mock_codex, monkeypatch
+):
+    configure_mcp(
+        codex_payload,
+        {
+            "remote": {
+                "transport": "streamable-http",
+                "url": "https://mcp.example.test/mcp",
+                "authentication": {"type": "oauth2"},
+            },
+        },
+    )
+    mock_codex.mcp_auth_statuses["remote"] = adapter.McpAuthStatus.not_logged_in
+    mock_codex.mcp_login_success = False
+    mock_codex.mcp_login_error = "authorization denied"
+    monkeypatch.setattr(
+        adapter,
+        "_open_authorization_url",
+        AsyncMock(return_value=True),
+    )
+
+    output = invoke_once(codex_payload)
+
+    assert output["failed"] is True
+    assert output["error"]["code"] == "codex_mcp_authentication_failed"
+    assert output["error"]["message"] == (
+        "Codex MCP OAuth login failed for server 'remote'"
+    )
+    mock_codex.instances[0].thread.turn.assert_not_awaited()
+
+
+def test_codex_reports_missing_mcp_auth_status_before_turn(codex_payload, mock_codex):
+    configure_mcp(
+        codex_payload,
+        {
+            "remote": {
+                "transport": "streamable-http",
+                "url": "https://mcp.example.test/mcp",
+                "authentication": {"type": "oauth2"},
+            },
+        },
+    )
+    mock_codex.report_mcp_auth_statuses = False
+
+    output = invoke_once(codex_payload)
+
+    assert output["failed"] is True
+    assert output["error"] == {
+        "code": "codex_mcp_authentication_failed",
+        "message": "Codex did not report a status for MCP server 'remote'",
+        "retryable": False,
+    }
+    assert [call.args[0] for call in mock_codex.skill_request.await_args_list] == [
+        "mcpServerStatus/list"
+    ]
+    mock_codex.next_notification.assert_not_awaited()
+    mock_codex.instances[0].thread.turn.assert_not_awaited()
+
+
+@pytest.mark.parametrize("opened", [True, False])
+async def test_codex_opens_mcp_authorization_url_without_blocking(monkeypatch, opened):
+    open_browser = MagicMock(return_value=opened)
+    monkeypatch.setattr(adapter.webbrowser, "open", open_browser)
+    to_thread = AsyncMock(return_value=opened)
+    monkeypatch.setattr(adapter.asyncio, "to_thread", to_thread)
+
+    assert await adapter._open_authorization_url("https://auth.example.test") is opened
+    to_thread.assert_awaited_once_with(open_browser, "https://auth.example.test")
+
+
+def test_codex_rejects_mcp_service_account_authentication(codex_payload):
+    configure_mcp(
+        codex_payload,
+        {
+            "remote": {
+                "transport": "streamable-http",
+                "url": "https://mcp.example.test/mcp",
+                "authentication": {
+                    "type": "service_account",
+                    "client_id": "fabric-client",
+                    "client_secret_env": "FABRIC_MCP_CLIENT_SECRET",
+                    "token_url": "https://auth.example.test/token",
+                },
+            },
+        },
+    )
+
+    with pytest.raises(adapter.AdapterConfigError, match="service_account"):
+        adapter.thread_config(*runtime_input(codex_payload)[:2], relay=None)
 
 
 def test_sdk_registers_native_skill_roots(codex_payload, mock_codex, tmp_path):
@@ -322,9 +811,7 @@ def test_sdk_registers_native_skill_roots(codex_payload, mock_codex, tmp_path):
             f"---\nname: {skill.name}\ndescription: Test skill.\n---\n",
             encoding="utf-8",
         )
-    codex_payload["capability_plan"] = {
-        "native": {"skill_paths": ["skills/review", "skills/test"]}
-    }
+    codex_payload["config"]["skills"] = {"paths": ["skills/review", "skills/test"]}
 
     output = invoke_once(codex_payload)
 
@@ -351,7 +838,7 @@ def test_sdk_closes_when_skill_registration_is_unavailable(
         "---\nname: review\ndescription: Test skill.\n---\n",
         encoding="utf-8",
     )
-    codex_payload["capability_plan"] = {"native": {"skill_paths": ["skills/review"]}}
+    codex_payload["config"]["skills"] = {"paths": ["skills/review"]}
     mock_codex.skill_request = None
 
     error = runtime_start_error(codex_payload)
@@ -364,13 +851,10 @@ def test_sdk_closes_when_skill_registration_is_unavailable(
 
 @pytest.mark.parametrize("transport", ["sse", "carrier-pigeon"])
 def test_sdk_rejects_unsupported_mcp_transport(codex_payload, mock_codex, transport):
-    codex_payload["capability_plan"] = {
-        "native": {
-            "mcp_servers": {
-                "bad": {"transport": transport, "url": "https://mcp.example.test"}
-            }
-        }
-    }
+    configure_mcp(
+        codex_payload,
+        {"bad": {"transport": transport, "url": "https://mcp.example.test"}},
+    )
 
     error = runtime_start_error(codex_payload)
 
@@ -381,7 +865,7 @@ def test_sdk_rejects_unsupported_mcp_transport(codex_payload, mock_codex, transp
 
 def test_sdk_rejects_invalid_native_skill_path(codex_payload, mock_codex, tmp_path):
     missing = tmp_path / "skills" / "missing"
-    codex_payload["capability_plan"] = {"native": {"skill_paths": [str(missing)]}}
+    codex_payload["config"]["skills"] = {"paths": [str(missing)]}
 
     error = runtime_start_error(codex_payload)
 
@@ -392,12 +876,10 @@ def test_sdk_rejects_invalid_native_skill_path(codex_payload, mock_codex, tmp_pa
 
 @pytest.mark.parametrize("skill_paths", [None, "", {}, False])
 def test_sdk_rejects_falsy_non_list_skill_paths(codex_payload, mock_codex, skill_paths):
-    codex_payload["capability_plan"] = {"native": {"skill_paths": skill_paths}}
+    codex_payload["config"]["skills"] = {"paths": skill_paths}
 
-    error = runtime_start_error(codex_payload)
-
-    assert error.code == "codex_invalid_configuration"
-    assert error.message == "native skill_paths must be a list of paths"
+    with pytest.raises(Exception, match="must be an array"):
+        lifecycle_start_payload(codex_payload)
     mock_codex.assert_not_called()
 
 
@@ -421,7 +903,7 @@ def test_sdk_test_override_resolves_relative_runtime_from_base_dir(
 ):
     monkeypatch.setenv("FABRIC_TEST_CODEX_BIN", codex_bin)
 
-    config = adapter.sdk_config(codex_payload, relay=None)
+    config = adapter.sdk_config(*runtime_input(codex_payload), relay=None)
 
     base_dir = Path(codex_payload["base_dir"])
     assert config.codex_bin == str((base_dir / codex_bin).resolve())
@@ -433,7 +915,7 @@ def test_sdk_test_override_keeps_absolute_runtime_path(
     codex_bin = tmp_path / "bin" / ".." / "codex"
     monkeypatch.setenv("FABRIC_TEST_CODEX_BIN", str(codex_bin))
 
-    config = adapter.sdk_config(codex_payload, relay=None)
+    config = adapter.sdk_config(*runtime_input(codex_payload), relay=None)
 
     assert config.codex_bin == str(codex_bin)
 
@@ -445,11 +927,14 @@ async def test_persistent_runtime_reuses_one_client_and_thread(
     start_payload.pop("request")
     runtime = adapter.CodexRuntime()
 
-    await runtime.start(start_payload)
-    first = await runtime.invoke(lifecycle_invocation(codex_payload))
+    await runtime.start(lifecycle_start_payload(start_payload))
+    first = result_view(await runtime.invoke(*lifecycle_invocation(codex_payload)))
     codex_payload["runtime_context"]["invocation_id"] = "invocation-2"
+    codex_payload["runtime_context"]["request_id"] = "request-2"
+    second_artifacts = Path(codex_payload["base_dir"]) / "second-artifacts"
+    codex_payload["runtime_context"]["artifacts"] = {"root": str(second_artifacts)}
     codex_payload["request"]["input"] = "Continue."
-    second = await runtime.invoke(lifecycle_invocation(codex_payload))
+    second = result_view(await runtime.invoke(*lifecycle_invocation(codex_payload)))
     await runtime.stop()
 
     assert first["thread_id"] == second["thread_id"] == "thread-123"
@@ -458,7 +943,33 @@ async def test_persistent_runtime_reuses_one_client_and_thread(
     client.thread_start.assert_awaited_once()
     assert client.thread.turn.await_count == 2
     assert client.thread.turn.await_args_list[1].args[0] == "Continue."
+    assert second["state_dir"] == str(second_artifacts / ".fabric" / "codex")
     client.close.assert_awaited_once()
+
+
+async def test_runtime_ignores_legacy_plan_fields(codex_payload, mock_codex):
+    codex_payload["capability_plan"] = {
+        "native": {
+            "mcp_servers": {
+                "ignored": {
+                    "transport": "streamable-http",
+                    "url": "https://mcp.example.test/ignored",
+                }
+            }
+        }
+    }
+    codex_payload["telemetry_plan"] = {
+        "providers": ["relay"],
+        "relay_enabled": True,
+    }
+
+    output = await invoke_once_async(codex_payload)
+
+    assert (
+        "mcp_servers"
+        not in mock_codex.instances[0].thread_start.await_args.kwargs["config"]
+    )
+    assert "relay_runtime" not in output
 
 
 async def test_persistent_runtime_registers_skills_once_and_maps_mcp(
@@ -470,25 +981,24 @@ async def test_persistent_runtime_registers_skills_once_and_maps_mcp(
         "---\nname: review\ndescription: Test skill.\n---\n",
         encoding="utf-8",
     )
-    codex_payload["capability_plan"] = {
-        "native": {
-            "skill_paths": ["skills/review"],
-            "mcp_servers": {
-                "review": {
-                    "transport": "streamable-http",
-                    "url": "https://mcp.example.test/review",
-                }
-            },
-        }
-    }
+    codex_payload["config"]["skills"] = {"paths": ["skills/review"]}
+    configure_mcp(
+        codex_payload,
+        {
+            "review": {
+                "transport": "streamable-http",
+                "url": "https://mcp.example.test/review",
+            }
+        },
+    )
     start_payload = dict(codex_payload)
     start_payload.pop("request")
     runtime = adapter.CodexRuntime()
 
-    await runtime.start(start_payload)
-    await runtime.invoke(lifecycle_invocation(codex_payload))
+    await runtime.start(lifecycle_start_payload(start_payload))
+    await runtime.invoke(*lifecycle_invocation(codex_payload))
     codex_payload["runtime_context"]["invocation_id"] = "invocation-2"
-    await runtime.invoke(lifecycle_invocation(codex_payload))
+    await runtime.invoke(*lifecycle_invocation(codex_payload))
     await runtime.stop()
 
     client = mock_codex.instances[0]
@@ -507,9 +1017,9 @@ async def test_persistent_runtime_registers_skills_once_and_maps_mcp(
 async def test_persistent_runtime_owns_one_relay_gateway(
     codex_payload, mock_codex, monkeypatch, tmp_path
 ):
-    codex_payload["telemetry_plan"] = {
-        "providers": ["relay"],
+    codex_payload["runtime_context"]["telemetry"] = {
         "relay_enabled": True,
+        "metadata": {"telemetry_providers": ["relay"]},
     }
     gateway = adapter.relay_gateway.RelayGatewayLaunch(
         executable=tmp_path / "nemo-relay",
@@ -532,10 +1042,10 @@ async def test_persistent_runtime_owns_one_relay_gateway(
     start_payload.pop("request")
     runtime = adapter.CodexRuntime()
 
-    await runtime.start(start_payload)
-    await runtime.invoke(lifecycle_invocation(codex_payload))
+    await runtime.start(lifecycle_start_payload(start_payload))
+    await runtime.invoke(*lifecycle_invocation(codex_payload))
     codex_payload["runtime_context"]["invocation_id"] = "invocation-2"
-    await runtime.invoke(lifecycle_invocation(codex_payload))
+    await runtime.invoke(*lifecycle_invocation(codex_payload))
     stop_gateway.assert_not_called()
     await runtime.stop()
 
@@ -545,6 +1055,99 @@ async def test_persistent_runtime_owns_one_relay_gateway(
         cwd=Path(codex_payload["runtime_context"]["environment"]["workspace"]),
     )
     stop_gateway.assert_called_once_with(process)
+
+
+async def test_relay_waits_for_delayed_atif_before_collecting_artifacts(
+    codex_payload, mock_codex, monkeypatch, tmp_path
+):
+    codex_payload["runtime_context"]["telemetry"] = {
+        "relay_enabled": True,
+        "metadata": {"telemetry_providers": ["relay"]},
+    }
+    atif_dir = tmp_path / "relay" / "atif"
+    atif_dir.mkdir(parents=True)
+    atif_file = atif_dir / "trajectory-session.atif.json"
+    relay = relay_settings(tmp_path, atif_plugin_config(atif_dir))
+    install_mock_relay(monkeypatch, relay)
+    mock_sdk_thread = mock_thread("thread-123")
+    write_task = None
+
+    async def finish_turn():
+        nonlocal write_task
+
+        async def write_atif():
+            await asyncio.sleep(0.05)
+            atif_file.write_text(
+                json.dumps({"schema_version": "ATIF-v1.7", "steps": []}),
+                encoding="utf-8",
+            )
+
+        write_task = asyncio.create_task(write_atif())
+        return successful_result()
+
+    mock_sdk_thread.handle.run.side_effect = finish_turn
+    mock_codex.next_thread = mock_sdk_thread
+    runtime = adapter.CodexRuntime()
+
+    await runtime.start(lifecycle_start_payload(codex_payload))
+    try:
+        output = result_view(await runtime.invoke(*lifecycle_invocation(codex_payload)))
+        assert write_task is not None
+        await write_task
+    finally:
+        await runtime.stop()
+
+    assert output["completed"] is True
+    assert output["relay_artifacts"] == [{"kind": "atif", "path": str(atif_file)}]
+
+
+async def test_relay_atif_timeout_fails_successful_turn_explicitly(
+    codex_payload, mock_codex, monkeypatch, tmp_path
+):
+    codex_payload["runtime_context"]["telemetry"] = {
+        "relay_enabled": True,
+        "metadata": {"telemetry_providers": ["relay"]},
+    }
+    atif_dir = tmp_path / "relay" / "atif"
+    atif_dir.mkdir(parents=True)
+    stale_atif = atif_dir / "trajectory-existing.atif.json"
+    stale_atif.write_text('{"schema_version":"ATIF-v1.7","steps":[]}', encoding="utf-8")
+    late_atif = atif_dir / "trajectory-late.atif.json"
+    relay = relay_settings(tmp_path, atif_plugin_config(atif_dir))
+    install_mock_relay(monkeypatch, relay)
+    wait_for_atif = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        adapter.relay_artifacts, "wait_for_finalized_atif", wait_for_atif
+    )
+    runtime = adapter.CodexRuntime()
+
+    await runtime.start(lifecycle_start_payload(codex_payload))
+    try:
+        output = result_view(await runtime.invoke(*lifecycle_invocation(codex_payload)))
+        late_atif.write_text(
+            '{"schema_version":"ATIF-v1.7","steps":[]}', encoding="utf-8"
+        )
+        unavailable = result_view(
+            await runtime.invoke(*lifecycle_invocation(codex_payload))
+        )
+    finally:
+        await runtime.stop()
+
+    assert output["failed"] is True
+    assert output["error"] == {
+        "code": "codex_relay_atif_timeout",
+        "message": "NeMo Relay did not finalize an ATIF artifact before the deadline",
+        "retryable": False,
+        "extensions": {
+            "timeout_seconds": adapter.relay_artifacts.ATIF_FINALIZATION_TIMEOUT_SECONDS
+        },
+    }
+    wait_for_atif.assert_awaited_once()
+    assert output["relay_runtime"]["enabled"] is True
+    assert output["relay_artifacts"] == []
+    assert unavailable["error"]["code"] == "codex_runtime_unavailable"
+    assert "relay_runtime" not in unavailable
+    assert "relay_artifacts" not in unavailable
 
 
 def test_failed_sdk_turn_is_normalized_and_transport_is_closed(
@@ -560,6 +1163,15 @@ def test_failed_sdk_turn_is_normalized_and_transport_is_closed(
         "retryable": False,
     }
     assert mock_codex.instances[0].closed is True
+
+
+def test_sdk_failure_preserves_jsonrpc_code():
+    output = adapter.sdk_failure(JsonRpcError(-32000, "provider failure"))
+
+    assert output["error"]["metadata"] == {
+        "sdk_error": "JsonRpcError",
+        "jsonrpc_code": -32000,
+    }
 
 
 def test_incomplete_sdk_turn_is_failed(codex_payload, mock_codex):
@@ -668,7 +1280,9 @@ def test_custom_provider_requires_credential(codex_payload, mock_codex):
 
     assert error.code == "codex_invalid_configuration"
     assert "ACME_API_KEY is required" in error.message
-    assert not (adapter.state_dir(codex_payload) / "custom-provider-home").exists()
+    assert not (
+        adapter.state_dir(*runtime_input(codex_payload)[1:]) / "custom-provider-home"
+    ).exists()
     mock_codex.assert_not_called()
 
 
@@ -693,9 +1307,9 @@ def test_custom_provider_requires_explicit_endpoint(codex_payload, mock_codex):
 def test_relay_uses_gateway_and_request_scoped_sdk_config(
     codex_payload, mock_codex, monkeypatch, tmp_path
 ):
-    codex_payload["telemetry_plan"] = {
-        "providers": ["relay"],
+    codex_payload["runtime_context"]["telemetry"] = {
         "relay_enabled": True,
+        "metadata": {"telemetry_providers": ["relay"]},
     }
     relay_config_path = tmp_path / "relay-config" / "config.toml"
     executable = tmp_path / "bin" / "nemo-relay"
@@ -731,9 +1345,12 @@ def test_relay_uses_gateway_and_request_scoped_sdk_config(
     assert config["features"]["web_search"] is False
     assert config["openai_base_url"] == gateway.url
     assert "model_providers" not in config
+    executable_arg = str(executable)
+    if sys.platform == "win32":
+        executable_arg = subprocess.list2cmdline([executable_arg.replace("\\", "/")])
     assert config["hooks"]["SessionStart"][0]["hooks"][0] == {
         "type": "command",
-        "command": f"{executable} hook-forward codex",
+        "command": f"{executable_arg} hook-forward codex",
         "timeout": 30,
     }
     assert output["relay_runtime"] == {
@@ -762,9 +1379,9 @@ def test_relay_routes_custom_provider_through_gateway(codex_payload, tmp_path):
             "base_url": "https://acme.example/v1",
         }
     )
-    codex_payload["telemetry_plan"] = {
-        "providers": ["relay"],
+    codex_payload["runtime_context"]["telemetry"] = {
         "relay_enabled": True,
+        "metadata": {"telemetry_providers": ["relay"]},
     }
     os.environ["ACME_API_KEY"] = "acme-secret"
     gateway = adapter.relay_gateway.RelayGatewayLaunch(
@@ -780,8 +1397,8 @@ def test_relay_routes_custom_provider_through_gateway(codex_payload, tmp_path):
         plugin_config={"version": 1, "components": []},
     )
 
-    adapter.validate_runtime_payload(codex_payload)
-    config = adapter.thread_config(codex_payload, relay)
+    adapter.validate_runtime_payload(*runtime_input(codex_payload))
+    config = adapter.thread_config(*runtime_input(codex_payload)[:2], relay)
 
     assert config["model_providers"]["acme"] == {
         "name": "acme",
@@ -802,45 +1419,110 @@ def test_prepare_relay_reuses_one_resolved_executable(
             "base_url": "https://acme.example/v1/",
         }
     )
-    codex_payload["telemetry_plan"] = {
-        "providers": ["relay"],
+    codex_payload["runtime_context"]["telemetry"] = {
         "relay_enabled": True,
+        "metadata": {"telemetry_providers": ["relay"]},
     }
     executable = tmp_path / "nemo-relay"
     config_path = tmp_path / "relay-config" / "config.toml"
     plugin_path = config_path.parent / "plugins.toml"
     resolve = MagicMock(return_value=executable)
     contract = MagicMock(
-        return_value=adapter.relay_gateway.RelayCliContract(
-            version=(0, 6, 0), observability_version=2
-        )
+        return_value=adapter.relay_gateway.RelayCliContract(version=(0, 7, 2))
     )
     write = MagicMock(return_value=(config_path, plugin_path))
+    load = MagicMock(
+        return_value={
+            "version": 1,
+            "components": [
+                {
+                    "kind": "observability",
+                    "config": {"version": 3, "atif": {"enabled": True}},
+                }
+            ],
+        }
+    )
     monkeypatch.setattr(adapter.relay_gateway, "resolve_relay_command", resolve)
     monkeypatch.setattr(adapter.relay_gateway, "relay_cli_contract", contract)
     monkeypatch.setattr(adapter.relay_gateway, "find_available_tcp_port", lambda: 43210)
-    monkeypatch.setattr(
-        adapter.common_utils,
-        "load_relay_plugin_config",
-        MagicMock(return_value={"version": 1, "components": []}),
-    )
+    monkeypatch.setattr(adapter.common_utils, "load_relay_plugin_config", load)
     monkeypatch.setattr(adapter.common_utils, "write_relay_configs", write)
 
-    relay = adapter.prepare_codex_relay(codex_payload)
+    config, context, base_dir = runtime_input(codex_payload)
+    relay = adapter.prepare_codex_relay(
+        codex_payload["agent_name"], config, context, base_dir
+    )
 
     assert relay is not None
     assert relay.gateway.executable == executable
     assert relay.gateway.url == "http://127.0.0.1:43210"
     assert relay.gateway.openai_base_url == "https://acme.example/v1"
+    assert relay.plugin_config["components"][0]["config"]["version"] == 3
     resolve.assert_called_once_with(
         Path(codex_payload["base_dir"]).resolve(),
         "nemo-relay",
     )
     contract.assert_called_once_with(executable)
+    load.assert_called_once_with(
+        {
+            "agent_name": "codex-test",
+            "base_dir": codex_payload["base_dir"],
+            "config": config.to_mapping(),
+            "runtime_context": context.to_mapping(),
+        }
+    )
     write.assert_called_once_with(
         relay_config={},
-        plugin_config={"version": 1, "components": []},
-        observability_version=2,
+        plugin_config={
+            "version": 1,
+            "components": [
+                {
+                    "kind": "observability",
+                    "config": {"version": 3, "atif": {"enabled": True}},
+                }
+            ],
+        },
+    )
+
+
+def test_prepare_relay_rejects_v2_observability_config(
+    codex_payload, monkeypatch, tmp_path
+):
+    codex_payload["runtime_context"]["telemetry"] = {
+        "relay_enabled": True,
+        "metadata": {"telemetry_providers": ["relay"]},
+    }
+    relay_intent_path = tmp_path / "relay.json"
+    relay_intent_path.write_text(
+        json.dumps({"relay": {"config": {"version": 2}}}),
+        encoding="utf-8",
+    )
+    os.environ["FABRIC_RELAY_CONFIG_PATH"] = str(relay_intent_path)
+    executable = tmp_path / "nemo-relay"
+    executable.touch()
+    monkeypatch.setattr(
+        adapter.relay_gateway,
+        "resolve_relay_command",
+        MagicMock(return_value=executable),
+    )
+    monkeypatch.setattr(
+        adapter.relay_gateway,
+        "relay_cli_contract",
+        MagicMock(
+            return_value=adapter.relay_gateway.RelayCliContract(version=(0, 7, 2))
+        ),
+    )
+
+    config, context, base_dir = runtime_input(codex_payload)
+    with pytest.raises(adapter.AdapterRelayError) as caught:
+        adapter.prepare_codex_relay(
+            codex_payload["agent_name"], config, context, base_dir
+        )
+
+    assert caught.value.code == "codex_relay_configuration_failed"
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert str(caught.value.__cause__) == (
+        "unsupported NeMo Relay observability config version 2; expected version 3"
     )
 
 
@@ -859,7 +1541,7 @@ def test_relay_stop_failure_is_reported_by_runtime_stop(
         gateway=gateway,
         plugin_config={"version": 1, "components": []},
     )
-    monkeypatch.setattr(adapter, "prepare_codex_relay", lambda _: relay)
+    monkeypatch.setattr(adapter, "prepare_codex_relay", lambda *_: relay)
     monkeypatch.setattr(
         adapter.relay_gateway, "start_relay_gateway", lambda **_: MagicMock()
     )
@@ -872,7 +1554,7 @@ def test_relay_stop_failure_is_reported_by_runtime_stop(
     async def scenario() -> tuple[dict[str, Any], adapter.lifecycle.LifecycleError]:
         runtime = adapter.CodexRuntime()
         await runtime.start(lifecycle_start_payload(codex_payload))
-        output = await runtime.invoke(lifecycle_invocation(codex_payload))
+        output = result_view(await runtime.invoke(*lifecycle_invocation(codex_payload)))
         with pytest.raises(adapter.lifecycle.LifecycleError) as caught:
             await runtime.stop()
         return output, caught.value
@@ -898,24 +1580,28 @@ def test_native_sdk_controls_and_telemetry_are_request_scoped(
             },
         }
     )
-    codex_payload["telemetry_plan"] = {
-        "providers": ["native"],
+    codex_payload["runtime_context"]["telemetry"] = {
         "relay_enabled": False,
-        "native_config": {
-            "components": [
-                {
-                    "kind": "observability",
-                    "enabled": True,
-                    "config": {
-                        "opentelemetry": {
-                            "enabled": True,
-                            "endpoint": "http://localhost:4318/v1/traces",
-                            "transport": "http_binary",
-                            "resource_attributes": {"deployment.environment": "test"},
-                        }
-                    },
-                }
-            ]
+        "metadata": {
+            "telemetry_providers": ["native"],
+            "native_config": {
+                "components": [
+                    {
+                        "kind": "observability",
+                        "enabled": True,
+                        "config": {
+                            "opentelemetry": {
+                                "enabled": True,
+                                "endpoint": "http://localhost:4318/v1/traces",
+                                "transport": "http_binary",
+                                "resource_attributes": {
+                                    "deployment.environment": "test"
+                                },
+                            }
+                        },
+                    }
+                ]
+            },
         },
     }
 
@@ -940,7 +1626,24 @@ def test_native_sdk_controls_and_telemetry_are_request_scoped(
     assert turn["output_schema"]["required"] == ["summary"]
 
 
-def test_timeout_interrupts_native_turn_and_closes_sdk(codex_payload, mock_codex):
+def test_native_telemetry_requires_mapping(codex_payload):
+    codex_payload["runtime_context"]["telemetry"] = {
+        "relay_enabled": False,
+        "metadata": {
+            "telemetry_providers": ["native"],
+            "native_config": [],
+        },
+    }
+
+    with pytest.raises(
+        adapter.AdapterConfigError, match="native_config must be a mapping"
+    ):
+        adapter.native_codex_telemetry_config(runtime_input(codex_payload)[1])
+
+
+def test_timeout_interrupts_native_turn_and_closes_sdk(
+    codex_payload, mock_codex, monkeypatch
+):
     mock_blocking_thread = mock_thread("thread-timeout")
 
     async def block():
@@ -948,7 +1651,7 @@ def test_timeout_interrupts_native_turn_and_closes_sdk(codex_payload, mock_codex
 
     mock_blocking_thread.handle.run.side_effect = block
     mock_codex.next_thread = mock_blocking_thread
-    codex_payload["config"]["runtime"]["timeout_seconds"] = 0.01
+    monkeypatch.setattr(adapter, "timeout_seconds", lambda: 0.01)
 
     output = invoke_once(codex_payload)
 
@@ -971,7 +1674,10 @@ def test_adapter_rejects_structured_input(codex_payload):
 def test_descriptor_has_no_codex_binary_requirement():
     descriptor = json.loads(
         (
-            Path(__file__).parents[2] / "adapters" / "codex" / "fabric-adapter.json"
+            Path(__file__).parents[2]
+            / "adapters"
+            / "codex"
+            / "codex.fabric-adapter.json"
         ).read_text(encoding="utf-8")
     )
 
@@ -984,8 +1690,21 @@ def test_descriptor_has_no_codex_binary_requirement():
         "models.base_url",
         "instructions.system",
         "mcp",
+        "mcp.auth.oauth2",
         "skills",
     ]
+    assert descriptor["model_schema"]["if"]["properties"]["provider"] == {
+        "const": "openai"
+    }
+    assert descriptor["model_schema"]["else"]["required"] == [
+        "base_url",
+        "api_key_env",
+    ]
+    assert descriptor["model_schema"]["properties"]["settings"] == {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
     assert "requirements" not in descriptor
 
 
@@ -1004,7 +1723,6 @@ def test_codex_config_resolves_sdk_adapter():
     plan = Fabric().plan(config, base_dir=BASE_DIR)
 
     assert plan.adapter.adapter_id == "nvidia.fabric.codex"
-    assert plan.adapter.harness == "codex"
     assert plan.config.runtime.input_schema == "text"
     assert plan.config.harness.settings["reasoning_effort"] == "high"
     native = plan["capability_plan"]["native"]
@@ -1022,7 +1740,7 @@ def test_codex_config_resolves_sdk_adapter():
 def test_environment_does_not_mutate_parent(codex_payload):
     os.environ["FABRIC_UNRELATED_SECRET"] = "parent-value"
 
-    child = adapter.child_environment(codex_payload)
+    child = adapter.child_environment(*runtime_input(codex_payload))
 
     assert child["FABRIC_UNRELATED_SECRET"] == ""
     assert os.environ["FABRIC_UNRELATED_SECRET"] == "parent-value"
@@ -1030,18 +1748,19 @@ def test_environment_does_not_mutate_parent(codex_payload):
 
 def test_environment_preserves_runtime_telemetry_env(codex_payload):
     codex_payload["runtime_context"]["telemetry"] = {
+        "relay_enabled": False,
         "env": {
             "FABRIC_RELAY_ENABLED": "true",
             "FABRIC_RELAY_CONFIG_PATH": "/tmp/relay.json",
             "CODEX_EXPLICIT": "telemetry",
-        }
+        },
     }
     codex_payload["runtime_context"]["environment"]["env"] = {
         "CODEX_EXPLICIT": "configured"
     }
     os.environ["FABRIC_RELAY_CONFIG_PATH"] = "/tmp/parent-relay.json"
 
-    child = adapter.child_environment(codex_payload)
+    child = adapter.child_environment(*runtime_input(codex_payload))
 
     assert child["FABRIC_RELAY_ENABLED"] == "true"
     assert child["FABRIC_RELAY_CONFIG_PATH"] == "/tmp/relay.json"
@@ -1059,24 +1778,28 @@ def test_environment_preserves_runtime_telemetry_env(codex_payload):
 def test_environment_rejects_non_string_runtime_telemetry_env(
     codex_payload, telemetry_env
 ):
-    codex_payload["runtime_context"]["telemetry"] = {"env": telemetry_env}
+    codex_payload["runtime_context"]["telemetry"] = {
+        "relay_enabled": False,
+        "env": telemetry_env,
+    }
 
-    with pytest.raises(
-        adapter.AdapterInputError,
-        match=r"runtime_context\.telemetry\.env must contain strings",
-    ):
-        adapter.child_environment(codex_payload)
+    with pytest.raises(ContractValidationError, match=r"telemetry\.env"):
+        runtime_input(codex_payload)
 
 
 @pytest.mark.parametrize("telemetry", [[], "invalid"])
 def test_environment_rejects_non_mapping_runtime_telemetry(codex_payload, telemetry):
     codex_payload["runtime_context"]["telemetry"] = telemetry
 
-    with pytest.raises(
-        adapter.AdapterInputError,
-        match=r"runtime_context\.telemetry must be a mapping",
-    ):
-        adapter.child_environment(codex_payload)
+    with pytest.raises(ContractValidationError, match="telemetry"):
+        runtime_input(codex_payload)
+
+
+def test_runtime_context_validation_uses_lifecycle_error():
+    with pytest.raises(adapter.lifecycle.LifecycleError) as caught:
+        adapter._runtime_context({"runtime_context": {}})
+
+    assert caught.value.code == "codex_invalid_runtime_context"
 
 
 def test_main_serves_persistent_runtime(monkeypatch):
@@ -1085,4 +1808,6 @@ def test_main_serves_persistent_runtime(monkeypatch):
 
     adapter.main()
 
-    serve.assert_called_once_with(adapter.CodexRuntime)
+    serve.assert_called_once_with(
+        adapter.CodexRuntime, config_loader=AgentConfig.from_mapping
+    )

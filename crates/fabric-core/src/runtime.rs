@@ -19,9 +19,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::agent_config::validate_agent_config;
+use crate::agent_execution::{
+    AgentArtifact, AgentRunError, AgentRunRequest, AgentRunResult, AgentRunStatus, AgentUsage,
+};
 use crate::config::{
-    AdapterKind, CapabilityPlan, CapabilityTarget, ControlLocation, EnvironmentOwnership,
-    FabricConfig, RunPlan, TelemetryPlan, validate_adapter_config_compatibility,
+    AdapterKind, AgentConfig, CapabilityPlan, CapabilityTarget, ControlLocation,
+    EnvironmentOwnership, RunPlan, TelemetryPlan, validate_adapter_config_compatibility,
+    validate_agent_config_extensions, validate_agent_run_request_extensions,
+    validate_agent_run_result_extensions, validate_config, validate_harness_settings,
+    validate_tool_definitions, validate_workflow,
 };
 use crate::error::{FabricError, Result};
 
@@ -35,6 +42,12 @@ const LOCAL_HOST_INVOKE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const LOCAL_HOST_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_HOST_EXIT_GRACE: Duration = Duration::from_secs(2);
 const LOCAL_HOST_DIAGNOSTIC_LIMIT: usize = 16 * 1024;
+#[cfg(test)]
+pub(crate) const OPENAI_STREAM_HOST: &str = "127.0.0.1";
+#[cfg(test)]
+pub(crate) const OPENAI_STREAM_PROTOCOL_VERSION: &str = "fabric.openai_stream/v1alpha1";
+#[cfg(test)]
+pub(crate) const OPENAI_CHAT_COMPLETIONS_CHUNK_PROFILE: &str = "openai.chat_completions.chunk/v1";
 
 #[cfg(not(windows))]
 const VENV_BIN_DIR: &str = "bin";
@@ -111,6 +124,9 @@ pub struct RunResult {
     /// Error metadata when applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorInfo>,
+    /// Normalized invocation usage when reported by the adapter target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RunUsage>,
     /// Artifacts produced or collected by this run.
     #[serde(default)]
     pub artifacts: ArtifactManifest,
@@ -154,6 +170,28 @@ pub struct ErrorInfo {
     pub metadata: BTreeMap<String, Value>,
 }
 
+/// Normalized invocation usage exposed to NeMo Fabric consumers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunUsage {
+    /// Input tokens consumed by the invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Output tokens produced by the invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// Total tokens reported by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    /// Invocation cost in US dollars when reported by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0))]
+    pub cost_usd: Option<f64>,
+    /// Adapter-owned usage metadata.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, Value>,
+}
+
 /// NeMo Fabric lifecycle stage associated with an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -178,6 +216,7 @@ pub enum ErrorStage {
 
 /// Manifest of run artifacts.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactManifest {
     /// Artifact root directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,6 +228,7 @@ pub struct ArtifactManifest {
 
 /// Reference to one artifact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactRef {
     /// Logical artifact name.
     pub name: String,
@@ -199,6 +239,9 @@ pub struct ArtifactRef {
     /// Optional media type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
+    /// Artifact-specific metadata preserved across the Rust and Python SDK boundary.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, Value>,
 }
 
 /// Reference to telemetry emitted by Relay or another configured telemetry path.
@@ -229,6 +272,7 @@ pub struct FabricEvent {
 
 /// Resolved execution environment context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentHandle {
     /// Environment handle id.
     pub environment_id: String,
@@ -288,6 +332,7 @@ pub struct InvocationHandle {
 
 /// Context generated for one invocation of a started runtime.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeContext {
     /// Runtime handle id.
     pub runtime_id: String,
@@ -306,6 +351,7 @@ pub struct RuntimeContext {
 
 /// Runtime telemetry config passed to adapters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeTelemetryContext {
     /// Whether Relay is enabled for this invocation.
     pub relay_enabled: bool,
@@ -326,7 +372,220 @@ pub struct AdapterInvocation {
     /// Invocation context generated by NeMo Fabric.
     pub runtime_context: RuntimeContext,
     /// Typed caller request for this invocation.
-    pub request: RunRequest,
+    pub request: AgentRunRequest,
+}
+
+/// SDK-owned loopback transport for one native OpenAI streaming invocation.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiStreamTransport {
+    /// Loopback TCP port owned by the SDK listener.
+    #[schemars(range(min = 1))]
+    pub port: u16,
+    /// Single-use bearer token used to authenticate the adapter connection.
+    #[schemars(length(min = 1), regex(pattern = r"^[^\r\n]*\S[^\r\n]*$"))]
+    pub token: String,
+}
+
+impl std::fmt::Debug for OpenAiStreamTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenAiStreamTransport")
+            .field("port", &self.port)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Supported southbound native-streaming protocol version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum OpenAiStreamProtocolVersion {
+    /// Initial authenticated loopback HTTP and chunked-NDJSON protocol.
+    #[serde(rename = "fabric.openai_stream/v1alpha1")]
+    V1Alpha1,
+}
+
+/// Supported OpenAI-compatible chunk profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum OpenAiStreamProfile {
+    /// OpenAI Chat Completions chunk objects.
+    #[serde(rename = "openai.chat_completions.chunk/v1")]
+    ChatCompletionsChunkV1,
+}
+
+/// Supported native-streaming listener host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum OpenAiStreamHost {
+    /// SDK-owned IPv4 loopback listener.
+    #[serde(rename = "127.0.0.1")]
+    Ipv4Loopback,
+}
+
+/// Adapter-facing stream sink with invocation identity generated by NVIDIA NeMo Fabric.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiStreamSink {
+    /// Southbound stream protocol version.
+    pub protocol_version: OpenAiStreamProtocolVersion,
+    /// OpenAI event profile emitted on this stream.
+    pub profile: OpenAiStreamProfile,
+    /// Loopback host owned by the SDK listener.
+    pub host: OpenAiStreamHost,
+    /// Loopback TCP port owned by the SDK listener.
+    #[schemars(range(min = 1))]
+    pub port: u16,
+    /// Single-use bearer token. Adapters must not log or persist this value.
+    #[schemars(length(min = 1), regex(pattern = r"^[^\r\n]*\S[^\r\n]*$"))]
+    pub token: String,
+    /// Runtime id for stream correlation.
+    #[schemars(length(min = 1), regex(pattern = r"\S"))]
+    pub runtime_id: String,
+    /// Invocation id for stream correlation.
+    #[schemars(length(min = 1), regex(pattern = r"\S"))]
+    pub invocation_id: String,
+    /// Request id for stream correlation.
+    #[schemars(length(min = 1), regex(pattern = r"\S"))]
+    pub request_id: String,
+}
+
+impl std::fmt::Debug for OpenAiStreamSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenAiStreamSink")
+            .field("protocol_version", &self.protocol_version)
+            .field("profile", &self.profile)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("token", &"[REDACTED]")
+            .field("runtime_id", &self.runtime_id)
+            .field("invocation_id", &self.invocation_id)
+            .field("request_id", &self.request_id)
+            .finish()
+    }
+}
+
+/// One adapter-native OpenAI streaming invocation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiStreamInvocation {
+    /// Invocation context generated by NeMo Fabric.
+    pub runtime_context: RuntimeContext,
+    /// Typed caller request for this invocation.
+    pub request: AgentRunRequest,
+    /// Authenticated progressive-output sink for this invocation.
+    pub stream: OpenAiStreamSink,
+}
+
+/// Exact OpenAI object discriminator accepted by the v1 chunk profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum OpenAiChatCompletionChunkObject {
+    /// OpenAI Chat Completions streaming chunk.
+    #[serde(rename = "chat.completion.chunk")]
+    ChatCompletionChunk,
+}
+
+/// Incremental assistant message fields carried by one OpenAI choice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct OpenAiChatCompletionChunkDelta {
+    /// Incremental text content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Incremental refusal content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    /// Incremental message role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Legacy incremental function-call fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<BTreeMap<String, Value>>,
+    /// Incremental tool-call fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<BTreeMap<String, Value>>>,
+    /// Additional OpenAI-compatible delta fields preserved by pass-through.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+/// One choice within an OpenAI Chat Completions streaming chunk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct OpenAiChatCompletionChunkChoice {
+    /// Choice index within the response.
+    #[schemars(range(max = u32::MAX))]
+    pub index: u32,
+    /// Incremental assistant message fields.
+    pub delta: OpenAiChatCompletionChunkDelta,
+    /// Terminal reason when this choice finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    /// Incremental log-probability information.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<BTreeMap<String, Value>>,
+    /// Additional OpenAI-compatible choice fields preserved by pass-through.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+/// OpenAI Chat Completions chunk accepted by the native streaming profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct OpenAiChatCompletionChunk {
+    /// Provider-generated response identifier.
+    #[schemars(length(min = 1), regex(pattern = r"\S"))]
+    pub id: String,
+    /// Exact OpenAI streaming object discriminator.
+    pub object: OpenAiChatCompletionChunkObject,
+    /// Unix timestamp in seconds.
+    #[schemars(range(max = u64::MAX))]
+    pub created: u64,
+    /// Model identifier.
+    #[schemars(length(min = 1), regex(pattern = r"\S"))]
+    pub model: String,
+    /// Incremental choices; an explicit usage-only chunk can contain none.
+    pub choices: Vec<OpenAiChatCompletionChunkChoice>,
+    /// Optional token-usage data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<BTreeMap<String, Value>>,
+    /// Additional OpenAI-compatible top-level fields preserved by pass-through.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+/// One correlated NDJSON record on the adapter-native stream channel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OpenAiStreamRecord {
+    /// One OpenAI Chat Completions chunk.
+    Chunk {
+        /// Monotonic zero-based record sequence.
+        #[schemars(range(max = u64::MAX))]
+        sequence: u64,
+        /// Runtime id for stream correlation.
+        #[schemars(length(min = 1), regex(pattern = r"\S"))]
+        runtime_id: String,
+        /// Invocation id for stream correlation.
+        #[schemars(length(min = 1), regex(pattern = r"\S"))]
+        invocation_id: String,
+        /// Request id for stream correlation.
+        #[schemars(length(min = 1), regex(pattern = r"\S"))]
+        request_id: String,
+        /// OpenAI-compatible chunk passed through to the consumer.
+        chunk: OpenAiChatCompletionChunk,
+    },
+    /// Explicit successful end of the progressive event channel.
+    End {
+        /// Monotonic zero-based record sequence.
+        #[schemars(range(max = u64::MAX))]
+        sequence: u64,
+        /// Runtime id for stream correlation.
+        #[schemars(length(min = 1), regex(pattern = r"\S"))]
+        runtime_id: String,
+        /// Invocation id for stream correlation.
+        #[schemars(length(min = 1), regex(pattern = r"\S"))]
+        invocation_id: String,
+        /// Request id for stream correlation.
+        #[schemars(length(min = 1), regex(pattern = r"\S"))]
+        request_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,6 +593,7 @@ pub struct AdapterInvocation {
 enum AdapterLifecycleOperation {
     Start,
     Invoke,
+    InvokeOpenaiStream,
     Stop,
 }
 
@@ -342,6 +602,7 @@ impl AdapterLifecycleOperation {
         match self {
             Self::Start => "start",
             Self::Invoke => "invoke",
+            Self::InvokeOpenaiStream => "invoke_openai_stream",
             Self::Stop => "stop",
         }
     }
@@ -349,7 +610,7 @@ impl AdapterLifecycleOperation {
     fn error_stage(self) -> ErrorStage {
         match self {
             Self::Start => ErrorStage::Start,
-            Self::Invoke => ErrorStage::Invoke,
+            Self::Invoke | Self::InvokeOpenaiStream => ErrorStage::Invoke,
             Self::Stop => ErrorStage::Stop,
         }
     }
@@ -359,7 +620,7 @@ impl AdapterLifecycleOperation {
 struct AdapterLifecycleStart {
     agent_name: String,
     base_dir: PathBuf,
-    config: FabricConfig,
+    config: AgentConfig,
     runtime_context: RuntimeContext,
     capability_plan: CapabilityPlan,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -376,6 +637,7 @@ struct AdapterLifecycleStop {
 enum AdapterLifecycleRequestKind {
     Start(Box<AdapterLifecycleStart>),
     Invoke(Box<AdapterInvocation>),
+    InvokeOpenaiStream(Box<OpenAiStreamInvocation>),
     Stop(AdapterLifecycleStop),
 }
 
@@ -384,6 +646,7 @@ impl AdapterLifecycleRequestKind {
         match self {
             Self::Start(_) => AdapterLifecycleOperation::Start,
             Self::Invoke(_) => AdapterLifecycleOperation::Invoke,
+            Self::InvokeOpenaiStream(_) => AdapterLifecycleOperation::InvokeOpenaiStream,
             Self::Stop(_) => AdapterLifecycleOperation::Stop,
         }
     }
@@ -431,6 +694,13 @@ trait RuntimeAdapter {
         runtime: &RuntimeHandle,
         request: RunRequest,
     ) -> Result<RunResult>;
+    fn invoke_openai_stream(
+        &self,
+        plan: &RunPlan,
+        runtime: &RuntimeHandle,
+        request: RunRequest,
+        transport: OpenAiStreamTransport,
+    ) -> Result<RunResult>;
     fn stop(&self, runtime: &RuntimeHandle) -> Result<Vec<FabricEvent>>;
 }
 
@@ -464,7 +734,20 @@ pub fn run_plan(plan: &RunPlan, request: RunRequest) -> Result<RunResult> {
             return Err(error);
         }
     };
-    result.events.extend(stop_runtime(plan, &runtime)?);
+    match stop_runtime(plan, &runtime) {
+        Ok(events) => result.events.extend(events),
+        Err(error) if result.status == RunStatus::Succeeded => {
+            result.status = RunStatus::Failed;
+            result.error = Some(ErrorInfo {
+                stage: ErrorStage::Stop,
+                code: "runtime_stop_failed".to_string(),
+                message: error.to_string(),
+                retryable: false,
+                metadata: BTreeMap::new(),
+            });
+        }
+        Err(_) => {}
+    }
     Ok(result)
 }
 
@@ -539,7 +822,17 @@ pub fn prepare_environment(plan: &RunPlan) -> Result<EnvironmentHandle> {
 
 /// Start or connect to a harness runtime.
 pub fn start_runtime(plan: &RunPlan) -> Result<RuntimeHandle> {
+    validate_config(&plan.config)?;
+    validate_agent_config(&plan.agent_config)?;
+    validate_harness_settings(&plan.config, plan.adapter_descriptor.as_ref())?;
+    validate_workflow(&plan.config, plan.adapter_target_descriptor.as_ref())?;
     validate_adapter_compatibility(plan)?;
+    validate_tool_definitions(&plan.config, plan.adapter_descriptor.as_ref())?;
+    validate_agent_config_extensions(
+        &plan.config,
+        plan.adapter_descriptor.as_ref(),
+        plan.adapter_target_descriptor.as_ref(),
+    )?;
     let environment = prepare_environment(plan)?;
     if uses_local_host(plan) {
         return LocalHostAdapter.start(plan, environment);
@@ -565,6 +858,54 @@ pub fn invoke_runtime(
         harness: harness(plan),
         adapter_kind: adapter_kind(plan),
     })
+}
+
+/// Invoke a started harness runtime and pass through native OpenAI chat-completion chunks.
+pub fn invoke_openai_stream(
+    plan: &RunPlan,
+    runtime: &RuntimeHandle,
+    request: RunRequest,
+    transport: OpenAiStreamTransport,
+) -> Result<RunResult> {
+    validate_adapter_compatibility(plan)?;
+    validate_runtime_handle(plan, runtime)?;
+    let descriptor_supports_streaming = plan
+        .adapter_descriptor
+        .as_ref()
+        .is_some_and(|adapter| adapter.descriptor.capabilities.streaming);
+    if !plan.capabilities.streaming || !descriptor_supports_streaming {
+        return Err(FabricError::UnsupportedRuntimeCapability {
+            adapter_id: adapter_id(plan).unwrap_or_else(|| harness(plan)),
+            capability: "streaming",
+        });
+    }
+    validate_openai_stream_transport(&transport)?;
+    if uses_local_host(plan) {
+        return LocalHostAdapter.invoke_openai_stream(plan, runtime, request, transport);
+    }
+    Err(FabricError::UnsupportedRuntimeAdapter {
+        harness: harness(plan),
+        adapter_kind: adapter_kind(plan),
+    })
+}
+
+fn validate_openai_stream_transport(transport: &OpenAiStreamTransport) -> Result<()> {
+    if transport.port == 0 {
+        return Err(FabricError::InvalidOpenAiStreamTransport {
+            field: "port",
+            reason: "must be greater than zero",
+        });
+    }
+    if transport.token.trim().is_empty()
+        || transport.token.contains('\r')
+        || transport.token.contains('\n')
+    {
+        return Err(FabricError::InvalidOpenAiStreamTransport {
+            field: "token",
+            reason: "must be a non-empty string without line breaks",
+        });
+    }
+    Ok(())
 }
 
 fn validate_adapter_compatibility(plan: &RunPlan) -> Result<()> {
@@ -854,6 +1195,16 @@ impl RuntimeAdapter for LocalHostAdapter {
         run_local_host_adapter(plan, runtime, request)
     }
 
+    fn invoke_openai_stream(
+        &self,
+        plan: &RunPlan,
+        runtime: &RuntimeHandle,
+        request: RunRequest,
+        transport: OpenAiStreamTransport,
+    ) -> Result<RunResult> {
+        run_local_host_openai_stream_adapter(plan, runtime, request, transport)
+    }
+
     fn stop(&self, runtime: &RuntimeHandle) -> Result<Vec<FabricEvent>> {
         let Some(host) = local_hosts().remove(&runtime.runtime_id) else {
             return Ok(vec![local_host_stop_event(runtime, true, false)]);
@@ -913,30 +1264,77 @@ fn run_local_host_adapter(
     runtime: &RuntimeHandle,
     request: RunRequest,
 ) -> Result<RunResult> {
-    let timeout = match plan.config.runtime.timeout_seconds {
-        Some(seconds) if seconds <= 0.0 => {
-            return Err(FabricError::InvalidConfig {
-                field: "runtime.timeout_seconds".to_string(),
-                reason: "must be a finite number greater than zero".to_string(),
-            });
-        }
+    run_local_host_adapter_with_timeout(plan, runtime, request, local_host_invoke_timeout(plan)?)
+}
+
+fn run_local_host_openai_stream_adapter(
+    plan: &RunPlan,
+    runtime: &RuntimeHandle,
+    request: RunRequest,
+    transport: OpenAiStreamTransport,
+) -> Result<RunResult> {
+    run_local_host_invocation_with_timeout(
+        plan,
+        runtime,
+        request,
+        LocalHostInvocation::OpenAiStream(transport),
+        local_host_invoke_timeout(plan)?,
+    )
+}
+
+fn local_host_invoke_timeout(plan: &RunPlan) -> Result<Duration> {
+    match plan.config.runtime.timeout_seconds {
+        Some(seconds) if seconds <= 0.0 => Err(FabricError::InvalidConfig {
+            field: "runtime.timeout_seconds".to_string(),
+            reason: "must be a finite number greater than zero".to_string(),
+        }),
         Some(seconds) => {
             Duration::try_from_secs_f64(seconds).map_err(|_| FabricError::InvalidConfig {
                 field: "runtime.timeout_seconds".to_string(),
                 reason: "must be a finite number greater than zero".to_string(),
-            })?
+            })
         }
-        None => LOCAL_HOST_INVOKE_TIMEOUT,
-    };
-    run_local_host_adapter_with_timeout(plan, runtime, request, timeout)
+        None => Ok(LOCAL_HOST_INVOKE_TIMEOUT),
+    }
 }
 
 fn run_local_host_adapter_with_timeout(
     plan: &RunPlan,
     runtime: &RuntimeHandle,
-    mut request: RunRequest,
+    request: RunRequest,
     invoke_timeout: Duration,
 ) -> Result<RunResult> {
+    run_local_host_invocation_with_timeout(
+        plan,
+        runtime,
+        request,
+        LocalHostInvocation::Invoke,
+        invoke_timeout,
+    )
+}
+
+enum LocalHostInvocation {
+    Invoke,
+    OpenAiStream(OpenAiStreamTransport),
+}
+
+impl LocalHostInvocation {
+    fn operation(&self) -> AdapterLifecycleOperation {
+        match self {
+            Self::Invoke => AdapterLifecycleOperation::Invoke,
+            Self::OpenAiStream(_) => AdapterLifecycleOperation::InvokeOpenaiStream,
+        }
+    }
+}
+
+fn run_local_host_invocation_with_timeout(
+    plan: &RunPlan,
+    runtime: &RuntimeHandle,
+    mut request: RunRequest,
+    invocation_kind: LocalHostInvocation,
+    invoke_timeout: Duration,
+) -> Result<RunResult> {
+    let operation = invocation_kind.operation();
     if request.request_id.is_empty() {
         request.request_id = new_id("request");
     }
@@ -950,7 +1348,7 @@ fn run_local_host_adapter_with_timeout(
         .cloned()
         .ok_or_else(|| {
             lifecycle_error(
-                AdapterLifecycleOperation::Invoke,
+                operation,
                 &runtime.runtime_id,
                 "host_unavailable",
                 "persistent local adapter host is not active",
@@ -971,21 +1369,38 @@ fn run_local_host_adapter_with_timeout(
             &artifacts,
             relay_config.as_ref(),
         )?;
-        let mut persisted_invocation = adapter_invocation.clone();
-        for value in persisted_invocation
-            .runtime_context
-            .environment
-            .env
-            .values_mut()
-        {
-            *value = "[REDACTED]".to_string();
-        }
-        let adapter_payload = serde_json::to_string_pretty(&persisted_invocation)
-            .map_err(FabricError::SerializeJson)?;
+        let (lifecycle_request, adapter_payload) = match invocation_kind {
+            LocalHostInvocation::Invoke => {
+                let mut persisted = adapter_invocation.clone();
+                redact_adapter_invocation(&mut persisted);
+                let payload =
+                    serde_json::to_string_pretty(&persisted).map_err(FabricError::SerializeJson)?;
+                (
+                    AdapterLifecycleRequest::new(AdapterLifecycleRequestKind::Invoke(Box::new(
+                        adapter_invocation,
+                    ))),
+                    payload,
+                )
+            }
+            LocalHostInvocation::OpenAiStream(transport) => {
+                let streaming_invocation = OpenAiStreamInvocation {
+                    stream: openai_stream_sink(runtime, &invocation, transport),
+                    runtime_context: adapter_invocation.runtime_context,
+                    request: adapter_invocation.request,
+                };
+                let mut persisted = streaming_invocation.clone();
+                redact_openai_stream_invocation(&mut persisted);
+                let payload =
+                    serde_json::to_string_pretty(&persisted).map_err(FabricError::SerializeJson)?;
+                (
+                    AdapterLifecycleRequest::new(AdapterLifecycleRequestKind::InvokeOpenaiStream(
+                        Box::new(streaming_invocation),
+                    )),
+                    payload,
+                )
+            }
+        };
         let fabric_invocation = write_fabric_invocation(&fabric_home, &adapter_payload)?;
-        let lifecycle_request = AdapterLifecycleRequest::new(AdapterLifecycleRequestKind::Invoke(
-            Box::new(adapter_invocation),
-        ));
         match exchange_lifecycle_message(
             &mut host_guard,
             &runtime.runtime_id,
@@ -1017,7 +1432,7 @@ fn run_local_host_adapter_with_timeout(
         }
     };
     let (
-        output,
+        adapter_output,
         stderr,
         host_command,
         host_pid,
@@ -1026,6 +1441,36 @@ fn run_local_host_adapter_with_timeout(
         fabric_home,
         fabric_invocation,
     ) = exchange_result?;
+
+    let agent_result: AgentRunResult = serde_json::from_value(adapter_output).map_err(|error| {
+        lifecycle_error(
+            operation,
+            &runtime.runtime_id,
+            "invalid_agent_run_result",
+            format!("adapter returned an invalid AgentRunResult: {error}"),
+            &stderr,
+        )
+    })?;
+    agent_result.validate().map_err(|error| {
+        lifecycle_error(
+            operation,
+            &runtime.runtime_id,
+            "invalid_agent_run_result",
+            format!("adapter returned an invalid AgentRunResult: {error}"),
+            &stderr,
+        )
+    })?;
+    validate_agent_run_result_extensions(&agent_result, plan.adapter_descriptor.as_ref())?;
+    if !agent_result.artifacts.is_empty() && artifacts.root.is_none() {
+        return Err(lifecycle_error(
+            operation,
+            &runtime.runtime_id,
+            "invalid_agent_run_result",
+            "adapter returned artifacts without a configured runtime artifact root",
+            &stderr,
+        ));
+    }
+    let output = agent_result.output.clone();
 
     let mut events = vec![event_with_metadata(
         "runtime_start",
@@ -1060,7 +1505,7 @@ fn run_local_host_adapter_with_timeout(
             ),
         ]),
     ));
-    let (status, error) = adapter_output_status(&output);
+    let (status, error) = agent_result_status(&agent_result);
     events.push(event_with_metadata(
         "invocation_end",
         format!("persistent local host completed with status {status:?}"),
@@ -1098,9 +1543,10 @@ fn run_local_host_adapter_with_timeout(
         )?;
     }
     collect_workspace_artifacts(&mut artifacts, &fabric_home, runtime, &mut events)?;
+    promote_agent_artifacts_to_manifest(&agent_result.artifacts, &mut artifacts);
     promote_relay_artifacts_to_manifest(&output, &mut artifacts);
 
-    let metadata = BTreeMap::from([
+    let mut metadata = BTreeMap::from([
         (
             "adapter_runner".to_string(),
             Value::String("persistent_local_host".to_string()),
@@ -1120,6 +1566,12 @@ fn run_local_host_adapter_with_timeout(
             Value::String(runtime.environment.provider.clone()),
         ),
     ]);
+    if !agent_result.extensions.is_empty() {
+        metadata.insert(
+            "adapter".to_string(),
+            serde_json::to_value(&agent_result.extensions).map_err(FabricError::SerializeJson)?,
+        );
+    }
     Ok(RunResult {
         agent_name: plan.agent_name.clone(),
         harness: harness(plan),
@@ -1131,6 +1583,7 @@ fn run_local_host_adapter_with_timeout(
         status,
         output,
         error,
+        usage: agent_result.usage.as_ref().map(run_usage),
         artifacts,
         telemetry: telemetry_ref(plan, relay_config.as_ref()),
         events,
@@ -1157,54 +1610,57 @@ fn invalidate_timed_out_local_host(
     let _ = remove_local_host_files(host);
 }
 
-fn adapter_output_status(output: &Value) -> (RunStatus, Option<ErrorInfo>) {
-    let failed = output
-        .as_object()
-        .and_then(|output| output.get("failed"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if !failed {
-        return (RunStatus::Succeeded, None);
-    }
+fn agent_result_status(result: &AgentRunResult) -> (RunStatus, Option<ErrorInfo>) {
+    let status = match result.status {
+        AgentRunStatus::Succeeded => RunStatus::Succeeded,
+        AgentRunStatus::Failed => RunStatus::Failed,
+        AgentRunStatus::Cancelled => RunStatus::Cancelled,
+    };
+    (status, result.error.as_ref().map(error_info))
+}
 
-    let reported = output
-        .as_object()
-        .and_then(|output| output.get("error"))
-        .and_then(Value::as_object);
-    let code = reported
-        .and_then(|error| error.get("code"))
-        .and_then(Value::as_str)
-        .unwrap_or("adapter_reported_failure")
-        .to_string();
-    let message = reported
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
-        .unwrap_or("adapter reported an invocation failure")
-        .to_string();
-    let retryable = reported
-        .and_then(|error| error.get("retryable"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let metadata = reported
-        .and_then(|error| error.get("metadata"))
-        .and_then(Value::as_object)
-        .map(|metadata| {
-            metadata
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    (
-        RunStatus::Failed,
-        Some(ErrorInfo {
-            stage: ErrorStage::Invoke,
-            code,
-            message,
-            retryable,
-            metadata,
-        }),
-    )
+fn error_info(error: &AgentRunError) -> ErrorInfo {
+    ErrorInfo {
+        stage: ErrorStage::Invoke,
+        code: error.code.clone(),
+        message: error.message.clone(),
+        retryable: error.retryable,
+        metadata: error.extensions.clone(),
+    }
+}
+
+fn run_usage(usage: &AgentUsage) -> RunUsage {
+    RunUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens: usage.total_tokens,
+        cost_usd: usage.cost_usd,
+        metadata: usage.extensions.clone(),
+    }
+}
+
+fn promote_agent_artifacts_to_manifest(
+    agent_artifacts: &[AgentArtifact],
+    manifest: &mut ArtifactManifest,
+) {
+    for artifact in agent_artifacts {
+        let path = resolve_relay_artifact_path(manifest, &artifact.path);
+        if manifest
+            .artifacts
+            .iter()
+            .any(|existing| existing.path == path)
+        {
+            continue;
+        }
+        let name = unique_artifact_name(manifest, &artifact.name);
+        manifest.artifacts.push(ArtifactRef {
+            name,
+            kind: artifact.kind.clone(),
+            path,
+            media_type: artifact.media_type.clone(),
+            metadata: artifact.extensions.clone(),
+        });
+    }
 }
 
 fn local_host_stop_event(
@@ -1625,14 +2081,16 @@ fn adapter_id(plan: &RunPlan) -> Option<String> {
     plan.adapter_descriptor
         .as_ref()
         .map(|adapter| adapter.descriptor.adapter_id.clone())
-        .or_else(|| Some(plan.config.harness.adapter_id.clone()))
+        .or_else(|| {
+            plan.config
+                .harness
+                .as_ref()
+                .map(|harness| harness.adapter_id.clone())
+        })
 }
 
 fn harness(plan: &RunPlan) -> String {
-    plan.adapter_descriptor
-        .as_ref()
-        .map(|adapter| adapter.descriptor.harness.clone())
-        .unwrap_or_else(|| "unknown".to_string())
+    adapter_id(plan).unwrap_or_else(|| "unknown".to_string())
 }
 
 fn adapter_kind(plan: &RunPlan) -> AdapterKind {
@@ -1678,17 +2136,24 @@ fn merged_adapter_settings(plan: &RunPlan) -> Map<String, Value> {
         .as_ref()
         .map(|adapter| adapter.descriptor.runner.clone())
         .unwrap_or_default();
-    settings.extend(plan.config.harness.settings.clone());
+    if let Some(harness) = &plan.config.harness {
+        settings.extend(harness.settings.clone());
+    }
     settings
 }
 
 fn adapter_setting_root<'a>(plan: &'a RunPlan, key: &str) -> &'a Path {
-    if plan.config.harness.settings.contains_key(key) {
+    if plan
+        .config
+        .harness
+        .as_ref()
+        .is_some_and(|harness| harness.settings.contains_key(key))
+    {
         return &plan.base_dir;
     }
     plan.adapter_descriptor
         .as_ref()
-        .map(|adapter| adapter.root.as_path())
+        .map(|adapter| adapter.primary().root.as_path())
         .unwrap_or(&plan.base_dir)
 }
 
@@ -1699,10 +2164,11 @@ fn adapter_lifecycle_start(
     artifacts: &ArtifactManifest,
     relay_config: Option<&RelayRuntimeConfig>,
 ) -> Result<AdapterLifecycleStart> {
+    let config = adapter_lifecycle_config(plan);
     Ok(AdapterLifecycleStart {
         agent_name: plan.agent_name.clone(),
         base_dir: absolute_path(plan.base_dir.clone())?,
-        config: plan.config.clone(),
+        config,
         runtime_context: adapter_runtime_context(
             plan,
             runtime,
@@ -1715,6 +2181,10 @@ fn adapter_lifecycle_start(
     })
 }
 
+fn adapter_lifecycle_config(plan: &RunPlan) -> AgentConfig {
+    plan.agent_config.clone()
+}
+
 fn adapter_invocation(
     plan: &RunPlan,
     runtime: &RuntimeHandle,
@@ -1723,6 +2193,8 @@ fn adapter_invocation(
     artifacts: &ArtifactManifest,
     relay_config: Option<&RelayRuntimeConfig>,
 ) -> Result<AdapterInvocation> {
+    let request = project_agent_run_request(request)?;
+    validate_agent_run_request_extensions(&request, plan.adapter_descriptor.as_ref())?;
     Ok(AdapterInvocation {
         runtime_context: adapter_runtime_context(
             plan,
@@ -1731,8 +2203,61 @@ fn adapter_invocation(
             artifacts,
             relay_config,
         ),
-        request: request.clone(),
+        request,
     })
+}
+
+fn project_agent_run_request(request: &RunRequest) -> Result<AgentRunRequest> {
+    let extensions = match &request.overrides {
+        Some(Value::Object(extensions)) => extensions
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        Some(_) => {
+            return Err(FabricError::InvalidConfig {
+                field: "request.overrides".to_string(),
+                reason: "must be an object".to_string(),
+            });
+        }
+        None => BTreeMap::new(),
+    };
+    Ok(AgentRunRequest {
+        input: request.input.clone(),
+        context: request.context.clone(),
+        extensions,
+    })
+}
+
+fn redact_adapter_invocation(invocation: &mut AdapterInvocation) {
+    redact_runtime_context_environment(&mut invocation.runtime_context);
+}
+
+fn redact_openai_stream_invocation(invocation: &mut OpenAiStreamInvocation) {
+    redact_runtime_context_environment(&mut invocation.runtime_context);
+    invocation.stream.token = "[REDACTED]".to_string();
+}
+
+fn redact_runtime_context_environment(context: &mut RuntimeContext) {
+    for value in context.environment.env.values_mut() {
+        *value = "[REDACTED]".to_string();
+    }
+}
+
+fn openai_stream_sink(
+    runtime: &RuntimeHandle,
+    invocation: &InvocationHandle,
+    transport: OpenAiStreamTransport,
+) -> OpenAiStreamSink {
+    OpenAiStreamSink {
+        protocol_version: OpenAiStreamProtocolVersion::V1Alpha1,
+        profile: OpenAiStreamProfile::ChatCompletionsChunkV1,
+        host: OpenAiStreamHost::Ipv4Loopback,
+        port: transport.port,
+        token: transport.token,
+        runtime_id: runtime.runtime_id.clone(),
+        invocation_id: invocation.invocation_id.clone(),
+        request_id: invocation.request_id.clone(),
+    }
 }
 
 fn adapter_runtime_context(
@@ -1776,6 +2301,9 @@ fn runtime_telemetry_context(
             "relay_output_dir".to_string(),
             Value::String(output_dir.to_string_lossy().into_owned()),
         );
+    }
+    if let Some(native_config) = &telemetry.native_config {
+        metadata.insert("native_config".to_string(), native_config.clone());
     }
     if !telemetry.adapter_outputs.is_empty() {
         metadata.insert(
@@ -1989,12 +2517,13 @@ fn promote_relay_artifacts_to_manifest(output: &Value, manifest: &mut ArtifactMa
             continue;
         }
 
-        let name = unique_relay_artifact_name(manifest, kind);
+        let name = unique_artifact_name(manifest, &format!("relay_{kind}"));
         manifest.artifacts.push(ArtifactRef {
             name,
             kind: kind.to_string(),
             path,
             media_type: relay_artifact_media_type(kind).map(str::to_string),
+            metadata: BTreeMap::new(),
         });
     }
 }
@@ -2018,14 +2547,13 @@ fn relay_artifact_media_type(kind: &str) -> Option<&'static str> {
     }
 }
 
-fn unique_relay_artifact_name(manifest: &ArtifactManifest, kind: &str) -> String {
-    let base = format!("relay_{kind}");
+fn unique_artifact_name(manifest: &ArtifactManifest, base: &str) -> String {
     if !manifest
         .artifacts
         .iter()
         .any(|artifact| artifact.name == base)
     {
-        return base;
+        return base.to_string();
     }
 
     let mut index = 2;
@@ -2127,6 +2655,7 @@ fn write_artifact(
         kind: kind.to_string(),
         path,
         media_type: Some(media_type.to_string()),
+        metadata: BTreeMap::new(),
     });
     Ok(())
 }
@@ -2411,9 +2940,11 @@ fn now_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Read;
+    use std::net::TcpListener;
 
     use super::*;
-    use crate::config::{ResolveContext, resolve_run_plan_from_config};
+    use crate::config::{ResolveContext, TelemetryProvider, resolve_run_plan_from_config};
 
     fn local_host_plan(mode: &str) -> (PathBuf, RunPlan) {
         local_host_plan_with_relay(mode, false)
@@ -2424,13 +2955,46 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("adapters/local-host")).expect("create adapters dir");
         fs::write(
-            root.join("adapters/local-host/fabric-adapter.json"),
+            root.join("adapters/local-host/local-host.fabric-adapter.json"),
             r#"{
-  "contract_version": "fabric.adapter/v1alpha1",
+  "contract_version": "fabric.adapter/v1alpha2",
   "adapter_id": "acme.fabric.local-host",
-  "harness": "local-host-test",
   "adapter_kind": "python",
   "runner": {"module": "fake_host"},
+  "settings_schema": {
+    "type": "object",
+    "properties": {
+      "python": {"type": "string"},
+      "cwd": {"type": "string"},
+      "env": {
+        "type": "object",
+        "additionalProperties": {"type": "string"}
+      }
+    },
+    "additionalProperties": false
+  },
+  "extension_schemas": {
+    "run_result": {
+      "type": "object",
+      "properties": {"trace_id": {"type": "string"}},
+      "additionalProperties": false
+    },
+    "run_error": {
+      "type": "object",
+      "properties": {"source": {"type": "string"}},
+      "additionalProperties": false
+    },
+    "usage": {
+      "type": "object",
+      "properties": {"provider": {"type": "string"}},
+      "additionalProperties": false
+    },
+    "artifact": {
+      "type": "object",
+      "properties": {"source": {"type": "string"}},
+      "additionalProperties": false
+    }
+  },
   "telemetry": {
     "providers": {
       "relay": {"outputs": ["atif"]}
@@ -2443,6 +3007,7 @@ mod tests {
             root.join("fake_host.py"),
             r#"import json
 import os
+import socket
 import sys
 import time
 
@@ -2468,6 +3033,52 @@ def failure(stage, code, message):
         "retryable": False,
     }
 
+def read_http_response(stream):
+    status = int(stream.readline().decode("ascii").split(" ", 2)[1])
+    while stream.readline() not in (b"\r\n", b"\n", b""):
+        pass
+    return status
+
+def write_openai_stream(sink, chunks):
+    with socket.create_connection((sink["host"], sink["port"]), timeout=2) as client:
+        request = (
+            "POST /openai-stream HTTP/1.1\r\n"
+            f"Host: {sink['host']}:{sink['port']}\r\n"
+            f"Authorization: Bearer {sink['token']}\r\n"
+            "Content-Type: application/x-ndjson\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "Expect: 100-continue\r\n"
+            "Connection: close\r\n\r\n"
+        )
+        client.sendall(request.encode("ascii"))
+        stream = client.makefile("rb")
+        if read_http_response(stream) != 100:
+            raise RuntimeError("stream listener rejected connection")
+        records = [
+            {
+                "type": "chunk",
+                "sequence": index,
+                "runtime_id": sink["runtime_id"],
+                "invocation_id": sink["invocation_id"],
+                "request_id": sink["request_id"],
+                "chunk": chunk,
+            }
+            for index, chunk in enumerate(chunks)
+        ]
+        records.append({
+            "type": "end",
+            "sequence": len(chunks),
+            "runtime_id": sink["runtime_id"],
+            "invocation_id": sink["invocation_id"],
+            "request_id": sink["request_id"],
+        })
+        for record in records:
+            encoded = json.dumps(record, separators=(",", ":")).encode() + b"\n"
+            client.sendall(f"{len(encoded):X}\r\n".encode() + encoded + b"\r\n")
+        client.sendall(b"0\r\n\r\n")
+        if read_http_response(stream) != 200:
+            raise RuntimeError("stream listener rejected records")
+
 for line in sys.stdin:
     message = json.loads(line)
     operation = message["operation"]
@@ -2482,7 +3093,7 @@ for line in sys.stdin:
             print("host crashed intentionally", file=sys.stderr, flush=True)
             time.sleep(1)
             sys.exit(17)
-    elif operation == "invoke":
+    elif operation in {"invoke", "invoke_openai_stream"}:
         invocations += 1
         if MODE == "invoke_stderr":
             print(f"diagnostic-{invocations}", file=sys.stderr, flush=True)
@@ -2493,11 +3104,33 @@ for line in sys.stdin:
             response("invoke", error=failure("invoke", "fake_invoke", "invoke rejected"))
             continue
         invocation = message["payload"]
-        if set(invocation) != {"runtime_context", "request"}:
-            response("invoke", error=failure(
+        expected_fields = (
+            {"runtime_context", "request", "stream"}
+            if operation == "invoke_openai_stream"
+            else {"runtime_context", "request"}
+        )
+        if set(invocation) != expected_fields:
+            response(operation, error=failure(
                 "invoke", "fake_invoke_shape", "invoke payload contains runtime config"
             ))
             continue
+        if operation == "invoke_openai_stream":
+            write_openai_stream(invocation["stream"], [
+                {
+                    "id": "chunk-1",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "test-model",
+                    "choices": [{"index": 0, "delta": {"content": "hel"}}],
+                },
+                {
+                    "id": "chunk-2",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "test-model",
+                    "choices": [{"index": 0, "delta": {"content": "lo"}}],
+                },
+            ])
         output = {
             "host_pid": os.getpid(),
             "invocation_count": invocations,
@@ -2508,16 +3141,39 @@ for line in sys.stdin:
             "normalized_env": os.environ.get("FABRIC_NORMALIZED_ENV"),
         }
         if MODE == "adapter_reported_failure":
-            output.update({
-                "failed": True,
+            result = {
+                "status": "failed",
+                "output": output,
                 "error": {
                     "code": "fake_adapter_failure",
                     "message": "adapter rejected the invocation",
                     "retryable": True,
-                    "metadata": {"source": "fake-host"},
+                    "extensions": {"source": "fake-host"},
                 },
-            })
-        response("invoke", output=output)
+            }
+        elif MODE == "typed_result":
+            result = {
+                "status": "succeeded",
+                "output": output,
+                "usage": {
+                    "input_tokens": 3,
+                    "output_tokens": 5,
+                    "total_tokens": 8,
+                    "cost_usd": 0.25,
+                    "extensions": {"provider": "fake"},
+                },
+                "artifacts": [{
+                    "name": "report",
+                    "kind": "report",
+                    "path": "reports/result.json",
+                    "media_type": "application/json",
+                    "extensions": {"source": "fake-host"},
+                }],
+                "extensions": {"trace_id": "trace-1"},
+            }
+        else:
+            result = {"status": "succeeded", "output": output}
+        response(operation, output=result)
     elif operation == "stop":
         if MODE == "stop_failure":
             response("stop", error=failure("stop", "fake_stop", "stop rejected"))
@@ -2540,6 +3196,7 @@ for line in sys.stdin:
                     "env": {"FABRIC_FAKE_HOST_MODE": mode},
                 },
             },
+            "discovery": {"local_paths": ["adapters"]},
             "runtime": {
                 "input_schema": "text",
                 "output_schema": "text",
@@ -2558,10 +3215,141 @@ for line in sys.stdin:
                 "observability": {"atif": {"enabled": true}},
             });
         }
-        let config: FabricConfig = serde_json::from_value(config_value).expect("typed config");
+        let config: crate::config::FabricConfig =
+            serde_json::from_value(config_value).expect("typed config");
         let plan = resolve_run_plan_from_config(config, ResolveContext::new(&root))
             .expect("resolve local-host plan");
         (root, plan)
+    }
+
+    fn openai_stream_listener(
+        token: &str,
+    ) -> (OpenAiStreamTransport, thread::JoinHandle<Vec<Value>>) {
+        let listener = TcpListener::bind((OPENAI_STREAM_HOST, 0)).expect("bind stream listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let expected_token = token.to_string();
+        let capture = thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("set stream listener nonblocking");
+            let accept_deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == ErrorKind::WouldBlock
+                            && Instant::now() < accept_deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        panic!("timed out waiting for stream connection")
+                    }
+                    Err(error) => panic!("accept stream connection: {error}"),
+                }
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("set accepted stream blocking");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set stream read timeout");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read HTTP header");
+                if line == "\r\n" {
+                    break;
+                }
+                headers.push(line);
+            }
+            assert_eq!(
+                headers.first().map(String::as_str),
+                Some("POST /openai-stream HTTP/1.1\r\n")
+            );
+            assert!(headers.iter().any(|header| {
+                header == &format!("Authorization: Bearer {expected_token}\r\n")
+            }));
+            stream
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .expect("accept stream request");
+            stream.flush().expect("flush continue response");
+
+            let mut records = Vec::new();
+            loop {
+                let mut size_line = String::new();
+                reader.read_line(&mut size_line).expect("read chunk size");
+                let size = usize::from_str_radix(size_line.trim(), 16).expect("hex chunk size");
+                if size == 0 {
+                    let mut terminator = String::new();
+                    reader
+                        .read_line(&mut terminator)
+                        .expect("read chunk terminator");
+                    assert_eq!(terminator, "\r\n");
+                    break;
+                }
+                let mut encoded = vec![0; size];
+                reader.read_exact(&mut encoded).expect("read chunk body");
+                let mut terminator = [0; 2];
+                reader
+                    .read_exact(&mut terminator)
+                    .expect("read chunk terminator");
+                assert_eq!(&terminator, b"\r\n");
+                records.push(
+                    serde_json::from_slice(encoded.strip_suffix(b"\n").unwrap_or(&encoded))
+                        .expect("parse stream record"),
+                );
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .expect("complete stream request");
+            stream.flush().expect("flush final response");
+            records
+        });
+        (
+            OpenAiStreamTransport {
+                port,
+                token: token.to_string(),
+            },
+            capture,
+        )
+    }
+
+    #[test]
+    fn adapter_lifecycle_always_receives_southbound_agent_config() {
+        let (root, plan) = local_host_plan("success");
+
+        let southbound = serde_json::to_value(adapter_lifecycle_config(&plan))
+            .expect("serialize southbound adapter config");
+        assert!(southbound.get("schema_version").is_none());
+        assert!(southbound.get("metadata").is_none());
+        assert_eq!(
+            southbound["harness"]["settings"]["python"],
+            serde_json::json!("python3")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_context_preserves_native_telemetry_config() {
+        let (root, mut plan) = local_host_plan("success");
+        let native_config = serde_json::json!({"components": [{"kind": "observability"}]});
+        plan.telemetry_plan = Some(TelemetryPlan {
+            providers: vec![TelemetryProvider::Native],
+            relay_enabled: false,
+            relay_project: None,
+            relay_output_dir: None,
+            relay_config: None,
+            native_config: Some(native_config.clone()),
+            adapter_outputs: Vec::new(),
+        });
+
+        let telemetry = runtime_telemetry_context(&plan, None).expect("telemetry context");
+
+        assert_eq!(telemetry.metadata["native_config"], native_config);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn stopped_agents() -> Vec<String> {
@@ -2626,6 +3414,164 @@ for line in sys.stdin:
         assert_eq!(second_stop[0].metadata["already_stopped"], true);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_host_openai_stream_uses_side_channel_and_separate_terminal_result() {
+        let (root, mut plan) = local_host_plan("success");
+        plan.capabilities.streaming = true;
+        plan.adapter_descriptor
+            .as_mut()
+            .expect("resolved descriptor")
+            .descriptor
+            .capabilities
+            .streaming = true;
+        let runtime = start_runtime(&plan).expect("start local host");
+        let (transport, capture) = openai_stream_listener("stream-secret");
+
+        let result = invoke_openai_stream(&plan, &runtime, RunRequest::text("stream"), transport)
+            .expect("stream invocation");
+        let records = capture.join().expect("stream capture");
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["type"], "chunk");
+        assert_eq!(records[0]["sequence"], 0);
+        assert_eq!(records[0]["chunk"]["id"], "chunk-1");
+        assert_eq!(records[1]["chunk"]["id"], "chunk-2");
+        assert_eq!(records[2]["type"], "end");
+        assert_eq!(records[2]["sequence"], 2);
+        for record in &records {
+            assert_eq!(record["runtime_id"], result.runtime_id);
+            assert_eq!(record["invocation_id"], result.invocation_id);
+            assert_eq!(record["request_id"], result.request_id);
+        }
+        assert_eq!(result.output["input"], "stream");
+        let persisted = fs::read_to_string(
+            result.metadata["fabric_invocation"]
+                .as_str()
+                .expect("invocation path"),
+        )
+        .expect("read persisted invocation");
+        assert!(!persisted.contains("stream-secret"));
+        let persisted: Value = serde_json::from_str(&persisted).expect("parse invocation");
+        assert_eq!(persisted["stream"]["token"], "[REDACTED]");
+        assert_eq!(
+            persisted["runtime_context"]["environment"]["env"]["FABRIC_NORMALIZED_ENV"],
+            "[REDACTED]"
+        );
+        assert_eq!(
+            persisted["stream"]["protocol_version"],
+            OPENAI_STREAM_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            persisted["stream"]["profile"],
+            OPENAI_CHAT_COMPLETIONS_CHUNK_PROFILE
+        );
+        assert_eq!(persisted["stream"]["runtime_id"], result.runtime_id);
+        assert_eq!(persisted["stream"]["invocation_id"], result.invocation_id);
+        assert_eq!(persisted["stream"]["request_id"], result.request_id);
+
+        stop_runtime(&plan, &runtime).expect("stop local host");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn openai_stream_rejects_missing_capability_before_execution() {
+        let (root, plan) = local_host_plan("success");
+        let runtime = start_runtime(&plan).expect("start local host");
+
+        let error = invoke_openai_stream(
+            &plan,
+            &runtime,
+            RunRequest::text("stream"),
+            OpenAiStreamTransport {
+                port: 1,
+                token: "unused".to_string(),
+            },
+        )
+        .expect_err("streaming capability must be required");
+
+        assert!(matches!(
+            error,
+            FabricError::UnsupportedRuntimeCapability {
+                capability: "streaming",
+                ..
+            }
+        ));
+        let ordinary = invoke_runtime(&plan, &runtime, RunRequest::text("ordinary"))
+            .expect("unsupported stream must not execute or poison runtime");
+        assert_eq!(ordinary.output["invocation_count"], 1);
+
+        stop_runtime(&plan, &runtime).expect("stop local host");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn openai_stream_rejects_stale_plan_capability_before_execution() {
+        let (root, mut plan) = local_host_plan("success");
+        plan.capabilities.streaming = true;
+        let runtime = start_runtime(&plan).expect("start local host");
+
+        let error = invoke_openai_stream(
+            &plan,
+            &runtime,
+            RunRequest::text("stream"),
+            OpenAiStreamTransport {
+                port: 1,
+                token: "unused".to_string(),
+            },
+        )
+        .expect_err("the resolved descriptor must also claim streaming");
+
+        assert!(matches!(
+            error,
+            FabricError::UnsupportedRuntimeCapability {
+                capability: "streaming",
+                ..
+            }
+        ));
+        let ordinary = invoke_runtime(&plan, &runtime, RunRequest::text("ordinary"))
+            .expect("unsupported stream must not execute or poison runtime");
+        assert_eq!(ordinary.output["invocation_count"], 1);
+
+        stop_runtime(&plan, &runtime).expect("stop local host");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn openai_stream_debug_output_redacts_the_bearer_token() {
+        let transport = OpenAiStreamTransport {
+            port: 1234,
+            token: "stream-secret".to_string(),
+        };
+        let sink = OpenAiStreamSink {
+            protocol_version: OpenAiStreamProtocolVersion::V1Alpha1,
+            profile: OpenAiStreamProfile::ChatCompletionsChunkV1,
+            host: OpenAiStreamHost::Ipv4Loopback,
+            port: transport.port,
+            token: transport.token.clone(),
+            runtime_id: "runtime-1".to_string(),
+            invocation_id: "invocation-1".to_string(),
+            request_id: "request-1".to_string(),
+        };
+
+        assert!(!format!("{transport:?}").contains("stream-secret"));
+        assert!(!format!("{sink:?}").contains("stream-secret"));
+    }
+
+    #[test]
+    fn openai_stream_transport_rejects_blank_or_header_unsafe_tokens() {
+        for token in ["", "   ", "safe\r\ninjected"] {
+            let error = validate_openai_stream_transport(&OpenAiStreamTransport {
+                port: 1234,
+                token: token.to_string(),
+            })
+            .expect_err("invalid token must be rejected");
+            assert!(matches!(
+                error,
+                FabricError::InvalidOpenAiStreamTransport { field: "token", .. }
+            ));
+        }
     }
 
     #[test]
@@ -2774,6 +3720,132 @@ for line in sys.stdin:
         ));
         stop_runtime(&plan, &runtime).expect("stop local host");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_host_revalidates_harness_settings_before_runtime_start() {
+        let (root, plan) = local_host_plan("success");
+        let mut invalid_plan = plan.clone();
+        invalid_plan
+            .config
+            .harness
+            .as_mut()
+            .expect("harness")
+            .settings
+            .insert("unknown".to_string(), Value::Bool(true));
+
+        let error =
+            start_runtime(&invalid_plan).expect_err("start must reject invalid harness settings");
+
+        assert!(matches!(
+            error,
+            FabricError::InvalidHarnessSettings {
+                adapter_id,
+                settings_path,
+                ..
+            } if adapter_id == "acme.fabric.local-host"
+                && settings_path == "harness.settings.unknown"
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_host_revalidates_southbound_config_before_runtime_start() {
+        for field in ["provider", "model"] {
+            let (root, plan) = local_host_plan("success");
+            let mut serialized = serde_json::to_value(plan).expect("serialize plan");
+            serialized["agent_config"]["models"]["primary"] = serde_json::json!({
+                "provider": "nvidia",
+                "model": "test-model"
+            });
+            serialized["agent_config"]["models"]["primary"][field] =
+                Value::String(" \t".to_string());
+            let plan: RunPlan = serde_json::from_value(serialized).expect("deserialize run plan");
+
+            let error = start_runtime(&plan).expect_err("start must reject blank agent config");
+            assert!(matches!(
+                error,
+                FabricError::InvalidConfig { field: actual, .. }
+                    if actual == format!("agent_config.models.primary.{field}")
+            ));
+            assert!(!root.join("artifacts").exists());
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn local_host_revalidates_workflow_before_runtime_start() {
+        let (root, mut plan) = local_host_plan("success");
+        plan.config.workflow = Some(
+            serde_json::from_value(serde_json::json!({
+                "target_id": "test.fabric.workflow",
+                "settings": {"llm_name": 7}
+            }))
+            .expect("typed workflow"),
+        );
+        let descriptor: crate::config::AdapterTargetDescriptor =
+            serde_json::from_value(serde_json::json!({
+                "contract_version": crate::ADAPTER_CONTRACT_VERSION,
+                "type": "workflow",
+                "id": "test.fabric.workflow",
+                "adapter_id": "acme.fabric.local-host",
+                "spec": {
+                    "entrypoint": {
+                        "kind": "workflow_registry",
+                        "ref": "test_agent"
+                    },
+                    "settings_schema": {
+                        "type": "object",
+                        "properties": {"llm_name": {"type": "string"}}
+                    }
+                }
+            }))
+            .expect("target descriptor");
+        plan.adapter_target_descriptor = Some(crate::config::ResolvedAdapterTargetDescriptor {
+            provenance: vec![crate::config::DescriptorProvenance {
+                source: crate::config::DescriptorSource::ExplicitLocal,
+                path: root.join("workflow.fabric-target.json"),
+                root: root.clone(),
+            }],
+            descriptor,
+        });
+
+        let error = start_runtime(&plan).expect_err("start must reject invalid workflow");
+        assert!(matches!(
+            error,
+            FabricError::InvalidWorkflow { workflow_path, .. }
+                if workflow_path == "workflow.settings.llm_name"
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_host_revalidates_projected_workflow_entrypoint_before_runtime_start() {
+        for (field, value) in [
+            ("agent_config.workflow.entrypoint.kind", " "),
+            ("agent_config.workflow.entrypoint.ref", "\t"),
+        ] {
+            let (root, plan) = local_host_plan("start_failure");
+            let mut serialized = serde_json::to_value(plan).expect("serialize plan");
+            serialized["agent_config"]["workflow"] = serde_json::json!({
+                "entrypoint": {
+                    "kind": "workflow_registry",
+                    "ref": "test_agent"
+                }
+            });
+            serialized["agent_config"]["workflow"]["entrypoint"][field
+                .strip_prefix("agent_config.workflow.entrypoint.")
+                .expect("entrypoint field")] = Value::String(value.to_string());
+            let plan: RunPlan = serde_json::from_value(serialized).expect("deserialize plan");
+
+            let error = start_runtime(&plan).expect_err("start must reject blank entrypoint");
+            assert!(matches!(
+                error,
+                FabricError::InvalidConfig { field: actual, .. } if actual == field
+            ));
+            assert!(!root.join("artifacts").exists());
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -2931,7 +4003,7 @@ for line in sys.stdin:
         let result = run_plan(&plan, RunRequest::text("fail")).expect("normalized result");
 
         assert_eq!(result.status, RunStatus::Failed);
-        assert_eq!(result.output["failed"], true);
+        assert_eq!(result.output["input"], "fail");
         assert_eq!(
             result.error,
             Some(ErrorInfo {
@@ -2944,6 +4016,129 @@ for line in sys.stdin:
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_host_enriches_typed_usage_artifacts_and_extensions() {
+        let (root, plan) = local_host_plan("typed_result");
+
+        let result = run_plan(&plan, RunRequest::text("enrich")).expect("normalized result");
+
+        assert_eq!(result.status, RunStatus::Succeeded);
+        assert_eq!(
+            result.usage,
+            Some(RunUsage {
+                input_tokens: Some(3),
+                output_tokens: Some(5),
+                total_tokens: Some(8),
+                cost_usd: Some(0.25),
+                metadata: BTreeMap::from([("provider".to_string(), serde_json::json!("fake"),)]),
+            })
+        );
+        let artifact = result
+            .artifacts
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.name == "report")
+            .expect("adapter artifact");
+        assert!(artifact.path.ends_with("reports/result.json"));
+        assert_eq!(
+            artifact.metadata,
+            BTreeMap::from([("source".to_string(), serde_json::json!("fake-host"))])
+        );
+        assert_eq!(
+            result.metadata.get("adapter"),
+            Some(&serde_json::json!({"trace_id": "trace-1"}))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_host_rejects_typed_artifacts_without_runtime_root() {
+        let (root, mut plan) = local_host_plan("typed_result");
+        plan.config.runtime.artifacts = None;
+        plan.environment_plan
+            .as_mut()
+            .expect("resolved environment plan")
+            .artifacts = None;
+        let runtime = start_runtime(&plan).expect("start local host");
+
+        let error = invoke_runtime(&plan, &runtime, RunRequest::text("enrich"))
+            .expect_err("adapter artifacts require a runtime artifact root");
+
+        assert!(matches!(
+            &error,
+            FabricError::AdapterLifecycleOperation { code, message, .. }
+                if code == "invalid_agent_run_result"
+                    && message.contains("configured runtime artifact root")
+        ));
+        stop_runtime(&plan, &runtime).expect("stop local host");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn promoted_agent_artifact_names_do_not_shadow_existing_artifacts() {
+        let root = PathBuf::from("artifacts");
+        let mut manifest = ArtifactManifest {
+            root: Some(root.clone()),
+            artifacts: vec![ArtifactRef {
+                name: "stdout".to_string(),
+                kind: "log".to_string(),
+                path: root.join("stdout.txt"),
+                media_type: Some("text/plain".to_string()),
+                metadata: BTreeMap::new(),
+            }],
+        };
+        let agent_artifacts = vec![AgentArtifact {
+            name: "stdout".to_string(),
+            kind: "report".to_string(),
+            path: PathBuf::from("reports/result.json"),
+            media_type: Some("application/json".to_string()),
+            extensions: BTreeMap::new(),
+        }];
+
+        promote_agent_artifacts_to_manifest(&agent_artifacts, &mut manifest);
+
+        assert_eq!(manifest.artifacts.len(), 2);
+        assert_eq!(manifest.artifacts[1].name, "stdout_2");
+        assert_eq!(manifest.artifacts[1].path, root.join("reports/result.json"));
+    }
+
+    #[test]
+    fn agent_run_request_projection_keeps_only_southbound_fields() {
+        let request = RunRequest {
+            request_id: "request-1".to_string(),
+            input: serde_json::json!({"task": "review"}),
+            context: BTreeMap::from([("rollout".to_string(), serde_json::json!(2))]),
+            overrides: Some(serde_json::json!({"acme": {"mode": "strict"}})),
+        };
+
+        let projected = project_agent_run_request(&request).expect("project request");
+
+        assert_eq!(projected.input, serde_json::json!({"task": "review"}));
+        assert_eq!(projected.context, request.context);
+        assert_eq!(
+            projected.extensions,
+            BTreeMap::from([("acme".to_string(), serde_json::json!({"mode": "strict"}))])
+        );
+        assert!(
+            !serde_json::to_value(projected)
+                .expect("serialize request")
+                .as_object()
+                .expect("request object")
+                .contains_key("request_id")
+        );
+    }
+
+    #[test]
+    fn agent_run_request_projection_rejects_non_object_overrides() {
+        let mut request = RunRequest::text("review");
+        request.overrides = Some(serde_json::json!(["invalid"]));
+
+        let error = project_agent_run_request(&request).expect_err("invalid overrides");
+
+        assert!(error.to_string().contains("request.overrides"), "{error}");
     }
 
     #[test]
@@ -3003,6 +4198,23 @@ for line in sys.stdin:
         assert!(error.to_string().contains("fake_stop"), "{error}");
         let retry = stop_runtime(&plan, &runtime).expect("cleanup retry is idempotent");
         assert_eq!(retry[0].metadata["already_stopped"], true);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_plan_preserves_completed_result_when_stop_fails() {
+        let (root, plan) = local_host_plan("stop_failure");
+
+        let result = run_plan(&plan, RunRequest::text("completed"))
+            .expect("completed result with stop failure");
+
+        assert_eq!(result.status, RunStatus::Failed);
+        assert_eq!(result.output["input"], "completed");
+        let error = result.error.expect("stop error");
+        assert_eq!(error.stage, ErrorStage::Stop);
+        assert_eq!(error.code, "runtime_stop_failed");
+        assert!(error.message.contains("fake_stop"), "{}", error.message);
 
         let _ = fs::remove_dir_all(root);
     }

@@ -8,9 +8,84 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
+
+
+_FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+
+
+def validate_http_header(server_name: str, name: str, value: str) -> None:
+    """Validate one HTTP header name and value."""
+
+    if not isinstance(name, str) or not _FIELD_NAME.fullmatch(name):
+        raise ValueError(
+            f"Invalid HTTP header name {name!r} for MCP server {server_name!r}"
+        )
+
+    if not isinstance(value, str):
+        raise TypeError(
+            f"HTTP header value for {name!r} on MCP server {server_name!r} "
+            "must be a string"
+        )
+
+    if not value or not value.strip():
+        raise ValueError(
+            f"HTTP header value for {name!r} on MCP server {server_name!r} "
+            "must not be blank"
+        )
+
+    try:
+        encoded = value.encode("latin-1")
+    except UnicodeEncodeError as error:
+        raise ValueError(
+            f"HTTP header value for {name!r} on MCP server {server_name!r} "
+            "is not Latin-1 encodable"
+        ) from error
+
+    if value[:1] in (" ", "\t") or value[-1:] in (" ", "\t"):
+        raise ValueError(
+            f"HTTP header value for {name!r} on MCP server {server_name!r} "
+            "has outer whitespace"
+        )
+
+    if any((byte < 0x20 and byte != 0x09) or byte == 0x7F for byte in encoded):
+        raise ValueError(
+            f"HTTP header value for {name!r} on MCP server {server_name!r} "
+            "contains a control character"
+        )
+
+
+def validate_http_headers(server_name: str, value: dict[str, str]) -> None:
+    """
+    Validate an MCP custom-header mapping.
+
+    Use this method for harnesses that support environment variable expansion
+    in HTTP headers. For harnesses that don't support environment variable
+    expansion, use expand_http_headers instead.
+    """
+
+    for name, item in value.items():
+        validate_http_header(server_name, name, item)
+
+
+def expand_http_headers(server_name: str, value: dict[str, str]) -> dict[str, str]:
+    """
+    Expand environment variables and validate an MCP custom-header mapping.
+
+    Use this method instead of validate_http_headers for harnesses that don't
+    support environment variable expansion in HTTP headers.
+    """
+
+    expanded: dict[str, str] = {}
+    for name, item in value.items():
+        item = os.path.expandvars(item)
+        validate_http_header(server_name, name, item)
+        expanded[name] = item
+
+    return expanded
 
 
 def current_virtualenv() -> Path | None:
@@ -39,10 +114,6 @@ def virtualenv_subprocess_env() -> dict[str, str]:
     env["PATH"] = os.pathsep.join(part for part in (str(scripts), path) if part)
     env.pop("PYTHONHOME", None)
     return env
-
-
-def request_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    return payload.get("request") or {}
 
 
 def fabric_config(payload: dict[str, Any]) -> dict[str, Any]:
@@ -82,12 +153,6 @@ def runtime_id(payload: dict[str, Any]) -> str:
     if not value:
         raise ValueError("runtime_context.runtime_id is required")
     return str(value)
-
-
-def runtime_state_directory(base: str | Path, payload: dict[str, Any]) -> Path:
-    """Return a harness-owned state directory isolated to one NeMo Fabric runtime."""
-
-    return Path(base).joinpath("runtimes", runtime_id(payload))
 
 
 def environment_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -180,6 +245,97 @@ def native_telemetry_config(payload: dict[str, Any]) -> dict[str, Any]:
     return config if isinstance(config, dict) else {}
 
 
+def ambient_relay_plugin_config_paths() -> list[Path]:
+    """Return ambient user or project Relay plugin configs visible to Python."""
+
+    user_directory: Path | None = None
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_config_home and Path(xdg_config_home).is_absolute():
+        user_directory = Path(xdg_config_home) / "nemo-relay"
+    else:
+        home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        if home is not None:
+            user_directory = Path(home) / ".config" / "nemo-relay"
+
+    candidates: list[Path] = []
+    if user_directory is not None:
+        candidates.append(user_directory / "plugins.toml")
+    try:
+        cwd = Path.cwd()
+    except OSError:
+        cwd = None
+    if cwd is not None:
+        project_config = next(
+            (
+                ancestor / ".nemo-relay" / "plugins.toml"
+                for ancestor in (cwd, *cwd.parents)
+                if (ancestor / ".nemo-relay" / "plugins.toml").exists()
+            ),
+            None,
+        )
+        if project_config is not None:
+            candidates.append(project_config)
+
+    visible: list[Path] = []
+    for candidate in candidates:
+        if candidate.exists() and candidate not in visible:
+            visible.append(candidate)
+    return visible
+
+
+def reject_ambient_relay_plugin_config() -> None:
+    """Fail before Relay's Python API can merge unmanaged plugin config."""
+
+    paths = ambient_relay_plugin_config_paths()
+    if not paths:
+        return
+    joined = ", ".join(str(path) for path in paths)
+    raise RuntimeError(
+        "NeMo Fabric cannot isolate Relay's Python plugin runtime from ambient "
+        f"user or project configuration: {joined}. Move or remove these files "
+        "before starting this Relay-enabled runtime."
+    )
+
+
+def reject_inherited_relay_plugin_config(report: Any) -> None:
+    """Reject discovered user or project config while allowing system policy."""
+
+    if not isinstance(report, dict):
+        raise RuntimeError("NeMo Relay did not return a plugin activation report")
+    diagnostics = report.get("diagnostics")
+    if not isinstance(diagnostics, list):
+        raise RuntimeError("NeMo Relay returned an invalid plugin activation report")
+    inherited = []
+    # Relay 0.7.2 exposes the source only in this message. Keep the system-policy
+    # allowlist exact and fail closed until Relay provides a structured source path.
+    message_prefix = "inherited plugin configuration from discovered file: "
+    system_config = Path("/etc/nemo-relay/plugins.toml")
+    for diagnostic in diagnostics:
+        if (
+            not isinstance(diagnostic, dict)
+            or diagnostic.get("code") != "plugin.configuration_inherited"
+        ):
+            continue
+        message = diagnostic.get("message")
+        if (
+            isinstance(message, str)
+            and message.startswith(message_prefix)
+            and Path(message.removeprefix(message_prefix)) == system_config
+        ):
+            continue
+        inherited.append(diagnostic)
+    if not inherited:
+        return
+    details = "; ".join(
+        str(diagnostic.get("message") or "inherited plugin configuration")
+        for diagnostic in inherited
+    )
+    raise RuntimeError(
+        "NeMo Fabric refuses Relay plugin configuration inherited from ambient "
+        f"user or project files: {details}"
+    )
+
+
 def capability_plan(payload: dict[str, Any]) -> dict[str, Any]:
     return payload.get("capability_plan") or payload.get("capabilities") or {}
 
@@ -219,8 +375,10 @@ def merge_unique(*values: Any) -> list[str]:
                 merged.append(item)
     return merged
 
+
 def without_none(mapping: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in mapping.items() if value is not None}
+
 
 def dump_yaml(value: dict[str, Any]) -> str:
     try:
@@ -229,6 +387,97 @@ def dump_yaml(value: dict[str, Any]) -> str:
         return yaml.safe_dump(value, sort_keys=False)
     except ImportError:
         return json.dumps(value, indent=2, sort_keys=False) + "\n"
+
+
+def validate_relay_observability_v3(plugin_config: dict[str, Any]) -> None:
+    """Validate Fabric's Relay observability schema boundary without mutation."""
+
+    endpoint_types = {"full", "gen_ai", "openinference"}
+    legacy_flat_otel_fields = {
+        "attribute_mappings",
+        "capture_content",
+        "endpoint",
+        "header_env",
+        "headers",
+        "instrumentation_scope",
+        "mark_exclude_names",
+        "mark_projection",
+        "resource_attributes",
+        "semantic_selector",
+        "service_name",
+        "service_namespace",
+        "service_version",
+        "timeout_millis",
+        "transport",
+    }
+    for component in plugin_config.get("components") or []:
+        if not isinstance(component, dict) or component.get("kind") != "observability":
+            continue
+        config = component.get("config")
+        if not isinstance(config, dict):
+            raise ValueError(
+                "NeMo Relay observability component config must be an object"
+            )
+        if "version" in config:
+            version = config["version"]
+            if (
+                isinstance(version, bool)
+                or not isinstance(version, int)
+                or version != 3
+            ):
+                raise ValueError(
+                    "unsupported NeMo Relay observability config version "
+                    f"{version!r}; expected version 3"
+                )
+        if "openinference" in config:
+            raise ValueError(
+                "NeMo Relay observability config version 3 removed the standalone "
+                "openinference section; use an opentelemetry endpoint with type "
+                "'openinference'"
+            )
+        if "opentelemetry" not in config:
+            continue
+        opentelemetry = config["opentelemetry"]
+        if not isinstance(opentelemetry, dict):
+            raise ValueError("NeMo Relay opentelemetry config must be an object")
+        legacy_fields = sorted(legacy_flat_otel_fields.intersection(opentelemetry))
+        if legacy_fields:
+            raise ValueError(
+                "NeMo Relay observability config version 3 requires exporter "
+                "fields inside opentelemetry.endpoints: " + ", ".join(legacy_fields)
+            )
+        enabled = opentelemetry.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise ValueError("NeMo Relay opentelemetry.enabled must be a boolean")
+        endpoints = opentelemetry.get("endpoints")
+        if "endpoints" in opentelemetry and not isinstance(endpoints, list):
+            raise ValueError("NeMo Relay opentelemetry.endpoints must be a list")
+        if enabled and not endpoints:
+            raise ValueError(
+                "enabled NeMo Relay OpenTelemetry requires at least one endpoint"
+            )
+        for index, endpoint in enumerate(endpoints or []):
+            if not isinstance(endpoint, dict):
+                raise ValueError(
+                    "NeMo Relay OpenTelemetry endpoint must be an object for "
+                    f"opentelemetry.endpoints[{index}]"
+                )
+            endpoint_type = endpoint.get("type")
+            if (
+                not isinstance(endpoint_type, str)
+                or endpoint_type not in endpoint_types
+            ):
+                raise ValueError(
+                    "NeMo Relay OpenTelemetry endpoint type must be one of "
+                    "'full', 'gen_ai', or 'openinference' for "
+                    f"opentelemetry.endpoints[{index}].type"
+                )
+            value = endpoint.get("endpoint")
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    "NeMo Relay OpenTelemetry endpoint must be a non-empty "
+                    f"string for opentelemetry.endpoints[{index}]"
+                )
 
 
 def load_relay_plugin_config(payload: dict[str, Any]) -> dict[str, Any]:
@@ -242,16 +491,18 @@ def load_relay_plugin_config(payload: dict[str, Any]) -> dict[str, Any]:
     relay = wrapper.get("relay", {})
     plugin_config = relay.get("config") or {}
     if "components" not in plugin_config:
-        plugin_config = {
-            "version": 1,
-            "components": [
+        components = (
+            [
                 {
                     "kind": "observability",
                     "enabled": True,
-                    "config": plugin_config or {"version": 2},
+                    "config": plugin_config,
                 }
-            ],
-        }
+            ]
+            if plugin_config
+            else []
+        )
+        plugin_config = {"version": 1, "components": components}
     plugin_config.setdefault("version", 1)
     plugin_config.setdefault("components", [])
     normalize_relay_output_dirs(plugin_config, payload)
@@ -261,13 +512,14 @@ def load_relay_plugin_config(payload: dict[str, Any]) -> dict[str, Any]:
 def normalize_relay_output_dirs(
     plugin_config: dict[str, Any], payload: dict[str, Any]
 ) -> None:
+    validate_relay_observability_v3(plugin_config)
+
     base = Path(base_dir(payload)).resolve()
     runtime_id = runtime_context(payload)["runtime_id"]
     for component in plugin_config.get("components", []):
-        if component.get("kind") != "observability":
+        if not isinstance(component, dict) or component.get("kind") != "observability":
             continue
-        config = component.setdefault("config", {})
-        config.setdefault("version", 2)
+        config = component["config"]
 
         atof = config.get("atof")
         if isinstance(atof, dict) and atof.get("enabled"):
@@ -341,7 +593,6 @@ def _artifact_glob(directory: Path, pattern: str) -> list[Path]:
 
 
 def collect_relay_artifacts(plugin_config: dict[str, Any]) -> list[dict[str, str]]:
-
     artifacts: list[dict[str, str]] = []
     for component in plugin_config.get("components", []):
         if component.get("kind") != "observability":
@@ -387,7 +638,6 @@ def write_relay_configs(
     *,
     relay_config: dict[str, Any] | None = None,
     plugin_config: dict[str, Any] | None = None,
-    observability_version: int = 2,
 ) -> tuple[Path | None, Path | None]:
     try:
         import tomli_w
@@ -400,6 +650,8 @@ def write_relay_configs(
 
         config_path = Path(config_path)
         config_dir = config_path.parent / "relay-config"
+        if plugin_config is not None:
+            validate_relay_observability_v3(plugin_config)
         config_dir.mkdir(parents=True, exist_ok=True)
         relay_config_path = None
         plugin_config_path = None
@@ -409,10 +661,6 @@ def write_relay_configs(
             relay_config_path.write_text(tomli_w.dumps(relay_config), encoding="utf-8")
 
         if plugin_config is not None:
-            if observability_version != 2:
-                raise ValueError(
-                    f"unsupported NeMo Relay observability config version {observability_version}"
-                )
             plugin_config_path = config_dir / "plugins.toml"
             plugin_config_path.write_text(
                 tomli_w.dumps(plugin_config),

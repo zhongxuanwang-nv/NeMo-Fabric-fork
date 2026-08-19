@@ -153,16 +153,17 @@ fn write_files(destination: &Path, files: &[ScaffoldFile]) -> Result<(), String>
 }
 
 fn render_python(config: &FabricConfig) -> String {
+    let harness = config.harness.as_ref().expect("scaffold preset harness");
     PYTHON_MAIN
         .replace("{{AGENT_NAME}}", &python_string(&config.metadata.name))
         .replace(
             "{{DESCRIPTION}}",
             &python_string(config.metadata.description.as_deref().unwrap_or("")),
         )
-        .replace("{{ADAPTER_ID}}", &python_string(&config.harness.adapter_id))
+        .replace("{{ADAPTER_ID}}", &python_string(&harness.adapter_id))
         .replace(
             "{{HARNESS_SETTINGS}}",
-            &python_value(&Value::Object(config.harness.settings.clone())),
+            &python_value(&Value::Object(harness.settings.clone())),
         )
         .replace(
             "{{INSTRUCTIONS}}",
@@ -269,16 +270,17 @@ fn python_string(value: &str) -> String {
 }
 
 fn render_rust(config: &FabricConfig) -> String {
+    let harness = config.harness.as_ref().expect("scaffold preset harness");
     RUST_MAIN
         .replace("{{AGENT_NAME}}", &rust_string(&config.metadata.name))
         .replace(
             "{{DESCRIPTION}}",
             &rust_string(config.metadata.description.as_deref().unwrap_or("")),
         )
-        .replace("{{ADAPTER_ID}}", &rust_string(&config.harness.adapter_id))
+        .replace("{{ADAPTER_ID}}", &rust_string(&harness.adapter_id))
         .replace(
             "{{HARNESS_SETTINGS}}",
-            &rust_settings(&config.harness.settings),
+            &rust_settings(&harness.settings),
         )
         .replace(
             "{{INSTRUCTIONS}}",
@@ -418,7 +420,7 @@ mod tests {
             assert!(destination.join("skills/code-review.md").is_file());
             assert!(
                 destination
-                    .join("adapters/hermes/fabric-adapter.json")
+                    .join("adapters/hermes/hermes.fabric-adapter.json")
                     .is_file()
             );
             assert_eq!(
@@ -431,7 +433,7 @@ mod tests {
             };
             let source = fs::read_to_string(launcher).expect("read launcher");
             assert!(source.contains("nvidia.fabric.hermes"));
-            assert!(source.contains("nvidia/nemotron-3-nano-30b-a3b"));
+            assert!(source.contains("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"));
             assert!(source.contains("https://integrate.api.nvidia.com/v1"));
             if language == Language::Rust {
                 let manifest =

@@ -3,10 +3,25 @@ SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Contributing to NeMo Fabric
+# Contributing to NVIDIA NeMo Fabric
 
 Thank you for your interest in contributing to NeMo Fabric. This guide covers
 the development workflow, coding standards, and pull request process.
+
+## Contribution Access
+
+Anyone with a GitHub account may create or comment on an issue in this public
+repository. Pull request creation is limited to approved users in the
+`NeMo-Fabric-developers` group. General changes require CODEOWNER approval from
+`NeMo-Fabric-reviewers`, a subset of the developer group. Documentation and
+dependency changes use their specialized approver groups.
+
+For non-security contributions, external contributors should open an issue with
+a reproducer, proposed design, or patch description. A NeMo Fabric maintainer
+can adopt the work into a pull request when appropriate. Do not report security
+vulnerabilities through a public issue or pull request; follow the [security
+policy](SECURITY.md). Public issue and pull request comments remain welcome and
+do not require developer access.
 
 ## Development Setup
 
@@ -19,11 +34,12 @@ Install these tools before you start:
 
 - **Rust** (stable toolchain) -- install with [rustup](https://rustup.rs/)
 - **Python** >= 3.11
+- **Node.js** >= 20.18.3 with npm
 - **uv** -- follow the [uv installation guide](https://docs.astral.sh/uv/getting-started/installation/)
 - **just** >= 1.50.0 -- `cargo install just --locked`
 
-Clone the repository, create a virtual environment, and build the Rust and
-Python packages:
+Clone the repository, create a virtual environment, and build the Rust,
+Python, and TypeScript packages:
 
 ```bash
 git clone https://github.com/NVIDIA/NeMo-Fabric.git
@@ -31,6 +47,7 @@ cd NeMo-Fabric
 
 uv venv --seed .venv --python 3.13
 source .venv/bin/activate
+just install-hermes-agent
 uv sync --all-groups --all-extras
 just no_uv=true build-all
 ```
@@ -51,15 +68,21 @@ The resulting wheel files are placed in the `dist/` directory. Install the
 packages into a virtual environment with:
 
 ```bash
-uv pip install --find-links ./dist "nemo-fabric[runtime]"
+uv pip install --find-links ./dist nemo-fabric
 ```
 
-Adapters are distributed as optional extras. For example, install the Hermes
-Agent adapter with:
+Hermes Agent 0.20 and later is not installable from PyPI. For local development,
+check out the pinned Hermes source and synchronize it into the project
+environment with:
 
 ```bash
-uv pip install --find-links ./dist "nemo-fabric[hermes]"
+just install-hermes-agent
 ```
+
+The recipe checks out Hermes Agent under `external/hermes-agent` and installs
+it as the editable source declared in `pyproject.toml`. End users should follow
+the [Hermes Agent installation guide](https://hermes-agent.nousresearch.com/docs/installation)
+and install `nemo-fabric-adapters-hermes` without a harness extra.
 
 Refer to the [installation guide](docs/getting-started/install.mdx) for the
 complete list of adapters and installation options.
@@ -68,15 +91,11 @@ complete list of adapters and installation options.
 
 ## Release Tagging
 
-Versioned release tags must use raw Rust-compatible SemVer without a leading
-`v`.
+Release tags use SemVer with a leading `v`.
 
-- Use `0.1.0` for stable releases.
-- Use `0.1.0-rc.1` for prereleases.
-- Do not create tags such as `v0.1.0` or `v0.1.0-rc.1`.
-
-This keeps release tags aligned with Cargo package versions and lets the release
-tooling translate the version consistently for Python packages.
+- Use `v0.1.0` for stable releases.
+- Use `v0.1.0-rc.1` for prereleases.
+- Do not use tags such as `0.1.0` or `0.1.0-rc.1`.
 
 ## Code Style
 
@@ -98,17 +117,25 @@ Follow the existing style in the Python SDK, adapters, examples, and tests.
 Use type annotations for public APIs and keep native binding declarations in
 sync with their Rust implementations.
 
+### TypeScript
+
+Use strict TypeScript for the adapter-contract binding. Preserve the JSON wire
+property names, run the checked-in generator instead of editing generated
+declarations, and keep production dependencies out of the contract package.
+
 ### General
 
-Use the naming conventions appropriate to each language: Rust and Python use
-`snake_case` for functions and variables, Rust types use `PascalCase`, and
-Python classes use `PascalCase`.
+Use the naming conventions appropriate to each language. Rust and Python use
+`snake_case` for functions and variables. Rust, Python, and TypeScript types use
+`PascalCase`. TypeScript contract properties preserve the wire `snake_case`
+names.
 
 ## Testing
 
 **Run tests for every language surface affected by your changes.** If a change
-touches the Rust core or public schemas, run both the Rust and Python suites
-because the Python SDK and adapters depend on the native core contract.
+touches the Rust core or public adapter-contract schemas, run the Rust, Python,
+and TypeScript suites because both language bindings depend on the generated
+wire contract.
 
 Run the affected test targets through the repository `justfile`:
 
@@ -119,7 +146,10 @@ just test-rust
 # Python SDK, adapters, integrations, and examples
 just test-python
 
-# Both suites
+# TypeScript adapter contract
+just test-typescript
+
+# All supported language surfaces
 just test-all
 ```
 
@@ -132,8 +162,9 @@ just no_uv=true test-all
 ```
 
 When adding functionality, include tests in the corresponding Rust crate or in
-the relevant area under `tests/`. Public contract changes must keep the checked-in
-JSON Schema snapshots and native Python binding declarations synchronized.
+the relevant area under `tests/`. Public contract changes must keep the
+checked-in JSON Schema snapshots, Python representations, and generated
+TypeScript declarations synchronized.
 
 ## Documentation Checklist
 

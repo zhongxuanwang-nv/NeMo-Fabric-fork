@@ -5,16 +5,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import inspect
 import json
 import os
 import sys
+import threading
+import tomllib
+from io import StringIO
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from unittest.mock import MagicMock
 
 import pytest
+from nemo_fabric_adapter_contract.models import AgentConfig
+from nemo_fabric_adapter_contract.models import AgentMcpServerConfig
+from nemo_fabric_adapter_contract.models import AgentRunRequest
+from nemo_fabric_adapter_contract.models import AgentRunStatus
+from nemo_fabric_adapter_contract.models import RuntimeContext
 
 pytestmark = pytest.mark.usefixtures("requires_hermes_agent")
 
@@ -25,160 +34,398 @@ if importlib.util.find_spec("run_agent") is not None:
     import nemo_fabric_adapters.common.utils as common_utils
 
     from nemo_fabric_adapters.hermes import adapter
+    from nemo_fabric_adapters.hermes import configuration
+    from nemo_fabric_adapters.hermes import telemetry
 
 
-@pytest.mark.parametrize("providers", [None, {"relay": {}}])
-def test_validate_hermes_telemetry_provider_accepts_relay(
-    providers: dict[str, object] | None,
-):
-    payload = {}
+def _agent_config(value: dict[str, object]) -> AgentConfig:
+    return AgentConfig.from_mapping(value)
+
+
+def _invocation(
+    payload: dict[str, object],
+) -> tuple[AgentRunRequest, RuntimeContext]:
+    request_mapping = payload["request"]
+    assert isinstance(request_mapping, dict)
+    request = {
+        key: value for key, value in request_mapping.items() if key != "request_id"
+    }
+    context = payload["runtime_context"]
+    if not isinstance(context, RuntimeContext):
+        assert isinstance(context, dict)
+        context = RuntimeContext.from_mapping(context)
+    return AgentRunRequest.from_mapping(request), context
+
+
+def _runtime_context(
+    *,
+    runtime_id: str = "runtime-1",
+    workspace: str | None = None,
+    artifact_root: str | None = None,
+    providers: list[str] | None = None,
+) -> RuntimeContext:
+    environment: dict[str, object] = {
+        "environment_id": "environment-1",
+        "provider": "test",
+        "control_location": "in_env_control",
+        "ownership": "caller_owned",
+    }
+    if workspace is not None:
+        environment["workspace"] = workspace
+    telemetry = None
     if providers is not None:
-        payload["telemetry_plan"] = {"providers": list(providers)}
+        telemetry = {
+            "relay_enabled": providers == ["relay"],
+            "metadata": {"telemetry_providers": providers},
+        }
+    return RuntimeContext.from_mapping(
+        {
+            "runtime_id": runtime_id,
+            "invocation_id": "invocation-1",
+            "request_id": "request-1",
+            "environment": environment,
+            "artifacts": {"root": artifact_root} if artifact_root else {},
+            "telemetry": telemetry,
+        }
+    )
 
-    adapter.validate_hermes_telemetry_provider(payload)
+
+@pytest.mark.parametrize("providers", [None, ["relay"]])
+def test_validate_hermes_telemetry_provider_accepts_relay(
+    providers: list[str] | None,
+):
+    telemetry.validate_hermes_telemetry_provider(_runtime_context(providers=providers))
 
 
 def test_validate_hermes_telemetry_provider_rejects_native():
-    payload = {"telemetry_plan": {"providers": ["native"], "relay_enabled": False}}
-
     with pytest.raises(
         ValueError, match="only relay telemetry is supported for Hermes"
     ):
-        adapter.validate_hermes_telemetry_provider(payload)
+        telemetry.validate_hermes_telemetry_provider(
+            _runtime_context(providers=["native"])
+        )
 
 
 def test_validate_hermes_telemetry_provider_rejects_mixed_native_and_relay():
-    payload = {
-        "telemetry_plan": {"providers": ["relay", "native"], "relay_enabled": True}
-    }
-
     with pytest.raises(
         ValueError, match="only relay telemetry is supported for Hermes"
     ):
-        adapter.validate_hermes_telemetry_provider(payload)
+        telemetry.validate_hermes_telemetry_provider(
+            _runtime_context(providers=["relay", "native"])
+        )
 
 
-def test_finalize_relay_session_flushes_before_artifact_collection(monkeypatch):
-    calls: list[str] = []
-    invoke_hook = MagicMock(side_effect=lambda *args, **kwargs: calls.append("hook"))
-    runtime = adapter.HermesRuntime()
-    runtime._relay_plugin_config = {"components": []}
-    runtime._agent = SimpleNamespace(
-        session_id="runtime-1",
-        model="test-model",
-        platform="fabric",
+def test_descriptor_uses_the_typed_agent_config_contract():
+    descriptor_path = (
+        Path(__file__).parents[2] / "adapters" / "hermes" / "hermes.fabric-adapter.json"
     )
-    runtime._invoke_hook = invoke_hook
-    runtime._relay_session_pending = True
+    descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
 
-    from nemo_relay import subscribers
+    assert descriptor["contract_version"] == "fabric.adapter/v1alpha2"
+    assert descriptor["config"]["accepts"] == [
+        "models",
+        "models.base_url",
+        "models.temperature",
+        "instructions.system",
+        "runtime.max_turns",
+        "tools.enabled",
+        "tools.blocked",
+        "mcp",
+        "mcp.auth.oauth2",
+        "skills",
+    ]
 
-    monkeypatch.setattr(subscribers, "flush", lambda: calls.append("flush"))
 
-    runtime._finalize_relay_session()
+def test_write_hermes_relay_plugin_config_passes_through_v3(
+    monkeypatch,
+    tmp_path: Path,
+):
+    ambient_guard = MagicMock()
+    monkeypatch.setattr(
+        telemetry.common_utils,
+        "reject_ambient_relay_plugin_config",
+        ambient_guard,
+    )
+    relay_config_path = tmp_path / "relay.json"
+    relay_config_path.write_text(
+        json.dumps(
+            {
+                "relay": {
+                    "config": {
+                        "version": 3,
+                        "atof": {"enabled": True, "sinks": [{"type": "file"}]},
+                        "atif": {"enabled": True},
+                        "opentelemetry": {
+                            "enabled": True,
+                            "endpoints": [
+                                {
+                                    "type": "full",
+                                    "endpoint": "https://otel.example/v1/traces",
+                                    "service_name": "fabric",
+                                    "instrumentation_scope": "nemo-relay-otel",
+                                }
+                            ],
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FABRIC_RELAY_CONFIG_PATH", str(relay_config_path))
+    payload = {
+        "agent_name": "hermes-test-agent",
+        "base_dir": str(tmp_path),
+        "config": {
+            "models": {"default": {"provider": "nvidia", "model": "nvidia/test-model"}}
+        },
+        "runtime_context": {"runtime_id": "runtime-hermes-relay"},
+    }
 
-    assert calls == ["hook", "flush"]
-    invoke_hook.assert_called_once_with(
-        "on_session_finalize",
-        session_id="runtime-1",
-        model="test-model",
-        platform="fabric",
+    plugin_config_path, plugin_config = telemetry.write_hermes_relay_plugin_config(
+        payload
+    )
+
+    assert plugin_config_path == tmp_path / "relay-config" / "plugins.toml"
+    with plugin_config_path.open("rb") as stream:
+        staged_plugin_config = tomllib.load(stream)
+    staged_observability = staged_plugin_config["components"][0]["config"]
+    assert staged_observability["version"] == 3
+    assert staged_observability["atif"]["enabled"] is True
+    assert staged_observability["atof"]["sinks"][0]["mode"] == "append"
+    assert staged_observability["opentelemetry"] == {
+        "enabled": True,
+        "endpoints": [
+            {
+                "type": "full",
+                "endpoint": "https://otel.example/v1/traces",
+                "service_name": "fabric",
+                "instrumentation_scope": "nemo-relay-otel",
+            }
+        ],
+    }
+    assert plugin_config["components"][0]["config"]["atof"]["sinks"][0][
+        "output_directory"
+    ] == str(tmp_path / "artifacts" / "relay" / "runtime-hermes-relay")
+    assert (
+        plugin_config["components"][0]["config"]["atof"]["sinks"][0]["mode"] == "append"
+    )
+    ambient_guard.assert_called_once_with()
+
+
+def test_write_hermes_relay_plugin_config_preserves_typed_v3_otlp_endpoints(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setattr(
+        telemetry.common_utils,
+        "reject_ambient_relay_plugin_config",
+        MagicMock(),
+    )
+    relay_config_path = tmp_path / "relay.json"
+    relay_config_path.write_text(
+        json.dumps(
+            {
+                "relay": {
+                    "config": {
+                        "version": 3,
+                        "opentelemetry": {
+                            "enabled": True,
+                            "endpoints": [
+                                {
+                                    "type": "full",
+                                    "endpoint": "https://otel.example/v1/traces",
+                                    "service_name": "fabric",
+                                    "instrumentation_scope": "nemo-relay-otel",
+                                },
+                                {
+                                    "type": "openinference",
+                                    "endpoint": (
+                                        "https://openinference.example/v1/traces"
+                                    ),
+                                    "service_name": "fabric",
+                                    "instrumentation_scope": (
+                                        "nemo-relay-openinference"
+                                    ),
+                                },
+                            ],
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FABRIC_RELAY_CONFIG_PATH", str(relay_config_path))
+    payload = {
+        "agent_name": "hermes-test-agent",
+        "base_dir": str(tmp_path),
+        "config": {
+            "models": {"default": {"provider": "nvidia", "model": "nvidia/test-model"}}
+        },
+        "runtime_context": {"runtime_id": "runtime-hermes-relay"},
+    }
+
+    plugin_config_path, _ = telemetry.write_hermes_relay_plugin_config(payload)
+
+    with plugin_config_path.open("rb") as stream:
+        staged_observability = tomllib.load(stream)["components"][0]["config"]
+    assert staged_observability["version"] == 3
+    assert staged_observability["opentelemetry"] == {
+        "enabled": True,
+        "endpoints": [
+            {
+                "type": "full",
+                "endpoint": "https://otel.example/v1/traces",
+                "service_name": "fabric",
+                "instrumentation_scope": "nemo-relay-otel",
+            },
+            {
+                "type": "openinference",
+                "endpoint": "https://openinference.example/v1/traces",
+                "service_name": "fabric",
+                "instrumentation_scope": "nemo-relay-openinference",
+            },
+        ],
+    }
+
+
+def test_write_hermes_relay_plugin_config_rejects_v2(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setattr(
+        telemetry.common_utils,
+        "reject_ambient_relay_plugin_config",
+        MagicMock(),
+    )
+    relay_config_path = tmp_path / "relay.json"
+    relay_config_path.write_text(
+        '{"relay":{"config":{"version":2}}}',
+        encoding="utf-8",
+    )
+    os.environ["FABRIC_RELAY_CONFIG_PATH"] = str(relay_config_path)
+    payload = {
+        "agent_name": "hermes-test-agent",
+        "base_dir": str(tmp_path),
+        "config": {
+            "models": {"default": {"provider": "nvidia", "model": "nvidia/test-model"}}
+        },
+        "runtime_context": {"runtime_id": "runtime-hermes-relay"},
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="unsupported NeMo Relay observability config version 2",
+    ):
+        telemetry.write_hermes_relay_plugin_config(payload)
+
+
+def test_finalize_hermes_relay_session_uses_legacy_plugin_hook(monkeypatch):
+    hermes_cli = ModuleType("hermes_cli")
+    hermes_plugins = ModuleType("hermes_cli.plugins")
+    mock_invoke_hook = MagicMock()
+    hermes_plugins.invoke_hook = mock_invoke_hook  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", hermes_plugins)
+    monkeypatch.delitem(sys.modules, "hermes_cli.lifecycle", raising=False)
+
+    telemetry.finalize_hermes_relay_session("session-legacy")
+
+    mock_invoke_hook.assert_called_once_with(
+        "on_session_finalize", session_id="session-legacy", platform="fabric"
     )
 
 
-async def test_stop_does_not_refinalize_completed_relay_turn(monkeypatch):
-    invoke_hook = MagicMock()
+async def test_runtime_start_stages_upstream_relay_plugin_configuration(
+    monkeypatch,
+    tmp_path: Path,
+):
+    plugin_config_path = tmp_path / "relay-config" / "plugins.toml"
+    monkeypatch.setattr(
+        telemetry,
+        "write_hermes_relay_plugin_config",
+        lambda _payload: (plugin_config_path, {"version": 1}),
+    )
+
+    def stop_after_staging(*_args, **kwargs):
+        assert kwargs["relay_enabled"] is True
+        assert os.environ["HERMES_NEMO_RELAY_PLUGINS_TOML"] == str(plugin_config_path)
+        assert all(
+            name not in os.environ
+            for name in telemetry.HERMES_RELAY_ENV_NAMES
+            if name != "HERMES_NEMO_RELAY_PLUGINS_TOML"
+        )
+        raise RuntimeError("stop after Relay plugin staging")
+
+    monkeypatch.setattr(configuration, "write_hermes_config", stop_after_staging)
+    for name in telemetry.HERMES_RELAY_ENV_NAMES:
+        monkeypatch.setenv(name, "before")
+    payload = {
+        "base_dir": str(tmp_path),
+        "config": _agent_config(
+            {
+                "harness": {"settings": {}},
+                "models": {"default": {"provider": "nvidia", "model": "test-model"}},
+            }
+        ),
+        "runtime_context": _runtime_context(
+            runtime_id="runtime-relay-plugin",
+            workspace=str(tmp_path),
+            artifact_root=str(tmp_path / "artifacts"),
+            providers=["relay"],
+        ).to_mapping(),
+    }
+
+    with pytest.raises(RuntimeError, match="stop after Relay plugin staging"):
+        await adapter.HermesRuntime().start(payload)
+
+    assert all(name not in os.environ for name in telemetry.HERMES_RELAY_ENV_NAMES)
+
+
+async def test_runtime_rechecks_ambient_relay_config_before_each_turn(
+    monkeypatch,
+):
+    mock_turn = MagicMock()
+    mock_finalize = MagicMock()
+    monkeypatch.setattr(adapter, "_invoke_hermes_turn", mock_turn)
+    monkeypatch.setattr(telemetry, "finalize_hermes_relay_session", mock_finalize)
+    monkeypatch.setattr(
+        common_utils,
+        "reject_ambient_relay_plugin_config",
+        MagicMock(side_effect=RuntimeError("ambient Relay config")),
+    )
     runtime = adapter.HermesRuntime()
     runtime._started = True
-    runtime._relay_plugin_config = {"components": []}
-    agent = MagicMock(
-        session_id="runtime-1",
-        model="test-model",
-        platform="fabric",
+    runtime._runtime_id = "runtime-relay-guard"
+    runtime._agent_config = _agent_config(
+        {"models": {"default": {"provider": "test", "model": "test-model"}}}
     )
-    session_db = MagicMock()
-    runtime._agent = agent
-    runtime._session_db = session_db
-    runtime._invoke_hook = invoke_hook
-    runtime._relay_session_pending = True
+    runtime._model_config = runtime._agent_config.models["default"]
+    runtime._agent = MagicMock()
+    runtime._relay_plugin_config = {"version": 1, "components": []}
 
-    from nemo_relay import subscribers
+    with pytest.raises(RuntimeError, match="ambient Relay config"):
+        await runtime.invoke(
+            *_invocation(
+                {
+                    "runtime_context": _runtime_context(
+                        runtime_id=runtime._runtime_id
+                    ).to_mapping(),
+                    "request": {"input": "hello"},
+                }
+            )
+        )
 
-    flush = MagicMock()
-    monkeypatch.setattr(subscribers, "flush", flush)
-
-    runtime._finalize_relay_session()
-    await runtime.stop()
-
-    invoke_hook.assert_called_once_with(
-        "on_session_finalize",
-        session_id="runtime-1",
-        model="test-model",
-        platform="fabric",
-    )
-    flush.assert_called_once_with()
-    agent.close.assert_called_once_with()
-    session_db.close.assert_called_once_with()
-    assert runtime._started is False
-    assert runtime._relay_session_pending is False
-    assert runtime._relay_finalize_hook_invoked is False
-
-
-async def test_stop_retries_failed_relay_flush_without_refinalizing(monkeypatch):
-    invoke_hook = MagicMock()
-    runtime = adapter.HermesRuntime()
-    runtime._started = True
-    runtime._relay_plugin_config = {"components": []}
-    runtime._agent = MagicMock(
-        session_id="runtime-1",
-        model="test-model",
-        platform="fabric",
-    )
-    runtime._session_db = MagicMock()
-    runtime._invoke_hook = invoke_hook
-    runtime._relay_session_pending = True
-
-    from nemo_relay import subscribers
-
-    flush = MagicMock(side_effect=[RuntimeError("flush failed"), None])
-    monkeypatch.setattr(subscribers, "flush", flush)
-
-    with pytest.raises(RuntimeError, match="flush failed"):
-        runtime._finalize_relay_session()
-
-    assert runtime._relay_session_pending is True
-    assert runtime._relay_finalize_hook_invoked is True
-    await runtime.stop()
-
-    invoke_hook.assert_called_once_with(
-        "on_session_finalize",
-        session_id="runtime-1",
-        model="test-model",
-        platform="fabric",
-    )
-    assert flush.call_count == 2
-    assert runtime._relay_session_pending is False
-    assert runtime._relay_finalize_hook_invoked is False
+    mock_turn.assert_not_called()
+    mock_finalize.assert_not_called()
 
 
 def test_build_hermes_config_maps_fabric_config_to_hermes_config():
     os.environ["MCP_URL"] = "http://localhost:9000/mcp"
-    payload = {
-        "runtime_context": {"environment": {"workspace": "/workspace/repo"}},
-        "capability_plan": {
-            "native": {
-                "skill_paths": ["skills/review"],
-                "mcp_servers": {
-                    "github": {
-                        "transport": "stdio",
-                        "url": "github-mcp",
-                        "args": ["--stdio"],
-                    },
-                    "memory": {"transport": "sse", "url": "${MCP_URL}"},
-                },
-            }
-        },
-        "config": {
+    agent_config = _agent_config(
+        {
             "harness": {
                 "settings": {
                     "terminal_timeout": 90,
@@ -197,10 +444,24 @@ def test_build_hermes_config_maps_fabric_config_to_hermes_config():
                     "base_url": "https://model.example/v1",
                 }
             },
-        },
-    }
-
-    config = adapter.build_hermes_config(payload, relay_enabled=True)
+            "skills": {"paths": ["skills/review"]},
+            "mcp": {
+                "servers": {
+                    "github": {
+                        "transport": "stdio",
+                        "url": "github-mcp",
+                        "args": ["--stdio"],
+                    },
+                    "memory": {"transport": "sse", "url": "${MCP_URL}"},
+                }
+            },
+        }
+    )
+    config = configuration.build_hermes_config(
+        agent_config,
+        workspace="/workspace/repo",
+        relay_enabled=True,
+    )
 
     assert config == {
         "model": {
@@ -250,14 +511,14 @@ def test_default_max_iterations_matches_hermes_library_default():
 def test_build_hermes_config_omits_max_turns_when_fabric_limit_unset():
     # When max_turns is unset the config layer must leave agent.max_turns
     # absent so Hermes applies its own default rather than a starving override.
-    payload = {
-        "config": {
+    agent_config = _agent_config(
+        {
             "harness": {"settings": {}},
             "models": {"default": {"provider": "nvidia", "model": "nvidia/test-model"}},
         }
-    }
+    )
 
-    config = adapter.build_hermes_config(payload)
+    config = configuration.build_hermes_config(agent_config, workspace=".")
 
     assert "max_turns" not in config["agent"]
 
@@ -265,15 +526,15 @@ def test_build_hermes_config_omits_max_turns_when_fabric_limit_unset():
 def test_build_hermes_config_omits_max_turns_when_fabric_limit_null():
     # An explicit null max_turns is treated like unset: agent.max_turns is
     # omitted so Hermes applies its own default instead of a starving override.
-    payload = {
-        "config": {
+    agent_config = _agent_config(
+        {
             "harness": {"settings": {}},
             "runtime": {"max_turns": None},
             "models": {"default": {"provider": "nvidia", "model": "nvidia/test-model"}},
         }
-    }
+    )
 
-    config = adapter.build_hermes_config(payload)
+    config = configuration.build_hermes_config(agent_config, workspace=".")
 
     assert "max_turns" not in config["agent"]
 
@@ -287,6 +548,7 @@ def test_hermes_config_variation_matrix_surfaces_supported_capabilities(
             {
                 "relay": {
                     "config": {
+                        "version": 3,
                         "atof": {
                             "enabled": True,
                             "sinks": [
@@ -313,27 +575,11 @@ def test_hermes_config_variation_matrix_surfaces_supported_capabilities(
             },
             "telemetry": {"relay_enabled": True},
         },
-        "capability_plan": {
-            "native": {
-                "skill_paths": [tmp_path / "skills" / "review"],
-                "mcp_servers": {
-                    "github": {
-                        "transport": "stdio",
-                        "url": "github-mcp",
-                        "args": ["--stdio"],
-                        "exposure": "harness_native",
-                    },
-                    "memory": {
-                        "transport": "streamable-http",
-                        "url": "https://mcp.example/memory",
-                        "exposure": "harness_native",
-                    },
-                },
-            }
-        },
         "agent_name": "matrix-agent",
         "base_dir": str(tmp_path),
-        "config": {
+    }
+    agent_config = _agent_config(
+        {
             "harness": {"settings": {}},
             "tools": {"enabled": ["git", "shell"]},
             "models": {
@@ -342,10 +588,29 @@ def test_hermes_config_variation_matrix_surfaces_supported_capabilities(
                     "model": "nvidia/review-model",
                 }
             },
-        },
-    }
+            "skills": {"paths": [tmp_path / "skills" / "review"]},
+            "mcp": {
+                "servers": {
+                    "github": {
+                        "transport": "stdio",
+                        "url": "github-mcp",
+                        "args": ["--stdio"],
+                    },
+                    "memory": {
+                        "transport": "streamable-http",
+                        "url": "https://mcp.example/memory",
+                    },
+                }
+            },
+        }
+    )
+    payload["config"] = agent_config.to_mapping()
 
-    config = adapter.build_hermes_config(payload, relay_enabled=True)
+    config = configuration.build_hermes_config(
+        agent_config,
+        workspace=str(tmp_path / "workspace"),
+        relay_enabled=True,
+    )
     plugin_config = common_utils.load_relay_plugin_config(payload)
     observability = plugin_config["components"][0]["config"]
 
@@ -379,15 +644,366 @@ def test_hermes_config_variation_matrix_surfaces_supported_capabilities(
     assert observability["atif"]["model_name"] == "nvidia/review-model"
 
 
-def test_write_hermes_config_writes_file(tmp_path: Path):
-    payload = {
-        "config": {
+def test_build_hermes_config_maps_stdio_mcp_args_and_env_from_agent_config(
+    tmp_path: Path,
+):
+    agent_config = _agent_config(
+        {
             "harness": {"settings": {}},
-            "models": {"default": {"provider": "nvidia", "model": "nvidia/test-model"}},
+            "models": {
+                "default": {
+                    "provider": "nvidia",
+                    "model": "nvidia/test-model",
+                }
+            },
+            "mcp": {
+                "servers": {
+                    "analyzer": {
+                        "transport": "stdio",
+                        "url": str(tmp_path / "analyzer-mcp"),
+                        "args": ["--stdio"],
+                        "env": {"NVIDIA_API_KEY": "${NVIDIA_API_KEY}"},
+                    }
+                }
+            },
+        }
+    )
+
+    config = configuration.build_hermes_config(
+        agent_config,
+        workspace=str(tmp_path / "workspace"),
+    )
+
+    assert config["mcp_servers"] == {
+        "analyzer": {
+            "enabled": True,
+            "command": str(tmp_path / "analyzer-mcp"),
+            "args": ["--stdio"],
+            "env": {"NVIDIA_API_KEY": "${NVIDIA_API_KEY}"},
         }
     }
 
-    config_path, config = adapter.write_hermes_config(payload, tmp_path / "hermes-home")
+
+def test_hermes_maps_http_mcp_headers_and_oauth():
+    os.environ["FABRIC_MCP_CLIENT_SECRET"] = "oauth-secret"
+
+    config = adapter.hermes_mcp_server_config(
+        AgentMcpServerConfig(
+            transport="sse",
+            url="https://mcp.example.test/sse",
+            custom_headers={"X-Tenant": "${FABRIC_MCP_HEADER}"},
+            authentication={
+                "type": "oauth2",
+                "client_id": "fabric-client",
+                "client_secret_env": "FABRIC_MCP_CLIENT_SECRET",
+                "scopes": ["read", "write"],
+                "redirect_uri": "http://127.0.0.1:8765/callback",
+            },
+        )
+    )
+
+    assert config == {
+        "enabled": True,
+        "url": "https://mcp.example.test/sse",
+        "transport": "sse",
+        "headers": {"X-Tenant": "${FABRIC_MCP_HEADER}"},
+        "auth": "oauth",
+        "oauth": {
+            "client_id": "fabric-client",
+            "client_secret": "${FABRIC_MCP_CLIENT_SECRET}",
+            "scope": "read write",
+            "redirect_uri": "http://127.0.0.1:8765/callback",
+        },
+    }
+
+
+def test_hermes_rejects_unset_mcp_oauth_client_secret():
+    with pytest.raises(ValueError, match="unset environment variable"):
+        adapter.hermes_mcp_server_config(
+            AgentMcpServerConfig(
+                transport="sse",
+                url="https://mcp.example.test/sse",
+                authentication={
+                    "type": "oauth2",
+                    "client_id": "fabric-client",
+                    "client_secret_env": "FABRIC_MCP_CLIENT_SECRET",
+                },
+            )
+        )
+
+
+def test_hermes_rejects_mcp_service_account_authentication():
+    with pytest.raises(ValueError, match="service_account"):
+        adapter.hermes_mcp_server_config(
+            AgentMcpServerConfig(
+                transport="streamable-http",
+                url="https://mcp.example.test/mcp",
+                authentication={
+                    "type": "service_account",
+                    "client_id": "fabric-client",
+                    "client_secret_env": "FABRIC_MCP_CLIENT_SECRET",
+                    "token_url": "https://auth.example.test/token",
+                },
+            )
+        )
+
+
+def test_hermes_rejects_configured_mcp_oauth_timeout():
+    with pytest.raises(
+        ValueError,
+        match="authorization_timeout_seconds is not supported by Hermes Agent",
+    ):
+        adapter.hermes_mcp_server_config(
+            AgentMcpServerConfig(
+                transport="streamable-http",
+                url="https://mcp.example.test/mcp",
+                authentication={
+                    "type": "oauth2",
+                    "authorization_timeout_seconds": 30,
+                },
+            )
+        )
+
+
+def test_hermes_accepts_default_mcp_oauth_timeout():
+    config = adapter.hermes_mcp_server_config(
+        AgentMcpServerConfig(
+            transport="streamable-http",
+            url="https://mcp.example.test/mcp",
+            authentication={
+                "type": "oauth2",
+                "authorization_timeout_seconds": 300,
+            },
+        )
+    )
+
+    assert config == {
+        "enabled": True,
+        "url": "https://mcp.example.test/mcp",
+        "transport": "streamable-http",
+        "auth": "oauth",
+        "oauth": {},
+    }
+
+
+async def test_runtime_start_discovers_mcp_tools_when_configured(
+    monkeypatch,
+    tmp_path: Path,
+):
+    mock_session_db = MagicMock(spec=SessionDB)
+    mock_session_db_type = MagicMock(spec=SessionDB, return_value=mock_session_db)
+    mock_ai_agent = MagicMock(spec=AIAgent)
+    mock_ai_agent_type = MagicMock(spec=AIAgent, return_value=mock_ai_agent)
+    monkeypatch.setattr(
+        mock_ai_agent_type.__init__.__func__,
+        "__signature__",
+        inspect.signature(AIAgent.__init__),
+        raising=False,
+    )
+
+    discover_calls: list[str] = []
+    shutdown_calls: list[str] = []
+
+    hermes_cli = ModuleType("hermes_cli")
+    hermes_config = ModuleType("hermes_cli.config")
+    hermes_config.load_config = lambda: {}  # type: ignore[attr-defined]
+    hermes_plugins = ModuleType("hermes_cli.plugins")
+    hermes_plugins.discover_plugins = lambda force=False: None  # type: ignore[attr-defined]
+    hermes_plugins.invoke_hook = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+    hermes_state = ModuleType("hermes_state")
+    hermes_state.SessionDB = mock_session_db_type  # type: ignore[attr-defined]
+    run_agent = ModuleType("run_agent")
+    run_agent.AIAgent = mock_ai_agent_type  # type: ignore[attr-defined]
+    tools_pkg = ModuleType("tools")
+    tools_mcp = ModuleType("tools.mcp_tool")
+    tools_mcp.discover_mcp_tools = lambda: discover_calls.append("discover") or []  # type: ignore[attr-defined]
+
+    def shutdown_mcp_servers() -> None:
+        shutdown_calls.append("shutdown")
+        raise RuntimeError("mcp shutdown failed")
+
+    tools_mcp.shutdown_mcp_servers = shutdown_mcp_servers  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", hermes_config)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", hermes_plugins)
+    monkeypatch.setitem(sys.modules, "hermes_state", hermes_state)
+    monkeypatch.setitem(sys.modules, "run_agent", run_agent)
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool", tools_mcp)
+    monkeypatch.setenv("TEST_API_KEY", "secret")
+
+    payload = {
+        "agent_name": "mcp-discover",
+        "base_dir": str(tmp_path),
+        "runtime_context": _runtime_context(
+            runtime_id="runtime-mcp-discover",
+            workspace=str(tmp_path),
+            artifact_root=str(tmp_path / "artifacts"),
+        ).to_mapping(),
+    }
+    payload["config"] = _agent_config(
+        {
+            "harness": {"settings": {}},
+            "models": {
+                "default": {
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "api_key_env": "TEST_API_KEY",
+                }
+            },
+            "tools": {"enabled": ["mcp-analyzer"]},
+            "mcp": {
+                "servers": {
+                    "analyzer": {
+                        "transport": "stdio",
+                        "url": str(tmp_path / "analyzer-mcp"),
+                        "env": {"NVIDIA_API_KEY": "${NVIDIA_API_KEY}"},
+                    }
+                }
+            },
+        }
+    )
+
+    runtime = adapter.HermesRuntime()
+    await runtime.start(payload)
+    with pytest.raises(adapter.lifecycle.LifecycleError) as caught:
+        await runtime.stop()
+
+    assert discover_calls == ["discover"]
+    assert shutdown_calls == ["shutdown"]
+    mock_ai_agent_type.assert_called_once()
+    mock_ai_agent.close.assert_called_once_with()
+    mock_session_db.close.assert_called_once_with()
+    assert caught.value.code == "hermes_runtime_stop_failed"
+
+
+async def test_runtime_authenticates_oauth_mcp_servers_before_invoke(monkeypatch):
+    thread_calls = []
+
+    async def to_thread(function, *args, **kwargs):
+        thread_calls.append((function, args, kwargs))
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(adapter.asyncio, "to_thread", to_thread)
+    force_interactive_oauth = MagicMock()
+    oauth_stdin_reads: list[str] = []
+    discover_mcp_tools = MagicMock(
+        side_effect=lambda: oauth_stdin_reads.append(sys.stdin.readline())
+    )
+    get_mcp_status = MagicMock(
+        side_effect=[
+            [
+                {
+                    "name": "confluence",
+                    "connected": False,
+                    "status": "failed",
+                }
+            ],
+            [
+                {
+                    "name": "confluence",
+                    "connected": True,
+                    "status": "connected",
+                }
+            ],
+        ]
+    )
+    refresh_agent_mcp_tools = MagicMock()
+
+    tools_oauth = ModuleType("tools.mcp_oauth")
+    tools_oauth.force_interactive_oauth = (  # type: ignore[attr-defined]
+        force_interactive_oauth
+    )
+    tools_mcp = ModuleType("tools.mcp_tool")
+    tools_mcp.discover_mcp_tools = discover_mcp_tools  # type: ignore[attr-defined]
+    tools_mcp.get_mcp_status = get_mcp_status  # type: ignore[attr-defined]
+    tools_mcp.refresh_agent_mcp_tools = (  # type: ignore[attr-defined]
+        refresh_agent_mcp_tools
+    )
+    monkeypatch.setitem(sys.modules, "tools.mcp_oauth", tools_oauth)
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool", tools_mcp)
+
+    runtime = adapter.HermesRuntime()
+    runtime._agent = MagicMock()
+    runtime._hermes_config = {
+        "mcp_servers": {
+            "confluence": {"auth": "oauth"},
+            "time": {"transport": "stdio"},
+        }
+    }
+    lifecycle_stdin = StringIO('{"operation":"stop"}\n')
+    monkeypatch.setattr(sys, "stdin", lifecycle_stdin)
+
+    await runtime._authenticate_mcp_servers()
+    await runtime._authenticate_mcp_servers()
+
+    force_interactive_oauth.assert_called_once_with()
+    discover_mcp_tools.assert_called_once_with()
+    assert get_mcp_status.call_count == 2
+    refresh_agent_mcp_tools.assert_called_once_with(
+        runtime._agent,
+        quiet_mode=True,
+    )
+    assert oauth_stdin_reads == [""]
+    assert lifecycle_stdin.readline() == '{"operation":"stop"}\n'
+    assert sys.stdin is lifecycle_stdin
+    assert runtime._mcp_authentication_checked is True
+    assert len(thread_calls) == 4
+    assert thread_calls[0] == (get_mcp_status, (), {})
+    assert thread_calls[1][0].__name__ == "authenticate"
+    assert thread_calls[2] == (get_mcp_status, (), {})
+    assert thread_calls[3] == (
+        refresh_agent_mcp_tools,
+        (runtime._agent,),
+        {"quiet_mode": True},
+    )
+
+
+async def test_runtime_reports_failed_oauth_mcp_authentication(monkeypatch):
+    tools_oauth = ModuleType("tools.mcp_oauth")
+    tools_oauth.force_interactive_oauth = MagicMock()  # type: ignore[attr-defined]
+    tools_mcp = ModuleType("tools.mcp_tool")
+    tools_mcp.discover_mcp_tools = MagicMock()  # type: ignore[attr-defined]
+    tools_mcp.get_mcp_status = MagicMock(  # type: ignore[attr-defined]
+        return_value=[
+            {
+                "name": "confluence",
+                "connected": False,
+                "status": "failed",
+            }
+        ]
+    )
+    tools_mcp.refresh_agent_mcp_tools = MagicMock()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "tools.mcp_oauth", tools_oauth)
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool", tools_mcp)
+
+    runtime = adapter.HermesRuntime()
+    runtime._agent = MagicMock()
+    runtime._hermes_config = {"mcp_servers": {"confluence": {"auth": "oauth"}}}
+
+    with pytest.raises(adapter.lifecycle.LifecycleError) as caught:
+        await runtime._authenticate_mcp_servers()
+
+    assert caught.value.code == "hermes_mcp_authentication_failed"
+    assert caught.value.metadata == {"servers": ["confluence"]}
+    tools_mcp.refresh_agent_mcp_tools.assert_not_called()  # type: ignore[attr-defined]
+    assert runtime._mcp_authentication_checked is False
+
+
+def test_write_hermes_config_writes_file(tmp_path: Path):
+    agent_config = _agent_config(
+        {
+            "harness": {"settings": {}},
+            "models": {"default": {"provider": "nvidia", "model": "nvidia/test-model"}},
+        }
+    )
+
+    config_path, config = configuration.write_hermes_config(
+        agent_config,
+        tmp_path / "hermes-home",
+        workspace=".",
+    )
 
     assert config_path == tmp_path / "hermes-home" / "config.yaml"
     assert config_path.exists()
@@ -399,43 +1015,38 @@ def test_write_hermes_config_writes_file(tmp_path: Path):
     ("server", "expected"),
     [
         (
-            {"transport": "stdio", "url": "python3", "args": ["server.py"]},
+            AgentMcpServerConfig(
+                transport="stdio",
+                url="python3",
+                args=["server.py"],
+            ),
             {"enabled": True, "command": "python3", "args": ["server.py"]},
         ),
         (
-            {"transport": "sse", "url": "http://localhost:9000/sse"},
+            AgentMcpServerConfig(
+                transport="sse",
+                url="http://localhost:9000/sse",
+            ),
             {"enabled": True, "url": "http://localhost:9000/sse", "transport": "sse"},
         ),
         (
-            {"transport": "websocket", "url": "ws://localhost:9000"},
+            AgentMcpServerConfig(
+                transport="websocket",
+                url="ws://localhost:9000",
+            ),
             {"enabled": True, "url": "ws://localhost:9000", "transport": "websocket"},
         ),
     ],
 )
 def test_hermes_mcp_server_config(
-    server: dict[str, object],
+    server: AgentMcpServerConfig,
     expected: dict[str, object],
 ):
-    assert adapter.hermes_mcp_server_config(server) == expected
-
-
-@pytest.mark.parametrize(
-    "server",
-    [
-        {"transport": "stdio"},
-        {"transport": "stdio", "command": "server --stdio"},
-        {"transport": "stdio", "url": "   "},
-    ],
-)
-def test_hermes_mcp_server_config_rejects_unsupported_mappings(
-    server: dict[str, str],
-):
-    with pytest.raises(ValueError, match="requires a URL"):
-        adapter.hermes_mcp_server_config(server)
+    assert configuration.hermes_mcp_server_config(server) == expected
 
 
 def test_summarize_hermes_config():
-    assert adapter.summarize_hermes_config(
+    assert configuration.summarize_hermes_config(
         {
             "model": {"default": "demo"},
             "terminal": {"backend": "local"},
@@ -456,12 +1067,31 @@ def test_summarize_hermes_config():
 
 
 async def test_runtime_start_rejects_native_telemetry():
-    payload = {"telemetry_plan": {"providers": ["native"], "relay_enabled": False}}
+    payload = {
+        "config": _agent_config({}),
+        "runtime_context": _runtime_context(providers=["native"]).to_mapping(),
+    }
 
     with pytest.raises(
         ValueError, match="only relay telemetry is supported for Hermes"
     ):
         await adapter.HermesRuntime().start(payload)
+
+
+async def test_runtime_start_requires_typed_agent_config():
+    with pytest.raises(adapter.lifecycle.LifecycleError) as caught:
+        await adapter.HermesRuntime().start(
+            {
+                "config": {
+                    "models": {"default": {"provider": "nvidia", "model": "test-model"}}
+                },
+                "runtime_context": _runtime_context(
+                    runtime_id="runtime-untyped"
+                ).to_mapping(),
+            }
+        )
+
+    assert caught.value.code == "hermes_invalid_config"
 
 
 async def test_runtime_start_overrides_inherited_terminal_environment(
@@ -474,31 +1104,145 @@ async def test_runtime_start_overrides_inherited_terminal_environment(
         assert os.environ["TERMINAL_ENV"] == "local"
         raise RuntimeError("stop after environment setup")
 
-    monkeypatch.setattr(adapter, "write_hermes_config", stop_after_environment_setup)
+    monkeypatch.setattr(
+        configuration, "write_hermes_config", stop_after_environment_setup
+    )
     payload = {
         "base_dir": str(tmp_path),
-        "config": {
+        "runtime_context": _runtime_context(
+            runtime_id="runtime-terminal-env",
+            workspace=str(tmp_path),
+            artifact_root=str(tmp_path / "artifacts"),
+        ).to_mapping(),
+    }
+    payload["config"] = _agent_config(
+        {
             "harness": {"settings": {}},
             "models": {"default": {"provider": "nvidia", "model": "test-model"}},
-        },
-        "runtime_context": {
-            "runtime_id": "runtime-terminal-env",
-            "environment": {"workspace": str(tmp_path)},
-            "artifacts": {"root": str(tmp_path / "artifacts")},
-        },
-    }
+        }
+    )
 
     with pytest.raises(RuntimeError, match="stop after environment setup"):
         await adapter.HermesRuntime().start(payload)
 
 
 def test_artifact_root_resolves_relative_to_base_dir(tmp_path: Path):
-    payload = {
-        "base_dir": str(tmp_path),
-        "runtime_context": {"artifacts": {"root": "run-artifacts"}},
-    }
+    assert (
+        adapter._artifact_root(
+            _runtime_context(artifact_root="run-artifacts"),
+            str(tmp_path),
+        )
+        == (tmp_path / "run-artifacts").resolve()
+    )
 
-    assert adapter._artifact_root(payload) == (tmp_path / "run-artifacts").resolve()
+
+@pytest.fixture(name="started_hermes_runtime")
+def started_hermes_runtime_fixture(
+    monkeypatch,
+) -> tuple[adapter.HermesRuntime, MagicMock]:
+    mock_turn = MagicMock()
+    monkeypatch.setattr(adapter, "_invoke_hermes_turn", mock_turn)
+    agent_config = _agent_config(
+        {"models": {"default": {"provider": "test", "model": "test-model"}}}
+    )
+    runtime = adapter.HermesRuntime()
+    runtime._started = True
+    runtime._agent_config = agent_config
+    runtime._model_config = agent_config.models["default"]
+    runtime._runtime_id = "runtime-incomplete"
+    runtime._agent = MagicMock()
+    return runtime, mock_turn
+
+
+@pytest.mark.parametrize(
+    ("result_update", "expected_failed", "expected_error"),
+    [
+        pytest.param(
+            {"failed": True},
+            True,
+            {
+                "code": "hermes_reported_failure",
+                "message": "Hermes did not complete the invocation",
+                "retryable": False,
+            },
+            id="failed",
+        ),
+        pytest.param(
+            {"partial": True},
+            True,
+            {
+                "code": "hermes_reported_failure",
+                "message": "Hermes did not complete the invocation",
+                "retryable": False,
+            },
+            id="partial",
+        ),
+        pytest.param(
+            {"error": "Response remained truncated after 4 continuation attempts"},
+            True,
+            {
+                "code": "hermes_reported_failure",
+                "message": "Response remained truncated after 4 continuation attempts",
+                "retryable": False,
+            },
+            id="string-error",
+        ),
+        pytest.param(
+            {
+                "error": {
+                    "code": "hermes_rate_limited",
+                    "message": "provider rate limited the request",
+                    "retryable": True,
+                    "metadata": {"provider": "test"},
+                }
+            },
+            True,
+            {
+                "code": "hermes_rate_limited",
+                "message": "provider rate limited the request",
+                "retryable": True,
+                "extensions": {"provider": "test"},
+            },
+            id="structured-error",
+        ),
+        pytest.param({"error": ""}, False, None, id="empty-error"),
+        pytest.param({}, False, None, id="completed-false-only"),
+    ],
+)
+async def test_hermes_failure_signals_are_normalized(
+    started_hermes_runtime,
+    result_update: dict[str, object],
+    *,
+    expected_failed: bool,
+    expected_error: object | None,
+):
+    runtime, mock_turn = started_hermes_runtime
+    mock_turn.return_value = (
+        {
+            "final_response": "done",
+            "completed": False,
+            "messages": [],
+            **result_update,
+        },
+        "",
+    )
+
+    output = await runtime.invoke(
+        *_invocation(
+            {
+                "runtime_context": _runtime_context(
+                    runtime_id="runtime-incomplete"
+                ).to_mapping(),
+                "request": {"input": "complete the task"},
+            }
+        )
+    )
+
+    assert output.output["completed"] is False
+    assert (output.status is AgentRunStatus.FAILED) is expected_failed
+    assert (
+        None if output.error is None else output.error.to_mapping()
+    ) == expected_error
 
 
 async def test_persistent_runtime_reuses_hermes_agent_session_and_history(
@@ -560,16 +1304,25 @@ async def test_persistent_runtime_reuses_hermes_agent_session_and_history(
     monkeypatch.setitem(sys.modules, "hermes_cli.plugins", hermes_plugins)
     monkeypatch.setitem(sys.modules, "hermes_state", hermes_state)
     monkeypatch.setitem(sys.modules, "run_agent", run_agent)
-    os.environ["TEST_API_KEY"] = "secret"
+    monkeypatch.setenv("TEST_API_KEY", "secret")
 
     payload = {
         "agent_name": "demo",
         "base_dir": str(tmp_path),
-        "config": {
+        "runtime_context": _runtime_context(
+            runtime_id="runtime-fabric-123",
+            workspace=str(tmp_path),
+        ).to_mapping(),
+        "request": {
+            "input": "hello",
+            "request_id": "request-1",
+            "context": {"history": [{"role": "user", "content": "stale"}]},
+        },
+    }
+    payload["config"] = _agent_config(
+        {
             "harness": {"settings": {}},
-            "instructions": {
-                "system": {"content": "system", "mode": "replace"}
-            },
+            "instructions": {"system": {"content": "system", "mode": "replace"}},
             "runtime": {"max_turns": None},
             "tools": {"enabled": []},
             "models": {
@@ -580,35 +1333,32 @@ async def test_persistent_runtime_reuses_hermes_agent_session_and_history(
                     "temperature": 0.2,
                 }
             },
-        },
-        "runtime_context": {
-            "runtime_id": "runtime-fabric-123",
-            "environment": {"workspace": str(tmp_path)},
-        },
-        "request": {
-            "input": "hello",
-            "context": {"history": [{"role": "user", "content": "stale"}]},
-        },
-        "capability_plan": {"native": {}},
-    }
+        }
+    )
 
     start_payload = {key: value for key, value in payload.items() if key != "request"}
     runtime = adapter.HermesRuntime()
 
     await runtime.start(start_payload)
     first = await runtime.invoke(
-        {
-            "runtime_context": payload["runtime_context"],
-            "request": payload["request"],
-        }
+        *_invocation(
+            {
+                "runtime_context": payload["runtime_context"],
+                "request": payload["request"],
+            }
+        )
     )
     payload["runtime_context"]["invocation_id"] = "invocation-2"
+    payload["runtime_context"]["request_id"] = "request-2"
     payload["request"]["input"] = "continue"
+    payload["request"]["request_id"] = "request-2"
     second = await runtime.invoke(
-        {
-            "runtime_context": payload["runtime_context"],
-            "request": payload["request"],
-        }
+        *_invocation(
+            {
+                "runtime_context": payload["runtime_context"],
+                "request": payload["request"],
+            }
+        )
     )
     await runtime.stop()
 
@@ -638,22 +1388,24 @@ async def test_persistent_runtime_reuses_hermes_agent_session_and_history(
     assert first_call.kwargs == {
         "system_message": "system",
         "conversation_history": None,
+        "task_id": "request-1",
     }
     assert second_call.args == ("continue",)
     assert second_call.kwargs == {
         "system_message": "system",
         "conversation_history": first_messages,
+        "task_id": "request-2",
     }
     mock_ai_agent.close.assert_called_once_with()
     mock_session_db.close.assert_called_once_with()
     assert runtime._agent is None
     assert runtime._session_db is None
-    assert runtime._start_payload is None
+    assert runtime._agent_config is None
     assert runtime._conversation_history is None
-    assert first["response"] == "first response"
-    assert second["response"] == "second response"
-    assert "session_id" not in second
-    assert Path(second["hermes_home"]) == (
+    assert first.output["response"] == "first response"
+    assert second.output["response"] == "second response"
+    assert "session_id" not in second.output
+    assert Path(second.output["hermes_home"]) == (
         tmp_path
         / "artifacts"
         / ".fabric"
@@ -663,10 +1415,144 @@ async def test_persistent_runtime_reuses_hermes_agent_session_and_history(
     )
 
 
+@pytest.mark.parametrize(
+    ("request_input", "expected_message"),
+    [
+        (0, "0"),
+        (False, "false"),
+        ([], "[]"),
+        ({}, "{}"),
+    ],
+)
+def test_user_message_preserves_falsy_request_input(
+    request_input: object,
+    expected_message: str,
+):
+    request = AgentRunRequest(input=request_input)
+
+    assert adapter._user_message(request.input) == expected_message
+
+
+async def test_runtime_stop_waits_for_cancelled_invoke_worker(monkeypatch):
+    worker_started = threading.Event()
+    worker_release = threading.Event()
+    mock_agent = MagicMock()
+    mock_session_db = MagicMock()
+
+    def run_turn(**_kwargs):
+        worker_started.set()
+        assert worker_release.wait(timeout=1)
+        return (
+            {
+                "response": "completed after cancellation",
+                "completed": True,
+                "failed": False,
+                "messages": [],
+            },
+            "",
+        )
+
+    monkeypatch.setattr(adapter, "_invoke_hermes_turn", run_turn)
+    runtime = adapter.HermesRuntime()
+    runtime._started = True
+    runtime._runtime_id = "runtime-cancelled-invoke"
+    runtime._agent_config = _agent_config(
+        {"models": {"default": {"provider": "test", "model": "test-model"}}}
+    )
+    runtime._model_config = runtime._agent_config.models["default"]
+    runtime._agent = mock_agent
+    runtime._session_db = mock_session_db
+    invocation = {
+        "runtime_context": _runtime_context(
+            runtime_id=runtime._runtime_id
+        ).to_mapping(),
+        "request": {"input": "wait"},
+    }
+
+    invoke_task = asyncio.create_task(runtime.invoke(*_invocation(invocation)))
+    assert await asyncio.to_thread(worker_started.wait, 1)
+
+    invoke_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invoke_task
+
+    stop_task = asyncio.create_task(runtime.stop())
+    await asyncio.sleep(0)
+    mock_agent.close.assert_not_called()
+    mock_session_db.close.assert_not_called()
+
+    worker_release.set()
+    await stop_task
+
+    mock_agent.close.assert_called_once_with()
+    mock_session_db.close.assert_called_once_with()
+
+
+async def test_runtime_allows_invoke_after_cancelled_worker_finishes(monkeypatch):
+    worker_started = threading.Event()
+    worker_release = threading.Event()
+    mock_agent = MagicMock()
+    mock_session_db = MagicMock()
+    calls = 0
+
+    def run_turn(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            worker_started.set()
+            assert worker_release.wait(timeout=1)
+        return (
+            {
+                "response": f"turn-{calls}",
+                "completed": True,
+                "failed": False,
+                "messages": [],
+            },
+            "",
+        )
+
+    monkeypatch.setattr(adapter, "_invoke_hermes_turn", run_turn)
+    runtime = adapter.HermesRuntime()
+    runtime._started = True
+    runtime._runtime_id = "runtime-cancelled-invoke"
+    runtime._agent_config = _agent_config(
+        {"models": {"default": {"provider": "test", "model": "test-model"}}}
+    )
+    runtime._model_config = runtime._agent_config.models["default"]
+    runtime._agent = mock_agent
+    runtime._session_db = mock_session_db
+    invocation = {
+        "runtime_context": _runtime_context(
+            runtime_id=runtime._runtime_id
+        ).to_mapping(),
+        "request": {"input": "wait"},
+    }
+
+    cancelled_invoke = asyncio.create_task(runtime.invoke(*_invocation(invocation)))
+    assert await asyncio.to_thread(worker_started.wait, 1)
+    active_invoke_task = runtime._active_invoke_task
+    assert active_invoke_task is not None
+
+    cancelled_invoke.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_invoke
+
+    worker_release.set()
+    await asyncio.wait_for(asyncio.shield(active_invoke_task), timeout=1)
+
+    result = await runtime.invoke(*_invocation(invocation))
+
+    assert result.output["response"] == "turn-2"
+    await runtime.stop()
+
+
 def test_main_serves_persistent_runtime(monkeypatch):
     serve = MagicMock()
     monkeypatch.setattr(adapter.lifecycle, "serve", serve)
 
     adapter.main()
 
-    serve.assert_called_once_with(adapter.HermesRuntime)
+    serve.assert_called_once_with(
+        adapter.HermesRuntime,
+        config_loader=AgentConfig.from_mapping,
+    )

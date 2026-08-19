@@ -3,34 +3,33 @@ SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# NVIDIA NeMo Fabric Agent Harness Adapters
+# NVIDIA NeMo Fabric Adapters
 
-NeMo Fabric adapters translate the normalized NeMo Fabric contract into
-harness-native models, tools, sessions, and telemetry. Use this reference to
-compare the bundled adapters and then open the linked package guide for
-installation, authentication, and configuration details.
+NeMo Fabric adapters translate the normalized NeMo Fabric contract into the
+native models, tools, sessions, and telemetry of an agent harness or custom
+agent. Use this reference to compare the bundled harness adapters, then refer
+to the custom-agent examples when building a shared framework adapter or a
+dedicated adapter.
 
 The adapter descriptor selected in `RunPlan` is authoritative for normalized
-configuration and telemetry support.
+configuration, its adapter-owned settings schema, and telemetry support.
 
 ## Descriptor Discovery
 
-As a stopgap until NeMo Fabric has a provider-backed adapter registry, the
-Python SDK discovers descriptors in three locations. Later locations take
-precedence:
+The Python SDK builds one descriptor registry from three sources:
 
-1. descriptors bundled in the NeMo Fabric source repository;
-2. `<sysconfig data>/share/nemo-fabric/adapters`, populated by adapter wheels
-   and queried from `ADAPTER_PYTHON` when set, otherwise from the current Python;
-3. `<base_dir>/adapters`, for agent-local and development overrides.
+1. records bundled with NeMo Fabric;
+2. records installed recursively below
+   `<sysconfig data>/share/nemo-fabric`, queried from `ADAPTER_PYTHON` when set;
+3. files and directories listed in `FabricConfig.discovery.local_paths`.
 
 NeMo Fabric resolves multi-component relative `ADAPTER_PYTHON` paths from
 `<base_dir>`. It resolves bare command names through `PATH`.
 
-This scan only discovers installed metadata. It is not the final registry
-contract for resolving or installing third-party adapters. Installed and
-agent-local descriptors both currently report `source: local`; a registry
-provider should expose more precise provenance.
+Identical records with the same ID are deduplicated and retain every source as
+provenance. Different records with the same ID fail as ambiguous; discovery
+does not merge fields or choose an override. Workflow entry points and settings
+schemas come from independently registered Adapter Target Descriptors.
 
 ## Bundled Adapter Packages
 
@@ -40,6 +39,22 @@ provider should expose more precise provenance.
 | [Codex](codex/README.md) | `nvidia.fabric.codex` | `nemo-fabric-adapters-codex` | 3.11+ |
 | [LangChain Deep Agents](deepagents/README.md) | `nvidia.fabric.langchain.deepagents` | `nemo-fabric-adapters-deepagents` | 3.11+ |
 | [Hermes Agent](hermes/README.md) | `nvidia.fabric.hermes` | `nemo-fabric-adapters-hermes` | 3.11-3.13 |
+| [mini-SWE-agent](mini-swe-agent/README.md) | `nvidia.fabric.mini-swe-agent` | `nemo-fabric-adapters-mini-swe-agent` | 3.11+ |
+| [Pi](pi/README.md) | `nvidia.fabric.pi` | `nemo-fabric-adapters-pi` | 3.11+ |
+
+## Custom-Agent Adapter References
+
+Custom-agent support uses the same adapter contract as the bundled harnesses:
+
+- The [NeMo Agent Toolkit reference adapter](../external/nat/README.md) shows
+  one shared framework adapter with separately registered calculator and
+  email-phishing targets.
+- The [LangGraph custom-agent example](../examples/langgraph_custom_agent/README.md)
+  shows a dedicated adapter beside an application-owned graph.
+
+Start with the
+[adapter contract overview](../docs/adapter-contract/README.md) to choose an
+integration shape and implement the minimum lifecycle.
 
 ## Configuration Compatibility
 
@@ -47,16 +62,20 @@ provider should expose more precise provenance.
 | --- | --- | --- | --- | --- | --- |
 | [Claude](claude/README.md) | Native Anthropic or a configured Anthropic Messages-compatible provider | `tools.enabled` selects built-ins; a pre-tool hook enforces enabled and blocked names across built-in, MCP, and plugin tools | Normalized: stdio, HTTP, streamable HTTP, and SSE | Normalized `skills.paths` | Not exposed |
 | [Codex](codex/README.md) | Native OpenAI or a configured Responses-compatible provider | `tools.enabled` and `tools.blocked` unsupported | Normalized: stdio, HTTP, and streamable HTTP | Normalized `SKILL.md` directories | Not exposed |
-| [LangChain Deep Agents](deepagents/README.md) | LangChain model providers | Middleware enforces `tools.enabled` and `tools.blocked` across built-ins, MCP, and local subagents | Normalized through `langchain-mcp-adapters` | Normalized | Constrained declarative local delegation |
+| [LangChain Deep Agents](deepagents/README.md) | LangChain model providers | Middleware enforces `tools.enabled` and `tools.blocked` across built-ins, MCP, and local delegation | Normalized through `langchain-mcp-adapters` | Normalized | Built-in, declarative, and Agent Protocol |
 | [Hermes Agent](hermes/README.md) | Configurable provider, model, and base URL | `tools.enabled` and `tools.blocked` map to Hermes native toolset selectors | Normalized | Normalized | Not exposed |
+| [mini-SWE-agent](mini-swe-agent/README.md) | Configured provider and model | Not exposed | Not exposed | Not exposed | Not exposed |
+| [Pi](pi/README.md) | Exactly one `default` provider and model | Not exposed | Not exposed | Explicit `SKILL.md` directories | Not exposed |
 
 "Normalized" means that the adapter accepts the corresponding `FabricConfig`
 field. "Not exposed" does not mean that the underlying harness lacks the
 feature; it means that NeMo Fabric does not provide a portable configuration
 surface for it. Tool values are adapter-native selectors; NeMo Fabric does not
 define a cross-harness tool-name catalog. Planning fails when the selected
-adapter cannot enforce a configured policy. Deep Agents subagents are limited
-to declarative local subagents that inherit the parent agent's capabilities.
+adapter cannot enforce a configured policy. Deep Agents supports its built-in
+subagent and descriptor-validated caller-defined subagents. A configured tools
+policy permits only local declarative subagents because the adapter cannot gate
+remote Agent Protocol tools.
 
 `RunPlan.capability_plan.routes` records execution ownership, not network
 routing. `harness_native` assigns a capability to the selected adapter,
@@ -72,38 +91,46 @@ its harness. `No` means an explicitly configured value fails planning instead
 of being ignored. The following table groups provider-specific Relay subfields
 and additive extension maps because their support does not vary by adapter:
 
-| `FabricConfig` Field | Claude | Codex | Deep Agents | Hermes Agent |
-| --- | --- | --- | --- | --- |
-| `schema_version` | Core | Core | Core | Core |
-| `metadata.name`, `.description` | Core | Core | Core | Core |
-| `harness.adapter_id`, `.resolution` | Core | Core | Core | Core |
-| `harness.settings` | Adapter-owned escape hatch | Adapter-owned escape hatch | Adapter-owned escape hatch | Adapter-owned escape hatch |
-| `models.<role>.provider` | `anthropic` uses native auth; custom names require an Anthropic Messages-compatible `base_url` and `api_key_env` | `openai` uses native auth; custom names require a Responses-compatible `base_url` and `api_key_env` | Dynamic LangChain provider; custom OpenAI-compatible endpoints require `base_url` and `api_key_env` | Dynamic Hermes provider |
-| `models.<role>.model` | Yes | Yes | Yes | Yes |
-| `models.<role>.api_key_env` | Yes | Yes | Yes | Yes |
-| `models.<role>.base_url` | Yes | Yes | Yes | Yes |
-| `models.<role>.temperature` | No | No | Yes | Yes |
-| `models.<role>.settings.<key>` | No keys declared | No keys declared | No keys declared | No keys declared |
-| `instructions.system` | Yes | Yes; base instructions | Yes | Yes |
-| `runtime.input_schema`, `.output_schema` | Core | Core | Core | Core |
-| `runtime.artifacts`, `.timeout_seconds` | Core | Core | Core | Core |
-| `runtime.max_turns` | Yes | No | No | Yes; iteration limit |
-| `environment.provider`, `.control_location`, `.ownership` | Core | Core | Core | Core |
-| `environment.workspace`, `.artifacts`, `.env` | Core | Core | Core | Core |
-| `environment.connection`, `.metadata`, `.settings` | Environment-provider-owned | Environment-provider-owned | Environment-provider-owned | Environment-provider-owned |
-| `tools.enabled`, `.blocked` | Yes | No | Yes | Yes; native selectors are Hermes toolset names |
-| `skills.paths` | Yes | Yes | Yes | Yes |
-| `mcp.servers.<name>.transport`, `.url` with `harness_native` exposure | Yes | Yes | Yes | Yes |
-| `mcp.servers.<name>.exposure = "fabric_managed"` | No; not implemented | No; not implemented | No; not implemented | No; not implemented |
-| `telemetry.providers.relay` | Yes | Yes | Yes | Yes |
-| `telemetry.providers.native` | No | Yes; OpenTelemetry | Yes; OpenTelemetry and OpenInference | No |
-| `telemetry.providers.<provider>.config` | Declared-provider pass-through | Declared-provider pass-through | Declared-provider pass-through | Declared-provider pass-through |
-| `relay.project`, `.output_dir`, `.observability` | Yes | Yes | Yes | Yes |
-| `relay.components`, `.policy` | Yes | Yes | Yes | Yes |
-| Additive `extensions` on typed config objects | Preserved; no portable adapter semantics | Preserved; no portable adapter semantics | Preserved; no portable adapter semantics | Preserved; no portable adapter semantics |
+| `FabricConfig` Field | Claude | Codex | Deep Agents | Hermes Agent | mini-SWE-agent | Pi |
+| --- | --- | --- | --- | --- | --- | --- |
+| `schema_version` | Core | Core | Core | Core | Core | Core |
+| `metadata.name`, `.description` | Core | Core | Core | Core | Core | Core |
+| `harness.adapter_id`, `.resolution` | Core | Core | Core | Core | Core | Core |
+| `harness.settings` | Closed adapter schema | Closed adapter schema | Closed adapter schema | Closed adapter schema | Closed `timeout` schema | Closed `pi_executable` schema |
+| `workflow.target_id`, `.settings` | No | No | No | No | No | No |
+| `models.<role>.provider` | `anthropic` uses native auth; custom names require an Anthropic Messages-compatible `base_url` and `api_key_env` | `openai` uses native auth; custom names require a Responses-compatible `base_url` and `api_key_env` | Dynamic LangChain provider; custom OpenAI-compatible endpoints require `base_url` and `api_key_env` | Dynamic Hermes provider | Configured provider | Configured `default` provider |
+| `models.<role>.model` | Yes | Yes | Yes | Yes | Yes | Yes; `default` only |
+| `models.<role>.api_key_env` | Yes | Yes | Yes | Yes | Yes | Yes; required |
+| `models.<role>.base_url` | Yes | Yes | Yes | Yes | Yes | No |
+| `models.<role>.temperature` | No | No | Yes | Yes | Yes | No |
+| `models.<role>.settings.<key>` | No keys declared | No keys declared | No keys declared | No keys declared | No keys declared | No keys declared |
+| `instructions.system` | Yes | Yes; base instructions | Yes | Yes | Yes | No |
+| `runtime.input_schema`, `.output_schema` | Core | Core | Core | Core | Core | Core |
+| `runtime.artifacts`, `.timeout_seconds` | Core | Core | Core | Core | Core | Core |
+| `runtime.max_turns` | Yes | No | No | Yes; iteration limit | Yes | No |
+| `environment.provider`, `.control_location`, `.ownership` | Core | Core | Core | Core | Core | Core |
+| `environment.workspace`, `.artifacts`, `.env` | Core | Core | Core | Core | Core | Core; absolute local paths required |
+| `environment.connection`, `.metadata`, `.settings` | Environment-provider-owned | Environment-provider-owned | Environment-provider-owned | Environment-provider-owned | Environment-provider-owned | Environment-provider-owned |
+| `tools.enabled`, `.blocked` | Yes | No | Yes | Yes; native selectors are Hermes toolset names | No | No |
+| `skills.paths` | Yes | Yes | Yes | Yes | No | Yes; absolute directories |
+| `mcp.servers.<name>.transport`, `.url` with `harness_native` exposure | Yes | Yes | Yes | Yes | No | No |
+| `mcp.servers.<name>.exposure = "fabric_managed"` | No; not implemented | No; not implemented | No; not implemented | No; not implemented | No | No |
+| `telemetry.providers.relay` | Yes | Yes | Yes | Yes | No | No |
+| `telemetry.providers.native` | No | Yes; OpenTelemetry | Yes; OpenTelemetry and OpenInference | No | No | No |
+| `telemetry.providers.<provider>.config` | Declared-provider pass-through | Declared-provider pass-through | Declared-provider pass-through | Declared-provider pass-through | No | No |
+| `relay.project`, `.output_dir`, `.observability` | Yes | Yes | Yes | Yes | No | No |
+| `relay.components`, `.policy` | Yes | Yes | Yes | Yes | No | No |
+| Additive `extensions` on typed config objects | Preserved; no portable adapter semantics | Preserved; no portable adapter semantics | Preserved; no portable adapter semantics | Preserved; no portable adapter semantics | Preserved; no portable adapter semantics | Preserved; no portable adapter semantics |
 
 The selected model role is `default`, or the sole configured role when no
 `default` exists. More than one role without `default` fails planning.
+Pi is narrower and requires exactly one role named `default`.
+Claude and Codex publish a descriptor-owned `model_schema` for every configured
+model role. Their native providers (`anthropic` and `openai`, respectively)
+keep the existing authentication path. Other providers remain valid only with
+an explicit `base_url` and `api_key_env`. The same schema rejects undeclared
+`ModelConfig.settings` during planning and reports each issue through
+`doctor(...)` before adapter startup.
 `runtime.max_turns` is optional; omitting it preserves adapter-native defaults
 without creating a compatibility requirement.
 
@@ -122,11 +149,14 @@ and produces normalized trajectories in Agent Trajectory Interchange Format
 | [Codex](codex/README.md) | `AsyncCodex` app-server client and SDK thread | Runtime-owned Relay CLI gateway and Codex SDK hooks | Reuses the SDK thread and persists its thread ID | Closes the SDK client and app server, then stops the gateway | Not implemented |
 | [LangChain Deep Agents](deepagents/README.md) | Compiled LangGraph agent, checkpointer, and thread ID | NeMo Relay Python SDK integration added when the agent is compiled | Creates a fresh Relay request scope and callback for each invocation | Closes the checkpointer; no gateway process | Not implemented |
 | [Hermes Agent](hermes/README.md) | `AIAgent`, `SessionDB`, and conversation history | Hermes Agent NeMo Relay plugin context | Finalizes and flushes Relay after each invocation | Closes the agent and database, then exits the plugin context | Not implemented |
+| [mini-SWE-agent](mini-swe-agent/README.md) | Conversation history | Not supported | Not applicable | Not applicable | Not implemented |
+| [Pi](pi/README.md) | One persistent Pi JSONL RPC process | Not supported | Waits for `agent_settled` and returns final assistant text | Closes stdin, then terminates and kills the process group only when needed | Not implemented |
 
 Telemetry output names use the descriptor contract values. Claude, Codex, and
 Hermes Agent can emit NeMo Relay ATIF, OpenTelemetry, and OpenInference output. Deep
 Agents supports the same Relay outputs plus native OpenTelemetry and
-OpenInference; Codex also supports native OpenTelemetry.
+OpenInference; Codex also supports native OpenTelemetry. mini-SWE-agent and Pi
+do not support telemetry output.
 
 Shared lifecycle, Relay gateway, hook, and payload helpers are documented in
 the [adapter utilities guide](common/README.md).

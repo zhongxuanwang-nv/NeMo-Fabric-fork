@@ -20,7 +20,7 @@ async def test_local_env_e2e(hermes_shim_agent_dir: Path):
         "repos",
         "my-service",
     )
-    assert plan["adapter_descriptor"]["source"] == "local"
+    assert plan["adapter_descriptor"]["provenance"][0]["source"] == "explicit_local"
 
     result = (
         await fabric.run(

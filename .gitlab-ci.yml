@@ -139,7 +139,17 @@ collect:github-artifacts:
         --pattern 'python-wheels-*' \
         --dir downloaded/wheels
 
-      find downloaded/wheels -type f -name '*.whl' -exec cp {} collected/wheels/ \;
+      # Each platform builds all wheels, most wheels are platform-independent,
+      # while the runtime wheel is platform-specific.
+      # Copy the platform-independent wheels from the Linux build
+      cp downloaded/wheels/python-wheels-linux-amd64/*-py3-none-any.whl \
+        collected/wheels/
+
+      find downloaded/wheels \
+        -type f \
+        -name 'nemo_fabric_runtime-*.whl' \
+        -exec cp {} collected/wheels/ \;
+
       if ! ls collected/wheels/*.whl >/dev/null 2>&1; then
         echo "Error: collected GitHub wheel artifacts did not contain any .whl files." >&2
         exit 1
@@ -174,7 +184,7 @@ publish:artifactory:wheels:
     - job: collect:github-artifacts
       artifacts: true
   before_script:
-    - uv sync --locked --no-install-project --no-default-groups --group dev
+    - uv sync --frozen --no-install-project --no-default-groups --group dev
   script:
     - |
       set -eu
@@ -238,6 +248,8 @@ publish:artifactory:cargo:
         exit 1
       fi
 
+      uv venv --python "${UV_PYTHON:-${NEMO_FABRIC_CI_PYTHON_VERSION}}" .venv
+      just install-hermes-agent
       just set-version "$version"
 
       cargo_home="${CARGO_HOME:-${HOME}/.cargo}"

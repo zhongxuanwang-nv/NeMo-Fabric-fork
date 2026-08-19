@@ -9,12 +9,13 @@ import os
 from pathlib import Path
 
 from examples.code_review_agent import base_config
-from nemo_fabric import Fabric
+from nemo_fabric import DiscoveryConfig, Fabric
 
 
 async def test_environment_handle(hermes_shim_agent_dir: Path):
     config = base_config()
     config.harness.adapter_id = "test.fabric.hermes_shim"
+    config.discovery = DiscoveryConfig(local_paths=["adapters"])
     runtime = await Fabric().start_runtime(
         config,
         base_dir=hermes_shim_agent_dir,

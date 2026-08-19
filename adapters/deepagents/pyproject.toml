@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nemo-fabric-adapters-deepagents"
-version = "0.2.0"
+version = "0.3.0"
 description = "LangChain Deep Agents adapter for NeMo Fabric"
 authors = [
   { name = "NVIDIA Corporation" },
@@ -22,40 +22,47 @@ classifiers = [
 ]
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-readme = "README.md"
+readme = "pypi.md"
 requires-python = ">=3.11"
 dependencies = [
-  "nemo-fabric-adapters-common == 0.2.0",
-  "deepagents>=0.6.12,<0.7.0",
-  "langchain>=1.3,<2.0",
+  "nemo-fabric-adapter-contract == 0.3.0",
+  "nemo-fabric-adapters-common == 0.3.0",
   "langchain-mcp-adapters>=0.1,<0.3.0",
   "langchain-openai>=0.3",
-  "langgraph>=1.2,<2.0",
   # Requires 3.x: the 2.x line is incompatible with the langgraph core deepagents
   # pulls (AsyncSqliteSaver fails with 'Connection has no attribute is_alive').
   "langgraph-checkpoint-sqlite>=3.0,<4.0",
 ]
 
-# NeMo Relay is an optional, SDK-native integration. It is installed through
-# Relay's own ``deepagents`` extra, which pulls the Deep Agents / LangGraph
-# instrumentation Relay needs. The adapter imports nemo_relay lazily and only
-# when telemetry.providers.relay is enabled, so the core install stays
-# Relay-neutral at import time.
 [project.optional-dependencies]
+harness = [
+  "deepagents>=0.6.12,<0.7.0",
+  "langchain>=1.3,<2.0",
+  "langgraph>=1.2,<2.0",
+]
 relay = [
-  "nemo-relay[deepagents]>=0.6.0,<0.7",
+  "nemo-relay>=0.7.2,<0.8",
+]
+full = [
+  "deepagents>=0.6.12,<0.7.0",
+  "langchain>=1.3,<2.0",
+  "langgraph>=1.2,<2.0",
+  "nemo-relay[deepagents]>=0.7.2,<0.8",
 ]
 
 [project.urls]
-Repository = "https://github.com/NVIDIA/nemo-fabric/"
-Documentation = "https://nvidia-nemo-fabric.docs.buildwithfern.com/nemo/fabric"
+Repository = "https://github.com/NVIDIA/NeMo-Fabric"
+Homepage = "https://github.com/NVIDIA/NeMo-Fabric"
+Issues = "https://github.com/NVIDIA/NeMo-Fabric/issues"
+Documentation = "https://docs.nvidia.com/nemo/fabric"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["nemo_fabric_adapters.deepagents*"]
 
 [tool.setuptools.data-files]
-"share/nemo-fabric/adapters/deepagents" = ["fabric-adapter.json"]
+"share/nemo-fabric/adapters/deepagents" = ["deepagents.fabric-adapter.json"]
 
 [tool.uv.sources]
+nemo-fabric-adapter-contract = { path = "../../adapter-contract/python", editable = true }
 nemo-fabric-adapters-common = { path = "../common", editable = true }
