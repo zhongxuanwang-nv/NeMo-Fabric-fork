@@ -2342,6 +2342,9 @@ hermes-agent = [
 mini-swe-agent = [
     { name = "nemo-fabric-adapters-mini-swe-agent", extra = ["harness"] },
 ]
+pi = [
+    { name = "nemo-fabric-adapters-pi", extra = ["harness"] },
+]
 relay = [
     { name = "nemo-relay" },
 ]
@@ -2354,11 +2357,12 @@ requires-dist = [
     { name = "nemo-fabric-adapters-deepagents", extras = ["harness"], marker = "extra == 'deepagents'", editable = "adapters/deepagents" },
     { name = "nemo-fabric-adapters-hermes", marker = "python_full_version < '3.14' and extra == 'hermes-agent'", editable = "adapters/hermes" },
     { name = "nemo-fabric-adapters-mini-swe-agent", extras = ["harness"], marker = "extra == 'mini-swe-agent'", editable = "adapters/mini-swe-agent" },
+    { name = "nemo-fabric-adapters-pi", extras = ["harness"], marker = "extra == 'pi'", editable = "adapters/pi" },
     { name = "nemo-fabric-runtime", editable = "sdk/python/nemo-fabric-runtime" },
     { name = "nemo-relay", marker = "extra == 'relay'", specifier = ">=0.7.2,<0.8" },
     { name = "pyyaml", marker = "extra == 'harbor'", specifier = ">=6.0" },
 ]
-provides-extras = ["claude", "codex", "deepagents", "mini-swe-agent", "harbor", "hermes-agent", "relay"]
+provides-extras = ["claude", "codex", "deepagents", "mini-swe-agent", "pi", "harbor", "hermes-agent", "relay"]
 
 [[package]]
 name = "nemo-fabric-adapter-contract"
@@ -2523,6 +2527,29 @@ requires-dist = [
 provides-extras = ["harness", "full"]
 
 [[package]]
+name = "nemo-fabric-adapters-pi"
+version = "0.3.0"
+source = { editable = "adapters/pi" }
+dependencies = [
+    { name = "nemo-fabric-adapter-contract" },
+    { name = "nemo-fabric-adapters-common" },
+]
+
+[package.optional-dependencies]
+harness = [
+    { name = "nemo-fabric-pi-cli-bin" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "nemo-fabric-adapter-contract", editable = "adapter-contract/python" },
+    { name = "nemo-fabric-adapters-common", editable = "adapters/common" },
+    { name = "nemo-fabric-pi-cli-bin", marker = "extra == 'full'", editable = "adapters/pi-cli-bin" },
+    { name = "nemo-fabric-pi-cli-bin", marker = "extra == 'harness'", editable = "adapters/pi-cli-bin" },
+]
+provides-extras = ["harness", "full"]
+
+[[package]]
 name = "nemo-fabric-development"
 version = "0.0.0"
 source = { virtual = "." }
@@ -2550,6 +2577,9 @@ hermes-agent = [
 mini-swe-agent = [
     { name = "nemo-fabric", extra = ["mini-swe-agent"] },
 ]
+pi = [
+    { name = "nemo-fabric", extra = ["pi"] },
+]
 relay = [
     { name = "nemo-fabric", extra = ["relay"] },
 ]
@@ -2561,6 +2591,7 @@ adapter-tests = [
     { name = "nemo-fabric-adapters-deepagents", extra = ["harness"] },
     { name = "nemo-fabric-adapters-hermes", extra = ["full"], marker = "python_full_version < '3.14'" },
     { name = "nemo-fabric-adapters-mini-swe-agent", extra = ["harness"] },
+    { name = "nemo-fabric-adapters-pi", extra = ["harness"] },
 ]
 adapters = [
     { name = "hermes-agent", marker = "python_full_version < '3.14'" },
@@ -2571,6 +2602,7 @@ adapters = [
     { name = "nemo-fabric-adapters-deepagents", extra = ["relay"] },
     { name = "nemo-fabric-adapters-hermes", marker = "python_full_version < '3.14'" },
     { name = "nemo-fabric-adapters-mini-swe-agent" },
+    { name = "nemo-fabric-adapters-pi" },
 ]
 dev = [
     { name = "ipython" },
@@ -2620,10 +2652,11 @@ requires-dist = [
     { name = "nemo-fabric", extras = ["harbor"], marker = "extra == 'harbor'", editable = "sdk/python/nemo-fabric" },
     { name = "nemo-fabric", extras = ["hermes-agent"], marker = "python_full_version < '3.14' and extra == 'hermes-agent'", editable = "sdk/python/nemo-fabric" },
     { name = "nemo-fabric", extras = ["mini-swe-agent"], marker = "extra == 'mini-swe-agent'", editable = "sdk/python/nemo-fabric" },
+    { name = "nemo-fabric", extras = ["pi"], marker = "extra == 'pi'", editable = "sdk/python/nemo-fabric" },
     { name = "nemo-fabric", extras = ["relay"], marker = "extra == 'relay'", editable = "sdk/python/nemo-fabric" },
     { name = "nemo-fabric-runtime", editable = "sdk/python/nemo-fabric-runtime" },
 ]
-provides-extras = ["claude", "codex", "deepagents", "mini-swe-agent", "harbor", "hermes-agent", "relay"]
+provides-extras = ["claude", "codex", "deepagents", "mini-swe-agent", "pi", "harbor", "hermes-agent", "relay"]
 
 [package.metadata.requires-dev]
 adapter-tests = [
@@ -2632,6 +2665,7 @@ adapter-tests = [
     { name = "nemo-fabric-adapters-deepagents", extras = ["harness"], editable = "adapters/deepagents" },
     { name = "nemo-fabric-adapters-hermes", extras = ["full"], marker = "python_full_version < '3.14'", editable = "adapters/hermes" },
     { name = "nemo-fabric-adapters-mini-swe-agent", extras = ["harness"], editable = "adapters/mini-swe-agent" },
+    { name = "nemo-fabric-adapters-pi", extras = ["harness"], editable = "adapters/pi" },
 ]
 adapters = [
     { name = "hermes-agent", marker = "python_full_version < '3.14'", editable = "external/hermes-agent" },
@@ -2642,6 +2676,7 @@ adapters = [
     { name = "nemo-fabric-adapters-deepagents", extras = ["relay"], editable = "adapters/deepagents" },
     { name = "nemo-fabric-adapters-hermes", marker = "python_full_version < '3.14'", editable = "adapters/hermes" },
     { name = "nemo-fabric-adapters-mini-swe-agent", editable = "adapters/mini-swe-agent" },
+    { name = "nemo-fabric-adapters-pi", editable = "adapters/pi" },
 ]
 dev = [
     { name = "ipython", specifier = "~=8.20" },
@@ -2680,6 +2715,17 @@ test = [
     { name = "tomli-w", specifier = "~=1.2" },
     { name = "uvicorn", specifier = "~=0.49" },
 ]
+
+[[package]]
+name = "nemo-fabric-pi-cli-bin"
+version = "0.3.0"
+source = { editable = "adapters/pi-cli-bin" }
+dependencies = [
+    { name = "nodejs-wheel" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "nodejs-wheel", specifier = "==22.19.0" }]
 
 [[package]]
 name = "nemo-fabric-runtime"
@@ -2731,6 +2777,34 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/24/bf/d1bda4f6168e0b2e9e5958945e01910052158313224ada5ce1fb2e1113b8/nodeenv-1.10.0.tar.gz", hash = "sha256:996c191ad80897d076bdfba80a41994c2b47c68e224c542b48feba42ba00f8bb", size = 55611, upload-time = "2025-12-20T14:08:54.006Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/88/b2/d0896bdcdc8d28a7fc5717c305f1a861c26e18c05047949fb371034d98bd/nodeenv-1.10.0-py2.py3-none-any.whl", hash = "sha256:5bb13e3eed2923615535339b3c620e76779af4cb4c6a90deccc9e36b274d3827", size = 23438, upload-time = "2025-12-20T14:08:52.782Z" },
+]
+
+[[package]]
+name = "nodejs-wheel"
+version = "22.19.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nodejs-wheel-binaries" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3b/28/76f283d083a469b1ad26c3c711a0c9fa8405d8f6a5edfa5e17a4958aeb82/nodejs_wheel-22.19.0.tar.gz", hash = "sha256:bdd854f9b87faf8c5305dc60d99a12d56a37e0ea8c9064a84845fdeaf987dfd8", size = 2968, upload-time = "2025-09-12T10:33:45.808Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f2/9a/c2ea78e11b6d28a80a7e638ac575b662860dfcf3ed83067e80c998cfaf58/nodejs_wheel-22.19.0-py3-none-any.whl", hash = "sha256:9021f544885c5b8122572bea8b23affb8a88033eaa9298e1c5e9789b5a31a84e", size = 3990, upload-time = "2025-09-12T10:33:16.166Z" },
+]
+
+[[package]]
+name = "nodejs-wheel-binaries"
+version = "22.19.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/bd/ca/6033f80b7aebc23cb31ed8b09608b6308c5273c3522aedd043e8a0644d83/nodejs_wheel_binaries-22.19.0.tar.gz", hash = "sha256:e69b97ef443d36a72602f7ed356c6a36323873230f894799f4270a853932fdb3", size = 8060, upload-time = "2025-09-12T10:33:46.935Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/93/a2/0d055fd1d8c9a7a971c4db10cf42f3bba57c964beb6cf383ca053f2cdd20/nodejs_wheel_binaries-22.19.0-py2.py3-none-macosx_11_0_arm64.whl", hash = "sha256:43eca1526455a1fb4cb777095198f7ebe5111a4444749c87f5c2b84645aaa72a", size = 50902454, upload-time = "2025-09-12T10:33:18.3Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/f5/446f7b3c5be1d2f5145ffa3c9aac3496e06cdf0f436adeb21a1f95dd79a7/nodejs_wheel_binaries-22.19.0-py2.py3-none-macosx_11_0_x86_64.whl", hash = "sha256:feb06709e1320790d34babdf71d841ec7f28e4c73217d733e7f5023060a86bfc", size = 51837860, upload-time = "2025-09-12T10:33:21.599Z" },
+    { url = "https://files.pythonhosted.org/packages/1e/4e/d0a036f04fd0f5dc3ae505430657044b8d9853c33be6b2d122bb171aaca3/nodejs_wheel_binaries-22.19.0-py2.py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:db9f5777292491430457c99228d3a267decf12a09d31246f0692391e3513285e", size = 57841528, upload-time = "2025-09-12T10:33:25.433Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/11/4811d27819f229cc129925c170db20c12d4f01ad366a0066f06d6eb833cf/nodejs_wheel_binaries-22.19.0-py2.py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:1392896f1a05a88a8a89b26e182d90fdf3020b4598a047807b91b65731e24c00", size = 58368815, upload-time = "2025-09-12T10:33:29.083Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/94/df41416856b980e38a7ff280cfb59f142a77955ccdbec7cc4260d8ab2e78/nodejs_wheel_binaries-22.19.0-py2.py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:9164c876644f949cad665e3ada00f75023e18f381e78a1d7b60ccbbfb4086e73", size = 59690937, upload-time = "2025-09-12T10:33:32.771Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/39/8d0d5f84b7616bdc4eca725f5d64a1cfcac3d90cf3f30cae17d12f8e987f/nodejs_wheel_binaries-22.19.0-py2.py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:6b4b75166134010bc9cfebd30dc57047796a27049fef3fc22316216d76bc0af7", size = 60751996, upload-time = "2025-09-12T10:33:36.962Z" },
+    { url = "https://files.pythonhosted.org/packages/41/93/2d66b5b60055dd1de6e37e35bef563c15e4cafa5cfe3a6990e0ab358e515/nodejs_wheel_binaries-22.19.0-py2.py3-none-win_amd64.whl", hash = "sha256:3f271f5abfc71b052a6b074225eca8c1223a0f7216863439b86feaca814f6e5a", size = 40026140, upload-time = "2025-09-12T10:33:40.33Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/46/c9cf7ff7e3c71f07ca8331c939afd09b6e59fc85a2944ea9411e8b29ce50/nodejs_wheel_binaries-22.19.0-py2.py3-none-win_arm64.whl", hash = "sha256:666a355fe0c9bde44a9221cd543599b029045643c8196b8eedb44f28dc192e06", size = 38804500, upload-time = "2025-09-12T10:33:43.302Z" },
 ]
 
 [[package]]

@@ -28,6 +28,10 @@ mini-swe-agent = [
   "nemo-fabric[mini-swe-agent]",
 ]
 
+pi = [
+  "nemo-fabric[pi]",
+]
+
 harbor = [
   "nemo-fabric[harbor]",
 ]
@@ -52,6 +56,7 @@ adapters = [
   "nemo-fabric-adapters-hermes; python_version < '3.14'",
   "hermes-agent==0.20.1; python_version < '3.14'",
   "nemo-fabric-adapters-mini-swe-agent",
+  "nemo-fabric-adapters-pi",
 ]
 
 adapter-tests = [
@@ -60,6 +65,7 @@ adapter-tests = [
   "nemo-fabric-adapters-deepagents[harness]",
   "nemo-fabric-adapters-hermes[full]; python_version < '3.14'",
   "nemo-fabric-adapters-mini-swe-agent[harness]",
+  "nemo-fabric-adapters-pi[harness]",
 ]
 
 langgraph-example = [
@@ -122,6 +128,8 @@ nemo-fabric-adapters-codex = { path = "adapters/codex", editable = true }
 nemo-fabric-adapters-deepagents = { path = "adapters/deepagents", editable = true }
 nemo-fabric-adapters-hermes = { path = "adapters/hermes", editable = true }
 nemo-fabric-adapters-mini-swe-agent = { path = "adapters/mini-swe-agent", editable = true }
+nemo-fabric-adapters-pi = { path = "adapters/pi", editable = true }
+nemo-fabric-pi-cli-bin = { path = "adapters/pi-cli-bin", editable = true }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -1,0 +1,10 @@
+{
+  "name": "nemo-fabric-pi-cli-bin-vendor",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Build-only lock for the Pi runtime vendored in nemo-fabric-pi-cli-bin wheels.",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2"
+  }
+}

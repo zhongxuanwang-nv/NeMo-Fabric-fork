@@ -113,6 +113,10 @@ def test_node_inventory_includes_locked_dev_dependencies(tmp_path: Path):
         license_diff.attributions_lockfile_md,
         "NODE",
         package_dir,
+    ), patch.object(
+        license_diff.attributions_lockfile_md,
+        "PI_NODE",
+        tmp_path / "missing-pi-package",
     ):
         inventory = license_diff.attributions_lockfile_md._node_license_inventory()
 
@@ -124,6 +128,10 @@ def test_node_inventory_is_empty_before_package_exists(tmp_path: Path):
         license_diff.attributions_lockfile_md,
         "NODE",
         tmp_path / "missing-package",
+    ), patch.object(
+        license_diff.attributions_lockfile_md,
+        "PI_NODE",
+        tmp_path / "missing-pi-package",
     ):
         inventory = license_diff.attributions_lockfile_md._node_license_inventory()
 
@@ -158,7 +166,6 @@ def test_worktree_inventory_cleans_up_when_checkout_fails(tmp_path: Path):
         check=False,
     )
     mock_rmtree.assert_called_once_with(tmp_path, ignore_errors=True)
-
 
 def test_worktree_inventory_cleans_up_when_generation_fails(tmp_path: Path):
     root = tmp_path / "root"
